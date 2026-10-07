@@ -1,0 +1,56 @@
+# Save a Cursor automation with a Webhook trigger, then set repository secrets
+# CURSOR_AUTOMATION_WEBHOOK_URL and CURSOR_AUTOMATION_WEBHOOK_KEY.
+
+name: Issue opened → Cursor automation
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  notify-cursor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate webhook secrets
+        env:
+          WEBHOOK_URL: ${{ secrets.CURSOR_AUTOMATION_WEBHOOK_URL }}
+          WEBHOOK_KEY: ${{ secrets.CURSOR_AUTOMATION_WEBHOOK_KEY }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "Missing secret: CURSOR_AUTOMATION_WEBHOOK_URL"
+            exit 1
+          fi
+          if [ -z "$WEBHOOK_KEY" ]; then
+            echo "Missing secret: CURSOR_AUTOMATION_WEBHOOK_KEY"
+            exit 1
+          fi
+
+      - name: Trigger Cursor automation
+        env:
+          WEBHOOK_URL: ${{ secrets.CURSOR_AUTOMATION_WEBHOOK_URL }}
+          WEBHOOK_KEY: ${{ secrets.CURSOR_AUTOMATION_WEBHOOK_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_HTML_URL: ${{ github.event.issue.html_url }}
+          AUTHOR_LOGIN: ${{ github.event.issue.user.login }}
+        run: |
+          payload=$(jq -n \
+            --argjson number "$ISSUE_NUMBER" \
+            --arg title "$ISSUE_TITLE" \
+            --arg body "$ISSUE_BODY" \
+            --arg html_url "$ISSUE_HTML_URL" \
+            --arg author_login "$AUTHOR_LOGIN" \
+            '{number: $number, title: $title, body: $body, html_url: $html_url, author_login: $author_login}')
+
+          http_code=$(curl -sS -o /tmp/cursor-webhook-response.txt -w "%{http_code}" \
+            -X POST "$WEBHOOK_URL" \
+            -H "Authorization: Bearer ${WEBHOOK_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary "$payload")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "Cursor webhook request failed with HTTP ${http_code}"
+            cat /tmp/cursor-webhook-response.txt
+            exit 1
+          fi
