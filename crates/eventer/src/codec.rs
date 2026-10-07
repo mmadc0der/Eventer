@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
@@ -228,7 +228,7 @@ fn encode_strings(values: &[Option<String>], allow_dict: bool) -> Vec<u8> {
         return out;
     }
     let raw = encode_raw_strings(&present);
-    if !allow_dict {
+    if !allow_dict || !string_dict_might_compress(&present) {
         return raw;
     }
     let dict = encode_dict_strings(&present);
@@ -237,6 +237,21 @@ fn encode_strings(values: &[Option<String>], allow_dict: bool) -> Vec<u8> {
     } else {
         raw
     }
+}
+
+/// Dictionary encoding only wins when some values repeat; unique strings pay extra
+/// for a code table, so skip the second pass unless we see a duplicate.
+fn string_dict_might_compress(present: &[&str]) -> bool {
+    if present.len() < 2 {
+        return false;
+    }
+    let mut seen = HashSet::with_capacity(present.len());
+    for text in present {
+        if !seen.insert(text) {
+            return true;
+        }
+    }
+    false
 }
 
 fn encode_raw_strings(present: &[&str]) -> Vec<u8> {
