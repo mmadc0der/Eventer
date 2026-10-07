@@ -1,0 +1,43 @@
+# Repo secrets: CURSOR_RESOLVER_WEBHOOK_URL, CURSOR_RESOLVER_KEY (key only, no Bearer prefix, no trailing newline).
+name: Wake resolver
+on:
+  pull_request_review:
+    types: [submitted]
+jobs:
+  wake:
+    if: github.event.review.user.login == 'cursor[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: POST resolver webhook
+        env:
+          KEY: ${{ secrets.CURSOR_RESOLVER_KEY }}
+          URL: ${{ secrets.CURSOR_RESOLVER_WEBHOOK_URL }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          BODY: ${{ github.event.review.body }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          KEY="$(printf '%s' "$KEY" | tr -d '\r\n')"
+          URL="$(printf '%s' "$URL" | tr -d '\r\n')"
+          ids="$(printf '%s\n' "$BODY" | sed -n 's/.*Resolve-Comment:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+          if [ -z "$ids" ]; then
+            ids="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/reviews/${{ github.event.review.id }}/comments" \
+              --jq '.[] | select(.in_reply_to_id == null) | .id')"
+          fi
+          if [ -z "$ids" ]; then
+            exit 0
+          fi
+          context="PR ${PR_URL}
+Fix only these review comments. One commit. Do not submit a review."
+          while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            context="${context}
+Resolve-Comment: ${id}"
+          done <<< "$ids"
+          jq -n --arg context "$context" '{context:$context}' \
+            | curl -sS -f -X POST "$URL" \
+                -H "Authorization: Bearer ${KEY}" \
+                -H "Content-Type: application/json" \
+                --data-binary @-
