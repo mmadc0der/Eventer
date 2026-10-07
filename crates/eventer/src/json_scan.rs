@@ -2,14 +2,12 @@ use crate::error::{Error, Result};
 
 /// Validates that `text` is a single non-null JSON value without building a DOM.
 pub fn validate_json_structure(text: &str) -> Result<()> {
-    let bytes = text.as_bytes();
-    let end = end_of_json_value(bytes, 0)?;
-    if skip_json_whitespace(bytes, end) != bytes.len() {
-        return Err(Error::event("json field has trailing data"));
-    }
     if text.trim() == "null" {
         return Err(Error::event("json field must not be null"));
     }
+    serde_json::from_str::<Box<serde_json::value::RawValue>>(text).map_err(|err| {
+        Error::event(format!("json field is not valid JSON: {err}"))
+    })?;
     Ok(())
 }
 
@@ -122,12 +120,12 @@ pub fn decode_json_string(bytes: &[u8]) -> Result<String> {
                     .map_err(|_| Error::event("invalid JSON unicode escape"))?;
                     i += 4;
                     if (0xD800..=0xDBFF).contains(&code) {
-                        let low_hex = bytes
-                            .get(i + 2..i + 6)
-                            .ok_or_else(|| Error::event("truncated JSON unicode escape"))?;
                         if bytes.get(i + 1) != Some(&b'\\') || bytes.get(i + 2) != Some(&b'u') {
                             return Err(Error::event("invalid JSON unicode escape"));
                         }
+                        let low_hex = bytes
+                            .get(i + 3..i + 7)
+                            .ok_or_else(|| Error::event("truncated JSON unicode escape"))?;
                         let low = u16::from_str_radix(
                             std::str::from_utf8(low_hex)
                                 .map_err(|_| Error::event("invalid JSON unicode escape"))?,
@@ -142,7 +140,7 @@ pub fn decode_json_string(bytes: &[u8]) -> Result<String> {
                         let ch = char::from_u32(combined)
                             .ok_or_else(|| Error::event("invalid JSON unicode escape"))?;
                         out.push(ch);
-                        i += 6;
+                        i += 7;
                     } else if (0xDC00..=0xDFFF).contains(&code) {
                         return Err(Error::event("invalid JSON unicode escape"));
                     } else {
@@ -156,10 +154,15 @@ pub fn decode_json_string(bytes: &[u8]) -> Result<String> {
             i += 1;
             continue;
         }
-        out.push(char::from_u32(byte as u32).ok_or_else(|| {
-            Error::event("JSON string is not valid UTF-8")
-        })?);
-        i += 1;
+        let rest = &bytes[i..];
+        let text = std::str::from_utf8(rest)
+            .map_err(|_| Error::event("JSON string is not valid UTF-8"))?;
+        let ch = text
+            .chars()
+            .next()
+            .ok_or_else(|| Error::event("JSON string is not valid UTF-8"))?;
+        out.push(ch);
+        i += ch.len_utf8();
     }
     Ok(out)
 }
@@ -261,6 +264,27 @@ fn end_of_json_number(bytes: &[u8], start: usize) -> Result<usize> {
         i = consume_json_digits(bytes, i, true)?;
     }
     Ok(i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_non_json() {
+        for bad in ["{foo}", "1.", "01", "[1,]", r#"{"a":1,}"#] {
+            assert!(validate_json_structure(bad).is_err(), "accepted {bad}");
+        }
+        assert!(validate_json_structure("null").is_err());
+        assert!(validate_json_structure(r#"{"a":1}"#).is_ok());
+    }
+
+    #[test]
+    fn surrogate_pair_in_ignored_key_is_scanned() {
+        let doc = br#"{"ts":1,"\uD83D\uDE00":0,"props":3}"#;
+        let value = extract_object_field_raw_last(doc, "props").unwrap();
+        assert_eq!(value.as_deref(), Some("3"));
+    }
 }
 
 fn consume_json_digits(bytes: &[u8], start: usize, allow_empty: bool) -> Result<usize> {

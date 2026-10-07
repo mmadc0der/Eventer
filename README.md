@@ -124,4 +124,4 @@ Stored size was identical across the runs (394,005 data bytes, 49 blocks, one se
 
 ## Rust API
 
-`Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced; the HTTP `POST` uses it. `Store::query(from_ms, to_ms)` returns matching rows in ingest order.
+`Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced; the HTTP `POST` uses it. `Store::query(from_ms, to_ms)` returns matching [`Row`] values in ingest order; use [`RowSerializable`] or [`row_to_json_bytes`] when you need the original JSON lexemes (including duplicate keys). `Store::query_json` returns the same data as one JSON array for HTTP.

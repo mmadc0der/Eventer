@@ -42,7 +42,7 @@ pub fn encode_block(schema: &Schema, rows: &[Row]) -> Result<EncodedBlock> {
     })
 }
 
-pub fn decode_block(schema: &Schema, bytes: &[u8]) -> Result<Vec<Row>> {
+pub fn block_row_count(bytes: &[u8]) -> Result<usize> {
     if bytes.len() < 4 {
         return Err(Error::corrupt("block is shorter than its row count"));
     }
@@ -52,6 +52,11 @@ pub fn decode_block(schema: &Schema, bytes: &[u8]) -> Result<Vec<Row>> {
             "block row count {nrows} is invalid"
         )));
     }
+    Ok(nrows)
+}
+
+pub fn decode_block(schema: &Schema, bytes: &[u8]) -> Result<Vec<Row>> {
+    let nrows = block_row_count(bytes)?;
     let mut cursor = 4;
     let mut columns = Vec::with_capacity(schema.fields.len());
     for field in &schema.fields {
@@ -253,7 +258,7 @@ fn string_dict_might_compress(present: &[&str]) -> bool {
     let mut duplicate_bytes: u64 = 0;
     for text in present {
         if text.len() > LARGE {
-            let fp = (text.len(), peek_hash(text));
+            let fp = (text.len(), string_fingerprint(text));
             if !large_fp.insert(fp) {
                 duplicate_bytes += text.len() as u64;
             }
@@ -264,15 +269,14 @@ fn string_dict_might_compress(present: &[&str]) -> bool {
     if duplicate_bytes == 0 {
         return false;
     }
-    duplicate_bytes * 2 < total_bytes
-        && (small.len() + large_fp.len()) <= present.len() / 2
+    let unique_count = small.len() + large_fp.len();
+    duplicate_bytes * 2 >= total_bytes || unique_count * 2 <= present.len()
 }
 
-fn peek_hash(text: &str) -> u64 {
-    let bytes = text.as_bytes();
+fn string_fingerprint(text: &str) -> u64 {
     let mut hash = 0u64;
-    for byte in bytes.iter().take(16) {
-        hash = hash * 31 + *byte as u64;
+    for byte in text.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
     }
     hash
 }
@@ -791,6 +795,30 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn string_dictionary_wins_on_low_cardinality() {
+        let values: Vec<Option<String>> = (0..8)
+            .map(|i| Some(["click", "view", "buy"][i % 3].to_string()))
+            .collect();
+        let present: Vec<&str> = values.iter().filter_map(|v| v.as_deref()).collect();
+        assert!(string_dict_might_compress(&present));
+        let raw = encode_raw_strings(&present);
+        let dict = encode_dict_strings(&present);
+        assert!(dict.len() < raw.len());
+        let encoded = encode_strings(&values, true);
+        assert_eq!(encoded[0], 1, "expected dictionary encoding kind 1");
+    }
+
+    #[test]
+    fn string_fingerprint_does_not_overflow_on_large_strings() {
+        let a = "x".repeat(5000);
+        let b = "y".repeat(5000);
+        let _ = string_fingerprint(&a);
+        let _ = string_fingerprint(&b);
+        let values = vec![Some(a), Some(b)];
+        let _ = encode_strings(&values, true);
     }
 
     #[test]

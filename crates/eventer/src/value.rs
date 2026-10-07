@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::{Map, Number, Value};
 
 use crate::error::{Error, Result};
@@ -204,8 +205,31 @@ pub fn format_decimal(value: i128, scale: u32) -> String {
     }
 }
 
+/// Serializes a row to JSON while preserving raw `json` column lexemes (including duplicate keys).
+pub struct RowSerializable<'a> {
+    pub schema: &'a Schema,
+    pub row: &'a Row,
+}
+
+impl Serialize for RowSerializable<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = row_to_json_bytes(self.schema, self.row).map_err(serde::ser::Error::custom)?;
+        let raw = serde_json::value::RawValue::from_string(
+            String::from_utf8(bytes).map_err(serde::ser::Error::custom)?,
+        )
+        .map_err(serde::ser::Error::custom)?;
+        raw.serialize(serializer)
+    }
+}
+
 pub fn row_to_json(schema: &Schema, row: &Row) -> Result<Value> {
-    value_from_row_json_bytes(&row_to_json_bytes(schema, row)?, schema)
+    let bytes = serde_json::to_vec(&RowSerializable { schema, row }).map_err(|err| {
+        Error::corrupt(format!("failed to encode row JSON: {err}"))
+    })?;
+    value_from_row_json_bytes(&bytes, schema)
 }
 
 /// Builds a [`Value`] from canonical row bytes, re-parsing only non-`json` columns.
@@ -451,6 +475,49 @@ mod tests {
             parse_event(&schema, br#"{"ts":1,"props":null,"props":{"a":1}}"#).unwrap();
         match &object_last.values[1] {
             Scalar::Json(raw) => assert_eq!(raw, r#"{"a":1}"#),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_utf8_object_key_matches_schema_field() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "café", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let raw_key = br#"{"ts":1,"caf\u00e9":{"ok":true}}"#;
+        let row = parse_event(&schema, raw_key).unwrap();
+        match &row.values[1] {
+            Scalar::Json(raw) => assert_eq!(raw, r#"{"ok":true}"#),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_ignored_surrogate_key_does_not_break_parse() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let row = parse_event(
+            &schema,
+            br#"{"ts":1,"\uD83D\uDE00":9,"props":2}"#,
+        )
+        .unwrap();
+        match &row.values[1] {
+            Scalar::Json(raw) => assert_eq!(raw, "2"),
             other => panic!("unexpected {other:?}"),
         }
     }
