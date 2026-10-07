@@ -1,0 +1,10 @@
+[package]
+name = "eventer-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Small write benchmark for the Eventer store"
+publish = false
+
+[dependencies]
+eventer = { path = "../eventer" }
+serde_json = "1"

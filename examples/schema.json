@@ -1,0 +1,12 @@
+{
+  "timestamp_field": "ts",
+  "fields": [
+    {"name": "ts", "type": "timestamp"},
+    {"name": "user_id", "type": "int"},
+    {"name": "score", "type": "float"},
+    {"name": "ok", "type": "bool"},
+    {"name": "action", "type": "string"},
+    {"name": "note", "type": "text"},
+    {"name": "amount", "type": "decimal", "scale": 2}
+  ]
+}

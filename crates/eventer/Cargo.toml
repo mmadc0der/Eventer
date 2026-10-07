@@ -1,0 +1,17 @@
+[package]
+name = "eventer"
+version = "0.1.0"
+edition = "2021"
+description = "Append-only columnar JSON event store"
+publish = false
+
+[lib]
+name = "eventer"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crc32fast = "1"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zstd = "0.13"
