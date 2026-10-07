@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::codec::{block_row_count, decode_block};
+use crate::codec::{block_row_count, decode_rows_in_range};
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, Schema};
@@ -139,9 +139,7 @@ impl Store {
             if rows_out.len() >= MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
-            if response_bytes > MAX_QUERY_BYTES {
-                return Err(Error::event("query response size limit exceeded"));
-            }
+            let string_budget = remaining_query_bytes(response_bytes)?;
             let payload = segment::read_block_payload(
                 &segment::data_path(&self.dir, block.segment_id),
                 &block,
@@ -152,7 +150,8 @@ impl Store {
                     return Err(Error::event("query row limit exceeded"));
                 }
             }
-            let rows = decode_block(&self.schema, &payload)?;
+            let rows =
+                decode_rows_in_range(&self.schema, &payload, from_ms, to_ms, string_budget)?;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
                     if rows_out.len() >= MAX_QUERY_ROWS {
@@ -202,9 +201,7 @@ impl Store {
             if row_count >= MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
-            if out.len() + 1 > MAX_QUERY_BYTES {
-                return Err(Error::event("query response size limit exceeded"));
-            }
+            let string_budget = remaining_query_bytes(out.len())?;
             let payload = segment::read_block_payload(
                 &segment::data_path(&self.dir, block.segment_id),
                 &block,
@@ -215,7 +212,8 @@ impl Store {
                     return Err(Error::event("query row limit exceeded"));
                 }
             }
-            let rows = decode_block(&self.schema, &payload)?;
+            let rows =
+                decode_rows_in_range(&self.schema, &payload, from_ms, to_ms, string_budget)?;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
                     if row_count >= MAX_QUERY_ROWS {
@@ -274,6 +272,16 @@ impl Drop for Store {
     }
 }
 
+/// Bytes already written, including the opening `[`. A further row needs at
+/// least one payload byte plus the closing `]`, so a full buffer stops the
+/// next block before it is read or decoded.
+fn remaining_query_bytes(produced: usize) -> Result<usize> {
+    if produced >= MAX_QUERY_BYTES || MAX_QUERY_BYTES - produced <= 1 {
+        return Err(Error::event("query response size limit exceeded"));
+    }
+    Ok(MAX_QUERY_BYTES - produced - 1)
+}
+
 fn validate_options(options: &StoreOptions) -> Result<()> {
     if options.block_rows == 0 || options.block_rows > 100_000 {
         return Err(Error::schema("block_rows must be between 1 and 100000"));
@@ -315,7 +323,7 @@ fn ensure_schema_lock(dir: &Path, schema: &Schema) -> Result<()> {
 mod tests {
     use super::*;
     use crate::schema::parse_schema;
-    use crate::value::{row_to_json, RowSerializable};
+    use crate::value::{row_to_json, row_to_json_bytes};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -699,15 +707,7 @@ mod tests {
         let rows = store.query(1, 1).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            serde_json::to_vec(&RowSerializable {
-                schema: &schema_model,
-                row: &rows[0],
-            })
-            .unwrap(),
-            number
-        );
-        assert_eq!(
-            serde_json::to_vec(&row_to_json(&schema_model, &rows[0]).unwrap()).unwrap(),
+            row_to_json_bytes(&schema_model, &rows[0]).unwrap(),
             number
         );
 
@@ -717,15 +717,7 @@ mod tests {
             format!("[{}]", String::from_utf8(dup_keys.to_vec()).unwrap()).as_bytes()
         );
         let rows = store.query(3, 3).unwrap();
-        assert_eq!(row_to_json(&schema_model, &rows[0]).unwrap()["props"]["a"], 2);
-        assert_eq!(
-            serde_json::to_vec(&RowSerializable {
-                schema: &schema_model,
-                row: &rows[0],
-            })
-            .unwrap(),
-            dup_keys
-        );
+        assert_eq!(row_to_json_bytes(&schema_model, &rows[0]).unwrap(), dup_keys);
         store.close().unwrap();
     }
 }

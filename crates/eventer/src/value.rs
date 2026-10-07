@@ -225,6 +225,12 @@ impl Serialize for RowSerializable<'_> {
     }
 }
 
+/// Builds a `serde_json::Value` for a row.
+///
+/// Object values are maps, so a `json` column cannot keep duplicate keys.
+/// This re-parses that column and keeps the last key. It is not a check that
+/// the stored lexeme survived. Use [`row_to_json_bytes`] or [`RowSerializable`]
+/// when the original text, including duplicate keys, has to round-trip.
 pub fn row_to_json(schema: &Schema, row: &Row) -> Result<Value> {
     let bytes = serde_json::to_vec(&RowSerializable { schema, row }).map_err(|err| {
         Error::corrupt(format!("failed to encode row JSON: {err}"))
