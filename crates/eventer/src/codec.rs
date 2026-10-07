@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::json_scan::validate_json_structure;
 use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::value::{Row, Scalar};
@@ -240,18 +241,40 @@ fn encode_strings(values: &[Option<String>], allow_dict: bool) -> Vec<u8> {
 }
 
 /// Dictionary encoding only wins when some values repeat; unique strings pay extra
-/// for a code table, so skip the second pass unless we see a duplicate.
+/// for a code table, so skip the second pass unless a cheap check says it can win.
 fn string_dict_might_compress(present: &[&str]) -> bool {
     if present.len() < 2 {
         return false;
     }
-    let mut seen = HashSet::with_capacity(present.len());
+    const LARGE: usize = 4096;
+    let total_bytes: u64 = present.iter().map(|text| text.len() as u64).sum();
+    let mut small = HashSet::with_capacity(present.len());
+    let mut large_fp = HashSet::with_capacity(present.len());
+    let mut duplicate_bytes: u64 = 0;
     for text in present {
-        if !seen.insert(text) {
-            return true;
+        if text.len() > LARGE {
+            let fp = (text.len(), peek_hash(text));
+            if !large_fp.insert(fp) {
+                duplicate_bytes += text.len() as u64;
+            }
+        } else if !small.insert(text) {
+            duplicate_bytes += text.len() as u64;
         }
     }
-    false
+    if duplicate_bytes == 0 {
+        return false;
+    }
+    duplicate_bytes * 2 < total_bytes
+        && (small.len() + large_fp.len()) <= present.len() / 2
+}
+
+fn peek_hash(text: &str) -> u64 {
+    let bytes = text.as_bytes();
+    let mut hash = 0u64;
+    for byte in bytes.iter().take(16) {
+        hash = hash * 31 + *byte as u64;
+    }
+    hash
 }
 
 fn encode_raw_strings(present: &[&str]) -> Vec<u8> {
@@ -653,12 +676,7 @@ fn decode_json(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<Sca
 }
 
 fn validate_json_column_text(text: &str) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_str(text)
-        .map_err(|_| Error::corrupt("json column value is not valid JSON"))?;
-    if value.is_null() {
-        return Err(Error::corrupt("json column stored JSON null"));
-    }
-    Ok(())
+    validate_json_structure(text).map_err(|_| Error::corrupt("json column value is not valid JSON"))
 }
 
 fn read_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {

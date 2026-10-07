@@ -12,6 +12,12 @@ use crate::schema::{self, Schema};
 use crate::segment::{self, Catalog};
 use crate::value::{row_to_json, row_to_json_bytes};
 
+/// Maximum JSON bytes a single query may materialize in the response buffer.
+pub const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum rows a single query may return.
+pub const MAX_QUERY_ROWS: usize = 1_000_000;
+
 /// Counters for the bytes sitting in segment files after the last flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
@@ -126,6 +132,7 @@ impl Store {
                 .collect::<Vec<_>>()
         };
         let mut values = Vec::new();
+        let mut response_bytes = 2usize;
         for block in blocks {
             let payload = segment::read_block_payload(
                 &segment::data_path(&self.dir, block.segment_id),
@@ -134,6 +141,17 @@ impl Store {
             let rows = decode_block(&self.schema, &payload)?;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
+                    if values.len() >= MAX_QUERY_ROWS {
+                        return Err(Error::event("query row limit exceeded"));
+                    }
+                    let row_bytes = row_to_json_bytes(&self.schema, &row)?;
+                    response_bytes = response_bytes
+                        .checked_add(row_bytes.len())
+                        .and_then(|n| n.checked_add(if values.is_empty() { 0 } else { 1 }))
+                        .ok_or_else(|| Error::event("query response size overflow"))?;
+                    if response_bytes > MAX_QUERY_BYTES {
+                        return Err(Error::event("query response size limit exceeded"));
+                    }
                     values.push(row_to_json(&self.schema, &row)?);
                 }
             }
@@ -158,6 +176,7 @@ impl Store {
         };
         let mut out = Vec::from(b"[");
         let mut wrote = false;
+        let mut row_count = 0usize;
         for block in blocks {
             let payload = segment::read_block_payload(
                 &segment::data_path(&self.dir, block.segment_id),
@@ -166,11 +185,24 @@ impl Store {
             let rows = decode_block(&self.schema, &payload)?;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
+                    if row_count >= MAX_QUERY_ROWS {
+                        return Err(Error::event("query row limit exceeded"));
+                    }
+                    let row_bytes = row_to_json_bytes(&self.schema, &row)?;
+                    let next_len = out
+                        .len()
+                        .checked_add(row_bytes.len())
+                        .and_then(|n| n.checked_add(if wrote { 1 } else { 0 }))
+                        .ok_or_else(|| Error::event("query response size overflow"))?;
+                    if next_len + 1 > MAX_QUERY_BYTES {
+                        return Err(Error::event("query response size limit exceeded"));
+                    }
                     if wrote {
                         out.push(b',');
                     }
                     wrote = true;
-                    out.extend_from_slice(&row_to_json_bytes(&self.schema, &row)?);
+                    row_count += 1;
+                    out.extend_from_slice(&row_bytes);
                 }
             }
         }
@@ -249,6 +281,7 @@ fn ensure_schema_lock(dir: &Path, schema: &Schema) -> Result<()> {
 mod tests {
     use super::*;
     use crate::schema::parse_schema;
+    use crate::value::parse_event;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -574,6 +607,51 @@ mod tests {
             let out = store.query_json(ts, ts).unwrap();
             assert_eq!(out, format!("[{}]", String::from_utf8(input.to_vec()).unwrap()).as_bytes());
         }
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn json_field_preserves_store_query() {
+        let dir = TempDir::new();
+        let schema = dir.path().join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        let schema_model = parse_schema(
+            r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"timestamp"},{"name":"props","type":"json"}]}"#,
+        )
+        .unwrap();
+        let number = br#"{"ts":1,"props":9007199254740993.0}"#;
+        let dup_keys = br#"{"ts":3,"props":{"a":1,"a":2,"b":{"z":1,"z":3}}}"#;
+        store.append_json(number).unwrap();
+        store.append_json(dup_keys).unwrap();
+        store.flush().unwrap();
+
+        let rows = store.query(1, 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        let encoded = serde_json::to_vec(&rows[0]).unwrap();
+        let expected = row_to_json_bytes(&schema_model, &parse_event(&schema_model, number).unwrap())
+            .unwrap();
+        assert_eq!(encoded, expected);
+        assert_eq!(expected, number);
+
+        let json_out = store.query_json(3, 3).unwrap();
+        assert_eq!(
+            json_out,
+            format!("[{}]", String::from_utf8(dup_keys.to_vec()).unwrap()).as_bytes()
+        );
+        let rows = store.query(3, 3).unwrap();
+        assert_eq!(rows[0]["props"]["a"], 2);
         store.close().unwrap();
     }
 }
