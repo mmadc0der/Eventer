@@ -467,4 +467,45 @@ mod tests {
         );
         store.close().unwrap();
     }
+
+    #[test]
+    fn json_field_survives_flush_and_query() {
+        let dir = TempDir::new();
+        let schema = dir.path().join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        store
+            .append_json(br#"{"ts":10,"props":{"user":{"id":7},"tags":["a","b"]}}"#)
+            .unwrap();
+        store
+            .append_json(br#"{"ts":20,"props":[1,{"n":2},"z"]}"#)
+            .unwrap();
+        store.append_json(br#"{"ts":30,"props":"solo"}"#).unwrap();
+        store.append_json(br#"{"ts":40}"#).unwrap();
+        let rows = store.query(10, 40).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["props"]["user"]["id"], 7);
+        assert_eq!(rows[0]["props"]["tags"][1], "b");
+        assert_eq!(rows[1]["props"][0], 1);
+        assert_eq!(rows[1]["props"][1]["n"], 2);
+        assert_eq!(rows[2]["props"], "solo");
+        assert!(rows[3]["props"].is_null());
+        store.close().unwrap();
+
+        let reopened = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        let again = reopened.query(10, 10).unwrap();
+        assert_eq!(again[0]["props"]["user"]["id"], 7);
+        reopened.close().unwrap();
+    }
 }

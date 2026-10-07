@@ -12,6 +12,8 @@ pub enum Scalar {
     Str(String),
     Decimal(i128),
     Timestamp(i64),
+    /// Canonical JSON value. Objects use serde_json's key order.
+    Json(Value),
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,7 @@ fn parse_field(name: &str, ty: FieldType, value: &Value) -> Result<Scalar> {
             parse_timestamp_value(value)
                 .map_err(|err| Error::event(format!("field `{name}`: {err}")))?,
         )),
+        FieldType::Json => Ok(Scalar::Json(value.clone())),
     }
 }
 
@@ -201,6 +204,7 @@ pub fn row_to_json(schema: &Schema, row: &Row) -> Result<Value> {
                 Value::String(format_decimal(*v, scale))
             }
             (FieldType::Timestamp, Scalar::Timestamp(v)) => Value::Number((*v).into()),
+            (FieldType::Json, Scalar::Json(v)) => v.clone(),
             _ => {
                 return Err(Error::corrupt(format!(
                     "field `{}` has a value that does not match its type",
@@ -264,5 +268,49 @@ mod tests {
         let again = parse_event(&schema, serde_json::to_vec(&json).unwrap().as_slice()).unwrap();
         assert_eq!(again.ts, row.ts);
         assert!(parse_event(&schema, br#"{"user_id":1}"#).is_err());
+    }
+
+    #[test]
+    fn json_field_keeps_each_row_shape() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let nested = parse_event(
+            &schema,
+            br#"{"ts":10,"props":{"b":1,"a":{"tags":["x",2]},"ok":true}}"#,
+        )
+        .unwrap();
+        let json = row_to_json(&schema, &nested).unwrap();
+        assert_eq!(json["props"]["a"]["tags"][1], 2);
+        assert_eq!(json["props"]["ok"], true);
+        let again = parse_event(&schema, serde_json::to_vec(&json).unwrap().as_slice()).unwrap();
+        assert_eq!(row_to_json(&schema, &again).unwrap(), json);
+
+        let list = parse_event(&schema, br#"{"ts":11,"props":[1,"z",false]}"#).unwrap();
+        assert_eq!(
+            row_to_json(&schema, &list).unwrap()["props"],
+            serde_json::json!([1, "z", false])
+        );
+        let text = parse_event(&schema, br#"{"ts":12,"props":"plain"}"#).unwrap();
+        assert_eq!(row_to_json(&schema, &text).unwrap()["props"], "plain");
+        let number = parse_event(&schema, br#"{"ts":13,"props":42}"#).unwrap();
+        assert_eq!(row_to_json(&schema, &number).unwrap()["props"], 42);
+        let missing = parse_event(&schema, br#"{"ts":14}"#).unwrap();
+        assert!(row_to_json(&schema, &missing).unwrap()["props"].is_null());
+        let explicit_null = parse_event(&schema, br#"{"ts":15,"props":null}"#).unwrap();
+        assert!(row_to_json(&schema, &explicit_null).unwrap()["props"].is_null());
+
+        let strings = parse_schema(
+            r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"timestamp"},{"name":"action","type":"string"}]}"#,
+        )
+        .unwrap();
+        assert!(parse_event(&strings, br#"{"ts":1,"action":{"nested":true}}"#).is_err());
     }
 }

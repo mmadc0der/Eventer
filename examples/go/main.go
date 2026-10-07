@@ -49,7 +49,7 @@ func main() {
 	store := openStore(data, schema)
 	defer C.eventer_close(store)
 
-	event := []byte(`{"ts":1700000000000,"user_id":7,"score":1.5,"ok":true,"action":"click","note":"from go","amount":"19.99"}`)
+	event := []byte(`{"ts":1700000000000,"user_id":7,"score":1.5,"ok":true,"action":"click","note":"from go","amount":"19.99","props":{"plan":"pro","flags":["a",1]}}`)
 	if rc := C.eventer_append(store, (*C.uint8_t)(unsafe.Pointer(&event[0])), C.size_t(len(event))); rc != 0 {
 		fatalf("append: %d: %s", rc, lastError(store))
 	}
@@ -128,7 +128,8 @@ const schemaJSON = `{
     {"name": "ok", "type": "bool"},
     {"name": "action", "type": "string"},
     {"name": "note", "type": "text"},
-    {"name": "amount", "type": "decimal", "scale": 2}
+    {"name": "amount", "type": "decimal", "scale": 2},
+    {"name": "props", "type": "json"}
   ]
 }
 `

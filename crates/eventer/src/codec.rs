@@ -109,6 +109,10 @@ fn encode_column(out: &mut Vec<u8>, ty: FieldType, rows: &[Row], index: usize) -
             let values = strings(rows, index)?;
             out.extend_from_slice(&encode_strings(&values, false));
         }
+        FieldType::Json => {
+            let values = json_texts(rows, index)?;
+            out.extend_from_slice(&encode_strings(&values, true));
+        }
     }
     Ok(())
 }
@@ -385,6 +389,20 @@ fn strings(rows: &[Row], index: usize) -> Result<Vec<Option<String>>> {
         .collect()
 }
 
+fn json_texts(rows: &[Row], index: usize) -> Result<Vec<Option<String>>> {
+    rows.iter()
+        .map(|row| match &row.values[index] {
+            Scalar::Null => Ok(None),
+            Scalar::Json(value) => {
+                let text = serde_json::to_string(value)
+                    .map_err(|err| Error::event(format!("json column failed to encode: {err}")))?;
+                Ok(Some(text))
+            }
+            _ => Err(Error::event("json column contains a non-json value")),
+        })
+        .collect()
+}
+
 fn decode_column(
     ty: FieldType,
     bytes: &[u8],
@@ -424,6 +442,7 @@ fn decode_column(
             .into_iter()
             .map(Scalar::Str)
             .collect(),
+        FieldType::Json => decode_json(bytes, cursor, present_count)?,
     };
     if values.len() != present_count {
         return Err(Error::corrupt(
@@ -612,6 +631,17 @@ fn decode_strings(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<
     }
 }
 
+fn decode_json(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<Scalar>> {
+    decode_strings(bytes, cursor, count)?
+        .into_iter()
+        .map(|text| {
+            let value = serde_json::from_str(&text)
+                .map_err(|_| Error::corrupt("json column value is not valid JSON"))?;
+            Ok(Scalar::Json(value))
+        })
+        .collect()
+}
+
 fn read_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
     let len = read_varint(bytes, cursor)? as usize;
     let end = cursor
@@ -760,5 +790,46 @@ mod tests {
         }
         assert!(matches!(decoded[0].values[1], Scalar::Null));
         assert!(matches!(decoded[0].values[5], Scalar::Null));
+    }
+
+    #[test]
+    fn json_column_roundtrips_mixed_shapes() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let payloads = [
+            serde_json::json!({"plan": "pro", "flags": ["a", 1]}),
+            serde_json::json!({"plan": "pro", "flags": ["a", 1]}),
+            serde_json::json!([1, "x", {"k": false}]),
+            serde_json::json!("plain"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ];
+        let mut rows = Vec::new();
+        for (i, props) in payloads.iter().enumerate() {
+            let mut obj = serde_json::json!({"ts": 1_000 + i as i64});
+            if !props.is_null() {
+                obj["props"] = props.clone();
+            }
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let decoded = decode_block(&schema, &encoded.bytes).unwrap();
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(
+                row_to_json(&schema, left).unwrap(),
+                row_to_json(&schema, right).unwrap()
+            );
+        }
+        assert!(matches!(decoded.last().unwrap().values[1], Scalar::Null));
+        assert!(matches!(decoded[0].values[1], Scalar::Json(_)));
     }
 }
