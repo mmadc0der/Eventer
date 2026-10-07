@@ -500,6 +500,34 @@ mod tests {
     }
 
     #[test]
+    fn json_surrogate_key_suffix_does_not_alias_field_name() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "😀x", "type": "json"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let row = parse_event(
+            &schema,
+            br#"{"ts":1,"\uD83D\uDE00x":1,"props":2}"#,
+        )
+        .unwrap();
+        match &row.values[1] {
+            Scalar::Json(raw) => assert_eq!(raw, "1"),
+            other => panic!("unexpected {other:?}"),
+        }
+        match &row.values[2] {
+            Scalar::Json(raw) => assert_eq!(raw, "2"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn json_ignored_surrogate_key_does_not_break_parse() {
         let schema = parse_schema(
             r#"{

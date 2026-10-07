@@ -140,7 +140,7 @@ pub fn decode_json_string(bytes: &[u8]) -> Result<String> {
                         let ch = char::from_u32(combined)
                             .ok_or_else(|| Error::event("invalid JSON unicode escape"))?;
                         out.push(ch);
-                        i += 7;
+                        i += 6;
                     } else if (0xDC00..=0xDFFF).contains(&code) {
                         return Err(Error::event("invalid JSON unicode escape"));
                     } else {
@@ -284,6 +284,13 @@ mod tests {
         let doc = br#"{"ts":1,"\uD83D\uDE00":0,"props":3}"#;
         let value = extract_object_field_raw_last(doc, "props").unwrap();
         assert_eq!(value.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn surrogate_pair_followed_by_char_is_decoded() {
+        let inner = br"\uD83D\uDE00x";
+        let decoded = decode_json_string(inner).unwrap();
+        assert_eq!(decoded, "😀x");
     }
 }
 

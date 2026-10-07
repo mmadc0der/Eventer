@@ -16,9 +16,6 @@ pub const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum rows a single query may return.
 pub const MAX_QUERY_ROWS: usize = 1_000_000;
 
-/// Upper bound on one event JSON payload (see ingest validation in [`crate::value::parse_event`]).
-const MAX_EVENT_JSON_BYTES: usize = 1024 * 1024;
-
 /// Counters for the bytes sitting in segment files after the last flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
@@ -137,8 +134,14 @@ impl Store {
                 .collect::<Vec<_>>()
         };
         let mut rows_out = Vec::new();
-        let mut response_bytes = 2usize;
+        let mut response_bytes = 1usize;
         for block in blocks {
+            if rows_out.len() >= MAX_QUERY_ROWS {
+                return Err(Error::event("query row limit exceeded"));
+            }
+            if response_bytes > MAX_QUERY_BYTES {
+                return Err(Error::event("query response size limit exceeded"));
+            }
             let payload = segment::read_block_payload(
                 &segment::data_path(&self.dir, block.segment_id),
                 &block,
@@ -147,10 +150,6 @@ impl Store {
             if block.min_ts >= from_ms && block.max_ts <= to_ms {
                 if rows_out.len() + nrows > MAX_QUERY_ROWS {
                     return Err(Error::event("query row limit exceeded"));
-                }
-                let worst = nrows.saturating_mul(MAX_EVENT_JSON_BYTES);
-                if response_bytes.saturating_add(worst) > MAX_QUERY_BYTES {
-                    return Err(Error::event("query response size limit exceeded"));
                 }
             }
             let rows = decode_block(&self.schema, &payload)?;
@@ -162,15 +161,18 @@ impl Store {
                     let row_bytes = row_to_json_bytes(&self.schema, &row)?;
                     let row_cost = row_bytes
                         .len()
-                        .checked_mul(2)
+                        .checked_add(if rows_out.is_empty() { 0 } else { 1 })
                         .ok_or_else(|| Error::event("query response size overflow"))?;
-                    response_bytes = response_bytes
+                    let next_bytes = response_bytes
                         .checked_add(row_cost)
-                        .and_then(|n| n.checked_add(if rows_out.is_empty() { 0 } else { 1 }))
+                        .and_then(|n| n.checked_add(1))
                         .ok_or_else(|| Error::event("query response size overflow"))?;
-                    if response_bytes > MAX_QUERY_BYTES {
+                    if next_bytes > MAX_QUERY_BYTES {
                         return Err(Error::event("query response size limit exceeded"));
                     }
+                    response_bytes = response_bytes
+                        .checked_add(row_cost)
+                        .ok_or_else(|| Error::event("query response size overflow"))?;
                     rows_out.push(row);
                 }
             }
@@ -197,6 +199,12 @@ impl Store {
         let mut wrote = false;
         let mut row_count = 0usize;
         for block in blocks {
+            if row_count >= MAX_QUERY_ROWS {
+                return Err(Error::event("query row limit exceeded"));
+            }
+            if out.len() + 1 > MAX_QUERY_BYTES {
+                return Err(Error::event("query response size limit exceeded"));
+            }
             let payload = segment::read_block_payload(
                 &segment::data_path(&self.dir, block.segment_id),
                 &block,
@@ -205,10 +213,6 @@ impl Store {
             if block.min_ts >= from_ms && block.max_ts <= to_ms {
                 if row_count + nrows > MAX_QUERY_ROWS {
                     return Err(Error::event("query row limit exceeded"));
-                }
-                let worst = nrows.saturating_mul(MAX_EVENT_JSON_BYTES);
-                if out.len().saturating_add(worst) + 1 > MAX_QUERY_BYTES {
-                    return Err(Error::event("query response size limit exceeded"));
                 }
             }
             let rows = decode_block(&self.schema, &payload)?;
@@ -222,8 +226,9 @@ impl Store {
                         .len()
                         .checked_add(row_bytes.len())
                         .and_then(|n| n.checked_add(if wrote { 1 } else { 0 }))
+                        .and_then(|n| n.checked_add(1))
                         .ok_or_else(|| Error::event("query response size overflow"))?;
-                    if next_len + 1 > MAX_QUERY_BYTES {
+                    if next_len > MAX_QUERY_BYTES {
                         return Err(Error::event("query response size limit exceeded"));
                     }
                     if wrote {
@@ -640,6 +645,27 @@ mod tests {
             let out = store.query_json(ts, ts).unwrap();
             assert_eq!(out, format!("[{}]", String::from_utf8(input.to_vec()).unwrap()).as_bytes());
         }
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn query_does_not_reject_block_of_small_events() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let mut options = test_options(128);
+        options.block_rows = 128;
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        for ts in 1..=80 {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let rows = store.query(1, 80).unwrap();
+        assert_eq!(rows.len(), 80);
+        let json = store.query_json(1, 80).unwrap();
+        assert!(json.len() < MAX_QUERY_BYTES);
         store.close().unwrap();
     }
 
