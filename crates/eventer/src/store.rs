@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, Schema};
 use crate::segment::{self, Catalog};
-use crate::value::row_to_json;
+use crate::value::{row_to_json, row_to_json_bytes};
 
 /// Counters for the bytes sitting in segment files after the last flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,8 +143,39 @@ impl Store {
 
     /// Same as [`Store::query`], encoded as one JSON array.
     pub fn query_json(&self, from_ms: i64, to_ms: i64) -> Result<Vec<u8>> {
-        let values = self.query(from_ms, to_ms)?;
-        Ok(serde_json::to_vec(&values)?)
+        self.flush()?;
+        if from_ms > to_ms {
+            return Ok(b"[]".to_vec());
+        }
+        let blocks = {
+            let catalog = self.catalog();
+            catalog
+                .segments
+                .iter()
+                .flat_map(|segment| segment.blocks.iter().cloned())
+                .filter(|block| block.max_ts >= from_ms && block.min_ts <= to_ms)
+                .collect::<Vec<_>>()
+        };
+        let mut out = Vec::from(b"[");
+        let mut wrote = false;
+        for block in blocks {
+            let payload = segment::read_block_payload(
+                &segment::data_path(&self.dir, block.segment_id),
+                &block,
+            )?;
+            let rows = decode_block(&self.schema, &payload)?;
+            for row in rows {
+                if row.ts >= from_ms && row.ts <= to_ms {
+                    if wrote {
+                        out.push(b',');
+                    }
+                    wrote = true;
+                    out.extend_from_slice(&row_to_json_bytes(&self.schema, &row)?);
+                }
+            }
+        }
+        out.push(b']');
+        Ok(out)
     }
 
     /// File sizes from the last committed batch. Call [`Store::flush`] first for a stable view.
@@ -507,5 +538,42 @@ mod tests {
         let again = reopened.query(10, 10).unwrap();
         assert_eq!(again[0]["props"]["user"]["id"], 7);
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn json_field_preserves_query_bytes() {
+        let dir = TempDir::new();
+        let schema = dir.path().join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        let cases: &[&[u8]] = &[
+            br#"{"ts":1,"props":9007199254740993.0}"#,
+            br#"{"ts":2,"props":18446744073709551617}"#,
+            br#"{"ts":3,"props":{"a":1,"a":2,"b":{"z":1,"z":3}}}"#,
+        ];
+        for input in cases {
+            store.append_json(input).unwrap();
+        }
+        store.flush().unwrap();
+        for input in cases {
+            let ts = serde_json::from_slice::<serde_json::Value>(input)
+                .unwrap()["ts"]
+                .as_i64()
+                .unwrap();
+            let out = store.query_json(ts, ts).unwrap();
+            assert_eq!(out, format!("[{}]", String::from_utf8(input.to_vec()).unwrap()).as_bytes());
+        }
+        store.close().unwrap();
     }
 }

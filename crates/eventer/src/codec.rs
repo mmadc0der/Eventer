@@ -393,11 +393,7 @@ fn json_texts(rows: &[Row], index: usize) -> Result<Vec<Option<String>>> {
     rows.iter()
         .map(|row| match &row.values[index] {
             Scalar::Null => Ok(None),
-            Scalar::Json(value) => {
-                let text = serde_json::to_string(value)
-                    .map_err(|err| Error::event(format!("json column failed to encode: {err}")))?;
-                Ok(Some(text))
-            }
+            Scalar::Json(text) => Ok(Some(text.clone())),
             _ => Err(Error::event("json column contains a non-json value")),
         })
         .collect()
@@ -635,11 +631,19 @@ fn decode_json(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<Sca
     decode_strings(bytes, cursor, count)?
         .into_iter()
         .map(|text| {
-            let value = serde_json::from_str(&text)
-                .map_err(|_| Error::corrupt("json column value is not valid JSON"))?;
-            Ok(Scalar::Json(value))
+            validate_json_column_text(&text)?;
+            Ok(Scalar::Json(text))
         })
         .collect()
+}
+
+fn validate_json_column_text(text: &str) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| Error::corrupt("json column value is not valid JSON"))?;
+    if value.is_null() {
+        return Err(Error::corrupt("json column stored JSON null"));
+    }
+    Ok(())
 }
 
 fn read_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
@@ -824,10 +828,7 @@ mod tests {
         let encoded = encode_block(&schema, &rows).unwrap();
         let decoded = decode_block(&schema, &encoded.bytes).unwrap();
         for (left, right) in rows.iter().zip(decoded.iter()) {
-            assert_eq!(
-                row_to_json(&schema, left).unwrap(),
-                row_to_json(&schema, right).unwrap()
-            );
+            assert_eq!(left.values[1], right.values[1]);
         }
         assert!(matches!(decoded.last().unwrap().values[1], Scalar::Null));
         assert!(matches!(decoded[0].values[1], Scalar::Json(_)));
