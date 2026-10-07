@@ -477,12 +477,23 @@ fn emit_block(
     }
 }
 
+/// A sealed block is decompressed even when the query range only overlaps it.
+/// Keep that expansion inside one query response (`store::MAX_QUERY_BYTES`).
+const MAX_SEALED_BLOCK_UNCOMPRESSED: usize = 64 * 1024 * 1024;
+
 fn compress_loop(rx: Receiver<CompIn>, tx: Sender<CompOut>, level: i32) {
     let mut compressor = zstd::bulk::Compressor::new(level).ok();
     while let Ok(msg) = rx.recv() {
         let out = match msg {
             CompIn::Flush { seq, ack } => CompOut::Flush { seq, ack },
             CompIn::Shutdown { seq, ack } => CompOut::Shutdown { seq, ack },
+            CompIn::Block(block) if block.raw.len() > MAX_SEALED_BLOCK_UNCOMPRESSED => {
+                CompOut::Skip {
+                    seq: block.seq,
+                    acks: block.acks,
+                    error: Error::event("query response size limit exceeded"),
+                }
+            }
             CompIn::Block(block) => match compressor.as_mut() {
                 None => CompOut::Skip {
                     seq: block.seq,

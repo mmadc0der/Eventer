@@ -140,6 +140,12 @@ impl Store {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(response_bytes)?;
+            if block.min_ts >= from_ms
+                && block.max_ts <= to_ms
+                && block.uncompressed_len as usize > string_budget
+            {
+                return Err(Error::event("query response size limit exceeded"));
+            }
             let payload = segment::read_block_payload(
                 &segment::data_path(&self.dir, block.segment_id),
                 &block,
@@ -202,6 +208,12 @@ impl Store {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(out.len())?;
+            if block.min_ts >= from_ms
+                && block.max_ts <= to_ms
+                && block.uncompressed_len as usize > string_budget
+            {
+                return Err(Error::event("query response size limit exceeded"));
+            }
             let payload = segment::read_block_payload(
                 &segment::data_path(&self.dir, block.segment_id),
                 &block,

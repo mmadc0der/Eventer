@@ -301,14 +301,25 @@ fn string_dict_might_compress(present: &[&str]) -> bool {
     let mut small = HashSet::with_capacity(present.len());
     let mut large_fp = HashSet::with_capacity(present.len());
     let mut duplicate_bytes: u64 = 0;
+    let mut seen_bytes: u64 = 0;
     for text in present {
+        let tail_bytes = total_bytes - seen_bytes;
+        let unique_count = small.len() + large_fp.len();
+        let max_duplicate = duplicate_bytes.saturating_add(tail_bytes);
+        let duplicate_can_win = max_duplicate.saturating_mul(2) >= total_bytes;
+        let cardinality_can_win = unique_count.saturating_mul(2) <= present.len();
+        if !duplicate_can_win && !cardinality_can_win {
+            return false;
+        }
+        let len = text.len() as u64;
+        seen_bytes += len;
         if text.len() > LARGE {
             let fp = (text.len(), string_fingerprint(text));
             if !large_fp.insert(fp) {
-                duplicate_bytes += text.len() as u64;
+                duplicate_bytes += len;
             }
         } else if !small.insert(text) {
-            duplicate_bytes += text.len() as u64;
+            duplicate_bytes += len;
         }
     }
     if duplicate_bytes == 0 {
@@ -1118,6 +1129,11 @@ mod tests {
             .collect();
         let present: Vec<&str> = values.iter().filter_map(|v| v.as_deref()).collect();
         assert!(string_dict_might_compress(&present));
+        let distinct: Vec<String> = (0..64)
+            .map(|i| format!("doc-{i:04}-{}", "x".repeat(64)))
+            .collect();
+        let distinct_refs: Vec<&str> = distinct.iter().map(String::as_str).collect();
+        assert!(!string_dict_might_compress(&distinct_refs));
         let raw = encode_raw_strings(&present);
         let dict = encode_dict_strings(&present);
         assert!(dict.len() < raw.len());
