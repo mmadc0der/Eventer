@@ -690,6 +690,50 @@ mod tests {
     }
 
     #[test]
+    fn oversized_json_block_is_split_and_every_row_is_readable() {
+        let dir = TempDir::new();
+        let schema = dir.path().join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(80)).unwrap();
+        store
+            .append_json(br#"{"ts":1,"props":{"ok":true}}"#)
+            .unwrap();
+        store.flush().unwrap();
+
+        let body = "x".repeat(890 * 1024);
+        for ts in 2..=101 {
+            let event = format!(r#"{{"ts":{ts},"props":{{"n":{ts},"body":"{body}"}}}}"#);
+            store.append_json(event.as_bytes()).unwrap();
+        }
+        store.flush().unwrap();
+        let stats = store.stats();
+        assert_eq!(stats.rows, 101);
+        assert!(stats.blocks >= 3);
+        for ts in [1, 2, 81, 82, 101] {
+            assert_eq!(store.query(ts, ts).unwrap().len(), 1, "ts {ts}");
+        }
+        store.close().unwrap();
+
+        let reopened = Store::open_with(&data, &schema, test_options(80)).unwrap();
+        assert_eq!(reopened.stats().rows, 101);
+        for ts in [1, 2, 81, 82, 101] {
+            assert_eq!(reopened.query(ts, ts).unwrap().len(), 1, "ts {ts}");
+        }
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn json_field_preserves_store_query() {
         let dir = TempDir::new();
         let schema = dir.path().join("schema.json");
