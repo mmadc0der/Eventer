@@ -17,24 +17,23 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           BODY: ${{ github.event.review.body }}
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_ID: ${{ github.event.review.id }}
         run: |
           set -eu
           KEY="$(printf '%s' "$KEY" | tr -d '\r\n')"
           URL="$(printf '%s' "$URL" | tr -d '\r\n')"
           ids="$(printf '%s\n' "$BODY" | sed -n 's/.*Resolve-Comment:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
           if [ -z "$ids" ]; then
-            ids="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/reviews/${{ github.event.review.id }}/comments" \
-              --jq '.[] | select(.in_reply_to_id == null) | .id')"
+            ids="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews/${REVIEW_ID}/comments" --jq '.[] | select(.in_reply_to_id == null) | .id')"
           fi
           if [ -z "$ids" ]; then
             exit 0
           fi
-          context="PR ${PR_URL}
-Fix only these review comments. One commit. Do not submit a review."
+          context="PR ${PR_URL}"$'\n'"Fix only these review comments. One commit. Do not submit a review."
           while IFS= read -r id; do
             [ -n "$id" ] || continue
-            context="${context}
-Resolve-Comment: ${id}"
+            context="${context}"$'\n'"Resolve-Comment: ${id}"
           done <<< "$ids"
           jq -n --arg context "$context" '{context:$context}' \
             | curl -sS -f -X POST "$URL" \
