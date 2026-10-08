@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::json_scan::validate_json_structure;
 use crate::error::{Error, Result};
+use crate::json_scan::validate_json_structure;
 use crate::schema::{FieldType, Schema};
 use crate::value::{Row, Scalar};
 
@@ -125,12 +125,12 @@ pub(crate) fn decode_rows_in_range_filtered(
                         nrows,
                         &mut mask,
                         &predicate.allowed,
+                        &mut budget,
                     )? {
                         StringFilter::Miss => {
                             return finish_empty(schema, bytes, &mut cursor, index + 1);
                         }
                         StringFilter::Values(values) => {
-                            charge_kept_strings(&values, &mask, &mut budget)?;
                             columns[index] = Some(values);
                             if !mask.iter().any(|keep| *keep) {
                                 return finish_empty(schema, bytes, &mut cursor, index + 1);
@@ -222,20 +222,6 @@ pub(crate) fn decode_rows_in_range_filtered(
         rows.push(Row { values, ts });
     }
     Ok(rows)
-}
-
-fn charge_kept_strings(values: &[Scalar], mask: &[bool], budget: &mut usize) -> Result<()> {
-    let mut total = 0usize;
-    for (value, keep) in values.iter().zip(mask.iter()) {
-        if *keep {
-            if let Scalar::Str(text) = value {
-                total = total
-                    .checked_add(text.len())
-                    .ok_or_else(|| Error::event("query response size limit exceeded"))?;
-            }
-        }
-    }
-    charge_string_bytes(budget, total)
 }
 
 fn decode_rows(
@@ -705,9 +691,7 @@ fn decode_column(
                 .map(Scalar::Str)
                 .collect()
         }
-        FieldType::Json => {
-            decode_json(bytes, cursor, present_count, &present_keep, budget)?
-        }
+        FieldType::Json => decode_json(bytes, cursor, present_count, &present_keep, budget)?,
     };
     if values.len() != present_count {
         return Err(Error::corrupt(
@@ -782,9 +766,8 @@ fn skip_column(ty: FieldType, bytes: &[u8], cursor: &mut usize, nrows: usize) ->
         FieldType::Float => skip_f64s(bytes, cursor, present_count),
         FieldType::Bool => skip_bools(bytes, cursor, present_count),
         FieldType::Decimal { .. } => skip_i128s(bytes, cursor, present_count),
-        FieldType::String | FieldType::Text | FieldType::Json => {
-            skip_strings(bytes, cursor, present_count)
-        }
+        FieldType::String | FieldType::Text => skip_strings(bytes, cursor, present_count, false),
+        FieldType::Json => skip_strings(bytes, cursor, present_count, true),
     }
 }
 
@@ -852,7 +835,10 @@ fn skip_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
     let kind = read_u8(bytes, cursor)?;
     match kind {
         1 => {
-            let _ = read_u8(bytes, cursor)?;
+            let value = read_u8(bytes, cursor)?;
+            if value > 1 {
+                return Err(Error::corrupt("bool constant is not 0 or 1"));
+            }
             Ok(())
         }
         2 => {
@@ -863,16 +849,16 @@ fn skip_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
     }
 }
 
-fn skip_strings(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
+fn skip_strings(bytes: &[u8], cursor: &mut usize, count: usize, validate_json: bool) -> Result<()> {
     if count == 0 {
         return expect_kind(bytes, cursor, 0);
     }
     let kind = read_u8(bytes, cursor)?;
     match kind {
-        3 => skip_lp_string(bytes, cursor),
+        3 => skip_lp_string_value(bytes, cursor, validate_json),
         2 => {
             for _ in 0..count {
-                skip_lp_string(bytes, cursor)?;
+                skip_lp_string_value(bytes, cursor, validate_json)?;
             }
             Ok(())
         }
@@ -882,7 +868,7 @@ fn skip_strings(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
                 return Err(Error::corrupt("string dictionary is empty"));
             }
             for _ in 0..dict_len {
-                skip_lp_string(bytes, cursor)?;
+                skip_lp_string_value(bytes, cursor, validate_json)?;
             }
             let width = read_u8(bytes, cursor)? as usize;
             if !matches!(width, 1 | 2 | 4) {
@@ -1065,9 +1051,10 @@ fn decode_strings(
                 validate_json_column_text(&text)?;
             }
             let copies = keep.iter().filter(|flag| **flag).count();
-            let expanded = text.len().checked_mul(copies).ok_or_else(|| {
-                Error::event("query response size limit exceeded")
-            })?;
+            let expanded = text
+                .len()
+                .checked_mul(copies)
+                .ok_or_else(|| Error::event("query response size limit exceeded"))?;
             charge_string_bytes(budget, expanded)?;
             let mut out = Vec::with_capacity(count);
             for flag in keep {
@@ -1125,9 +1112,9 @@ fn decode_strings(
                 let text = dict
                     .get(*code)
                     .ok_or_else(|| Error::corrupt("string dictionary code is out of range"))?;
-                expanded = expanded.checked_add(text.len()).ok_or_else(|| {
-                    Error::event("query response size limit exceeded")
-                })?;
+                expanded = expanded
+                    .checked_add(text.len())
+                    .ok_or_else(|| Error::event("query response size limit exceeded"))?;
             }
             charge_string_bytes(budget, expanded)?;
             let mut out = Vec::with_capacity(count);
@@ -1170,9 +1157,14 @@ fn read_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
 }
 
 fn skip_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<()> {
+    skip_lp_string_value(bytes, cursor, false)
+}
+
+fn skip_lp_string_value(bytes: &[u8], cursor: &mut usize, validate_json: bool) -> Result<()> {
     let slice = read_lp_bytes(bytes, cursor)?;
-    if std::str::from_utf8(slice).is_err() {
-        return Err(Error::corrupt("string is not utf-8"));
+    let text = std::str::from_utf8(slice).map_err(|_| Error::corrupt("string is not utf-8"))?;
+    if validate_json {
+        validate_json_column_text(text)?;
     }
     Ok(())
 }
@@ -1313,6 +1305,7 @@ fn read_string_filter(
     nrows: usize,
     mask: &mut [bool],
     allowed: &[Scalar],
+    budget: &mut usize,
 ) -> Result<StringFilter> {
     let present = read_present(bytes, cursor, nrows)?;
     let (present_count, _) = present_stats(&present, nrows);
@@ -1337,12 +1330,30 @@ fn read_string_filter(
             if !hit && !null_hit {
                 return Ok(StringFilter::Miss);
             }
-            let owned = text.to_owned();
+            let copies = if hit {
+                mask.iter()
+                    .enumerate()
+                    .filter(|(row, keep)| **keep && row_present(*row, &present))
+                    .count()
+            } else {
+                0
+            };
+            let expanded = text
+                .len()
+                .checked_mul(copies)
+                .ok_or_else(|| Error::event("query response size limit exceeded"))?;
+            charge_string_bytes(budget, expanded)?;
+            let owned = if copies > 0 {
+                Some(text.to_owned())
+            } else {
+                None
+            };
             let mut column = Vec::with_capacity(nrows);
             for (row, keep) in mask.iter_mut().enumerate() {
                 if row_present(row, &present) {
                     if *keep && hit {
-                        column.push(Scalar::Str(owned.clone()));
+                        let source = owned.as_ref().map(|text| text.as_str()).unwrap_or("");
+                        column.push(Scalar::Str(source.to_owned()));
                     } else {
                         *keep = false;
                         column.push(Scalar::Null);
@@ -1357,28 +1368,42 @@ fn read_string_filter(
             Ok(StringFilter::Values(column))
         }
         2 => {
-            let mut column = vec![Scalar::Null; nrows];
+            let mut pending = Vec::new();
             let mut saw = null_hit;
             for row in 0..nrows {
                 if !row_present(row, &present) {
-                    if !(mask[row] && null_ok) {
-                        mask[row] = false;
-                    }
                     continue;
                 }
                 let text = read_lp_str(bytes, cursor)?;
                 if mask[row] && scalar_text_hit(allowed, text) {
                     saw = true;
-                    column[row] = Scalar::Str(text.to_owned());
-                } else {
+                    pending.push((row, text));
+                }
+            }
+            if !saw {
+                for row in 0..nrows {
+                    mask[row] = false;
+                }
+                return Ok(StringFilter::Miss);
+            }
+            let mut expanded = 0usize;
+            for (_, text) in &pending {
+                expanded = expanded
+                    .checked_add(text.len())
+                    .ok_or_else(|| Error::event("query response size limit exceeded"))?;
+            }
+            charge_string_bytes(budget, expanded)?;
+            let mut column = vec![Scalar::Null; nrows];
+            for (row, text) in pending {
+                column[row] = Scalar::Str(text.to_owned());
+            }
+            for row in 0..nrows {
+                let null_kept = mask[row] && null_ok && !row_present(row, &present);
+                if !matches!(column[row], Scalar::Str(_)) && !null_kept {
                     mask[row] = false;
                 }
             }
-            Ok(if saw {
-                StringFilter::Values(column)
-            } else {
-                StringFilter::Miss
-            })
+            Ok(StringFilter::Values(column))
         }
         1 => {
             let dict_len = read_varint(bytes, cursor)? as usize;
@@ -1407,6 +1432,21 @@ fn read_string_filter(
             if !entry_hit && !null_hit {
                 return Ok(StringFilter::Miss);
             }
+            let mut expanded = 0usize;
+            let mut next = 0;
+            for row in 0..nrows {
+                if !row_present(row, &present) {
+                    continue;
+                }
+                let text = dict[codes[next]];
+                next += 1;
+                if mask[row] && scalar_text_hit(allowed, text) {
+                    expanded = expanded
+                        .checked_add(text.len())
+                        .ok_or_else(|| Error::event("query response size limit exceeded"))?;
+                }
+            }
+            charge_string_bytes(budget, expanded)?;
             let mut column = vec![Scalar::Null; nrows];
             let mut next = 0;
             for row in 0..nrows {
@@ -1722,7 +1762,9 @@ mod tests {
             _ => panic!("expected json"),
         };
         let err = decode_rows_in_range(&schema, &encoded.bytes, 1, 4, one * 4 - 1).unwrap_err();
-        assert!(err.to_string().contains("query response size limit exceeded"));
+        assert!(err
+            .to_string()
+            .contains("query response size limit exceeded"));
         let decoded = decode_rows_in_range(&schema, &encoded.bytes, 1, 4, one * 4).unwrap();
         assert_eq!(decoded.len(), 4);
         let partial = decode_rows_in_range(&schema, &encoded.bytes, 4, 4, one).unwrap();
@@ -1863,5 +1905,141 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("utf-8"));
+    }
+
+    #[test]
+    fn filtered_decode_rejects_bad_bool_and_json_on_the_skip_path() {
+        let bool_schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let row = parse_event(&bool_schema, br#"{"ts":1000,"ok":true,"action":"click"}"#).unwrap();
+        let encoded = encode_block(&bool_schema, &[row]).unwrap();
+        let mut bytes = encoded.bytes;
+        let marker = bytes
+            .windows(2)
+            .rposition(|window| window == [1, 1])
+            .expect("constant bool");
+        bytes[marker + 1] = 2;
+        let full = decode_block(&bool_schema, &bytes).unwrap_err().to_string();
+        assert!(full.contains("bool constant is not 0 or 1"));
+        let miss = ColumnPredicate {
+            index: 2,
+            allowed: vec![Scalar::Str("missing".into())],
+        };
+        let filtered = decode_rows_in_range_filtered(
+            &bool_schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[miss],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(filtered.contains("bool constant is not 0 or 1"));
+
+        let json_schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let row = parse_event(
+            &json_schema,
+            br#"{"ts":1000,"action":"click","props":{"a":1}}"#,
+        )
+        .unwrap();
+        let json_text = match &row.values[2] {
+            Scalar::Json(text) => text.clone(),
+            other => panic!("expected json, got {other:?}"),
+        };
+        assert!(json_text.starts_with('{'));
+        let encoded = encode_block(&json_schema, &[row]).unwrap();
+        let mut bytes = encoded.bytes;
+        let needle = json_text.as_bytes();
+        let pos = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("json payload");
+        bytes[pos + 1] = b'x';
+        let full = decode_block(&json_schema, &bytes).unwrap_err().to_string();
+        assert!(full.contains("json column value is not valid JSON"));
+        let miss = ColumnPredicate {
+            index: 1,
+            allowed: vec![Scalar::Str("missing".into())],
+        };
+        let filtered = decode_rows_in_range_filtered(
+            &json_schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[miss],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(filtered.contains("json column value is not valid JSON"));
+    }
+
+    #[test]
+    fn filtered_constant_string_charges_before_replication() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let rows: Vec<_> = (0..4)
+            .map(|ts| {
+                parse_event(
+                    &schema,
+                    format!(r#"{{"ts":{ts},"action":"click"}}"#).as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let filter = || ColumnPredicate {
+            index: 1,
+            allowed: vec![Scalar::Str("click".into())],
+        };
+        let err = decode_rows_in_range_filtered(
+            &schema,
+            &encoded.bytes,
+            i64::MIN,
+            i64::MAX,
+            5 * 3,
+            &[filter()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("query response size limit exceeded"));
+        let decoded = decode_rows_in_range_filtered(
+            &schema,
+            &encoded.bytes,
+            i64::MIN,
+            i64::MAX,
+            5 * 4,
+            &[filter()],
+        )
+        .unwrap();
+        assert_eq!(decoded.len(), 4);
     }
 }

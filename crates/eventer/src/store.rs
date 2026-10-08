@@ -166,10 +166,8 @@ impl Store {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(response_bytes)?;
-            if block.min_ts >= from_ms
-                && block.max_ts <= to_ms
-                && block.uncompressed_len as usize > string_budget
-            {
+            let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
+            if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = segment::read_block_payload(
@@ -177,10 +175,8 @@ impl Store {
                 &block,
             )?;
             let nrows = block_row_count(&payload)?;
-            if block.min_ts >= from_ms && block.max_ts <= to_ms {
-                if rows_out.len() + nrows > MAX_QUERY_ROWS {
-                    return Err(Error::event("query row limit exceeded"));
-                }
+            if resolved.is_empty() && contained && rows_out.len() + nrows > MAX_QUERY_ROWS {
+                return Err(Error::event("query row limit exceeded"));
             }
             let rows = decode_rows_in_range_filtered(
                 &self.schema,
@@ -249,10 +245,8 @@ impl Store {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(out.len())?;
-            if block.min_ts >= from_ms
-                && block.max_ts <= to_ms
-                && block.uncompressed_len as usize > string_budget
-            {
+            let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
+            if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = segment::read_block_payload(
@@ -260,10 +254,8 @@ impl Store {
                 &block,
             )?;
             let nrows = block_row_count(&payload)?;
-            if block.min_ts >= from_ms && block.max_ts <= to_ms {
-                if row_count + nrows > MAX_QUERY_ROWS {
-                    return Err(Error::event("query row limit exceeded"));
-                }
+            if resolved.is_empty() && contained && row_count + nrows > MAX_QUERY_ROWS {
+                return Err(Error::event("query row limit exceeded"));
             }
             let rows = decode_rows_in_range_filtered(
                 &self.schema,
@@ -552,7 +544,14 @@ mod tests {
         assert_eq!(row_value(&store, &middle[0])["ts"], 2000);
         assert_eq!(row_value(&store, &middle[1])["amount"], "0.05");
         assert!(row_value(&store, &middle[1])["user_id"].is_null());
-        assert!(row_value(&store, &middle[1]).get("note").unwrap().as_str().unwrap() == "b");
+        assert!(
+            row_value(&store, &middle[1])
+                .get("note")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                == "b"
+        );
 
         let one = store.query(2000, 2000).unwrap();
         assert_eq!(one.len(), 1);
@@ -757,12 +756,14 @@ mod tests {
         }
         store.flush().unwrap();
         for input in cases {
-            let ts = serde_json::from_slice::<serde_json::Value>(input)
-                .unwrap()["ts"]
+            let ts = serde_json::from_slice::<serde_json::Value>(input).unwrap()["ts"]
                 .as_i64()
                 .unwrap();
             let out = store.query_json(ts, ts).unwrap();
-            assert_eq!(out, format!("[{}]", String::from_utf8(input.to_vec()).unwrap()).as_bytes());
+            assert_eq!(
+                out,
+                format!("[{}]", String::from_utf8(input.to_vec()).unwrap()).as_bytes()
+            );
         }
         store.close().unwrap();
     }
@@ -861,10 +862,7 @@ mod tests {
 
         let rows = store.query(1, 1).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_to_json_bytes(&schema_model, &rows[0]).unwrap(),
-            number
-        );
+        assert_eq!(row_to_json_bytes(&schema_model, &rows[0]).unwrap(), number);
 
         let json_out = store.query_json(3, 3).unwrap();
         assert_eq!(
@@ -872,7 +870,10 @@ mod tests {
             format!("[{}]", String::from_utf8(dup_keys.to_vec()).unwrap()).as_bytes()
         );
         let rows = store.query(3, 3).unwrap();
-        assert_eq!(row_to_json_bytes(&schema_model, &rows[0]).unwrap(), dup_keys);
+        assert_eq!(
+            row_to_json_bytes(&schema_model, &rows[0]).unwrap(),
+            dup_keys
+        );
         store.close().unwrap();
     }
 
