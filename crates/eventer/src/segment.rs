@@ -173,6 +173,23 @@ fn structural_match(indexed: &[BlockMeta], scanned: &[BlockMeta]) -> bool {
         })
 }
 
+/// Length prefix for a version-2 summary, or `None` when the index is version 1.
+///
+/// `read_index` is not the only gate: an oversized blob must not reach disk,
+/// because `load_catalog` treats a refused summary as a missing index and
+/// would write it again.
+fn encoded_summary_len(version: u16, summary: &[u8]) -> Result<Option<u32>> {
+    if version < INDEX_VERSION {
+        return Ok(None);
+    }
+    if summary.len() > crate::summary::MAX_SUMMARY_LEN {
+        return Err(Error::corrupt("index summary is larger than 8 MiB"));
+    }
+    let len = u32::try_from(summary.len())
+        .map_err(|_| Error::event("block summary does not fit in u32"))?;
+    Ok(Some(len))
+}
+
 fn index_entry_on_disk_len(index_version: u16, summary_len: usize) -> u64 {
     if index_version <= INDEX_VERSION_V1 {
         INDEX_ENTRY_LEN as u64
@@ -389,15 +406,17 @@ pub(crate) fn write_index(path: &Path, version: u16, blocks: &[BlockMeta]) -> Re
             "unsupported index version {version}"
         )));
     }
+    let mut summary_lens = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        summary_lens.push(encoded_summary_len(version, &block.summary)?);
+    }
     let mut file = File::create(path)?;
     file.write_all(INDEX_MAGIC)?;
     file.write_all(&version.to_le_bytes())?;
     file.write_all(&0u16.to_le_bytes())?;
-    for block in blocks {
+    for (block, summary_len) in blocks.iter().zip(summary_lens) {
         file.write_all(&index_entry_bytes(block))?;
-        if version >= INDEX_VERSION {
-            let len = u32::try_from(block.summary.len())
-                .map_err(|_| Error::event("block summary does not fit in u32"))?;
+        if let Some(len) = summary_len {
             file.write_all(&len.to_le_bytes())?;
             file.write_all(&block.summary)?;
         }
@@ -494,12 +513,11 @@ impl ActiveSegment {
     }
 
     pub fn write_framed(&mut self, framed: &[u8], meta: &BlockMeta) -> Result<()> {
+        let summary_len = encoded_summary_len(self.index_version, &meta.summary)?;
         self.data.write_all(framed)?;
         self.index.write_all(&index_entry_bytes(meta))?;
         let mut added = INDEX_ENTRY_LEN as u64;
-        if self.index_version >= INDEX_VERSION {
-            let len = u32::try_from(meta.summary.len())
-                .map_err(|_| Error::event("block summary does not fit in u32"))?;
+        if let Some(len) = summary_len {
             self.index.write_all(&len.to_le_bytes())?;
             self.index.write_all(&meta.summary)?;
             added += 4 + meta.summary.len() as u64;
@@ -519,5 +537,43 @@ impl ActiveSegment {
             self.index.get_ref().sync_data()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(summary: Vec<u8>) -> BlockMeta {
+        BlockMeta {
+            segment_id: 0,
+            offset: 0,
+            compressed_len: 0,
+            uncompressed_len: 0,
+            row_count: 0,
+            min_ts: 0,
+            max_ts: 0,
+            summary,
+        }
+    }
+
+    #[test]
+    fn write_index_refuses_a_summary_the_reader_cannot_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "eventer-summary-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg-000000.idx");
+        let summary = vec![0u8; crate::summary::MAX_SUMMARY_LEN + 1];
+        let err = write_index(&path, INDEX_VERSION, &[block(summary)]).unwrap_err();
+        assert!(!path.exists());
+        let message = err.to_string();
+        assert!(message.contains("8 MiB"), "{message}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

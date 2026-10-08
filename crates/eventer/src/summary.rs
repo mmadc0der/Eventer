@@ -72,10 +72,15 @@ pub(crate) fn summarize(schema: &Schema, rows: &[Row]) -> Vec<u8> {
             continue;
         }
         let used = 2 + encoded.len();
-        if used >= MAX_SUMMARY_LEN {
+        // The field index is two bytes. A running total of MAX_SUMMARY_LEN - 1
+        // leaves no room for it; a wrapping subtract would treat the next body
+        // as unbounded and write a summary the reader refuses.
+        let Some(max_body) = MAX_SUMMARY_LEN
+            .checked_sub(used)
+            .and_then(|rest| rest.checked_sub(2))
+        else {
             break;
-        }
-        let max_body = MAX_SUMMARY_LEN - used - 2;
+        };
         let Some(body) = summarize_column(field.ty, rows, index, max_body) else {
             continue;
         };
@@ -775,5 +780,55 @@ mod tests {
         assert!(summary.len() <= MAX_SUMMARY_LEN);
         assert!(summary.len() < 256);
         assert_eq!(bloom_may_contain(&summary, 2, &huge), Some(true));
+    }
+
+    #[test]
+    fn exact_string_leaving_one_byte_omits_the_next_column() {
+        let text = "x".repeat(MAX_SUMMARY_LEN - 12);
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "action", "type": "string"},
+                    {"name": "amount", "type": "int"},
+                    {"name": "ts", "type": "timestamp"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let rows = vec![Row {
+            ts: 1,
+            values: vec![
+                Scalar::Str(text.clone()),
+                Scalar::Int(7),
+                Scalar::Timestamp(1),
+            ],
+        }];
+        let summary = summarize(&schema, &rows);
+        assert_eq!(summary.len(), MAX_SUMMARY_LEN - 1);
+        let same = [Scalar::Str(text)];
+        assert!(might_match(
+            &summary,
+            &[SummaryPredicate {
+                field_index: 0,
+                allowed: &same,
+            }]
+        ));
+        let other = [Scalar::Str("y".into())];
+        assert!(!might_match(
+            &summary,
+            &[SummaryPredicate {
+                field_index: 0,
+                allowed: &other,
+            }]
+        ));
+        let amount = [Scalar::Int(7)];
+        assert!(might_match(
+            &summary,
+            &[SummaryPredicate {
+                field_index: 1,
+                allowed: &amount,
+            }]
+        ));
     }
 }
