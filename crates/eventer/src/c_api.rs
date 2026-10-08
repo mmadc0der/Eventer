@@ -4,7 +4,8 @@ use std::ptr;
 use std::sync::Mutex;
 
 use crate::error::Error;
-use crate::store::Store;
+use crate::store::{Predicate, Store};
+use crate::value::Scalar;
 
 /// Opaque handle returned by [`eventer_open`].
 #[repr(C)]
@@ -154,6 +155,65 @@ pub unsafe extern "C" fn eventer_query(
     out_cap: usize,
     out_len: *mut usize,
 ) -> c_int {
+    query_into(store, from_ms, to_ms, &[], out, out_cap, out_len)
+}
+
+/// Query a time range and keep rows whose string or text column equals `filter_val`.
+///
+/// `filter_col` is a schema field name, for example `"type"` or `"action"`.
+/// `filter_val` is the exact UTF-8 value. The match is pushed into block decoding.
+///
+/// # Safety
+/// `filter_col` and `filter_val` must be null-terminated. `out` may be null only when
+/// `out_cap` is 0. `out_len` must be non-null.
+#[no_mangle]
+pub unsafe extern "C" fn eventer_query_filtered(
+    store: *mut EventerStore,
+    from_ms: i64,
+    to_ms: i64,
+    filter_col: *const c_char,
+    filter_val: *const c_char,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> c_int {
+    let Some(handle) = borrow(store) else {
+        return -1;
+    };
+    if filter_col.is_null() || filter_val.is_null() {
+        set_err(
+            handle,
+            &Error::event("filter column and value are required"),
+        );
+        return -1;
+    }
+    let column = match CStr::from_ptr(filter_col).to_str() {
+        Ok(column) => column,
+        Err(_) => {
+            set_err(handle, &Error::event("filter column is not utf-8"));
+            return -1;
+        }
+    };
+    let value = match CStr::from_ptr(filter_val).to_str() {
+        Ok(value) => value,
+        Err(_) => {
+            set_err(handle, &Error::event("filter value is not utf-8"));
+            return -1;
+        }
+    };
+    let predicate = Predicate::Eq(column.to_string(), Scalar::Str(value.to_string()));
+    query_into(store, from_ms, to_ms, &[predicate], out, out_cap, out_len)
+}
+
+unsafe fn query_into(
+    store: *mut EventerStore,
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[Predicate],
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> c_int {
     let Some(handle) = borrow(store) else {
         return -1;
     };
@@ -161,7 +221,10 @@ pub unsafe extern "C" fn eventer_query(
         set_err(handle, &Error::event("invalid query buffer"));
         return -1;
     }
-    match handle.store.query_json(from_ms, to_ms) {
+    match handle
+        .store
+        .query_json_with_filter(from_ms, to_ms, predicates)
+    {
         Ok(bytes) => {
             *out_len = bytes.len();
             if out_cap < bytes.len() {
@@ -257,6 +320,97 @@ mod tests {
         let text = std::str::from_utf8(&buf[..got]).unwrap();
         assert!(text.contains("click"));
         assert!(text.contains("42"));
+
+        let col = CString::new("action").unwrap();
+        let val = CString::new("click").unwrap();
+        let mut filtered_needed = 0usize;
+        assert_eq!(
+            unsafe {
+                eventer_query_filtered(
+                    store,
+                    0,
+                    100,
+                    col.as_ptr(),
+                    val.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut filtered_needed,
+                )
+            },
+            -4
+        );
+        let mut filtered = vec![0u8; filtered_needed];
+        let mut filtered_got = 0usize;
+        assert_eq!(
+            unsafe {
+                eventer_query_filtered(
+                    store,
+                    0,
+                    100,
+                    col.as_ptr(),
+                    val.as_ptr(),
+                    filtered.as_mut_ptr(),
+                    filtered.len(),
+                    &mut filtered_got,
+                )
+            },
+            0
+        );
+        let filtered_text = std::str::from_utf8(&filtered[..filtered_got]).unwrap();
+        assert!(filtered_text.contains("click"));
+
+        let other = CString::new("view").unwrap();
+        let mut missed = 0usize;
+        assert_eq!(
+            unsafe {
+                eventer_query_filtered(
+                    store,
+                    0,
+                    100,
+                    col.as_ptr(),
+                    other.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut missed,
+                )
+            },
+            -4
+        );
+        let mut empty_buf = vec![0u8; missed];
+        let mut empty_got = 0usize;
+        assert_eq!(
+            unsafe {
+                eventer_query_filtered(
+                    store,
+                    0,
+                    100,
+                    col.as_ptr(),
+                    other.as_ptr(),
+                    empty_buf.as_mut_ptr(),
+                    empty_buf.len(),
+                    &mut empty_got,
+                )
+            },
+            0
+        );
+        assert_eq!(std::str::from_utf8(&empty_buf[..empty_got]).unwrap(), "[]");
+
+        let missing_col = CString::new("nope").unwrap();
+        assert_eq!(
+            unsafe {
+                eventer_query_filtered(
+                    store,
+                    0,
+                    100,
+                    missing_col.as_ptr(),
+                    val.as_ptr(),
+                    empty_buf.as_mut_ptr(),
+                    empty_buf.len(),
+                    &mut empty_got,
+                )
+            },
+            -3
+        );
         unsafe { eventer_close(store) };
         let _ = fs::remove_dir_all(&dir);
     }

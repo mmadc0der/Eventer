@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::codec::{block_row_count, decode_rows_in_range};
+use crate::codec::{block_row_count, decode_rows_in_range_filtered, ColumnPredicate};
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, Schema};
 use crate::segment::{self, Catalog};
-use crate::value::{row_to_json_bytes, Row};
+use crate::value::{self, row_to_json_bytes, Row, Scalar};
 
 /// Maximum JSON bytes a single query may materialize in the response buffer.
 pub const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
@@ -56,6 +56,18 @@ impl Default for StoreOptions {
             linger: Duration::from_millis(5),
         }
     }
+}
+
+/// Equality constraint pushed into block decoding.
+///
+/// Predicates on one query are AND-ed. [`Predicate::In`] matches any listed value.
+/// [`Scalar::Null`] matches a null column. An empty [`Predicate::In`] matches nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Predicate {
+    /// `field == value`, for example `Predicate::Eq("type".into(), "assistant".into())`.
+    Eq(String, Scalar),
+    /// `field` equals one of `values`.
+    In(String, Vec<Scalar>),
 }
 
 /// Append-only event store. Clone the directory handle by wrapping `Store` in `Arc`.
@@ -120,10 +132,24 @@ impl Store {
 
     /// Inclusive range on the schema timestamp, in unix milliseconds. Results are in ingest order.
     pub fn query(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Row>> {
-        self.flush()?;
-        if from_ms > to_ms {
+        self.query_with_filter(from_ms, to_ms, &[])
+    }
+
+    /// Inclusive time range plus equality predicates.
+    ///
+    /// Each predicate is applied while the block is decoded. If a filter column's
+    /// constant or dictionary cannot contain the requested value, the rest of that
+    /// block is not decoded. Unknown fields and values of the wrong column type
+    /// return [`Error::Schema`]. Checks run before [`Store::flush`].
+    pub fn query_with_filter(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+    ) -> Result<Vec<Row>> {
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(Vec::new());
-        }
+        };
         let blocks = {
             let catalog = self.catalog();
             catalog
@@ -140,10 +166,8 @@ impl Store {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(response_bytes)?;
-            if block.min_ts >= from_ms
-                && block.max_ts <= to_ms
-                && block.uncompressed_len as usize > string_budget
-            {
+            let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
+            if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = segment::read_block_payload(
@@ -151,13 +175,17 @@ impl Store {
                 &block,
             )?;
             let nrows = block_row_count(&payload)?;
-            if block.min_ts >= from_ms && block.max_ts <= to_ms {
-                if rows_out.len() + nrows > MAX_QUERY_ROWS {
-                    return Err(Error::event("query row limit exceeded"));
-                }
+            if resolved.is_empty() && contained && rows_out.len() + nrows > MAX_QUERY_ROWS {
+                return Err(Error::event("query row limit exceeded"));
             }
-            let rows =
-                decode_rows_in_range(&self.schema, &payload, from_ms, to_ms, string_budget)?;
+            let rows = decode_rows_in_range_filtered(
+                &self.schema,
+                &payload,
+                from_ms,
+                to_ms,
+                string_budget,
+                &resolved,
+            )?;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
                     if rows_out.len() >= MAX_QUERY_ROWS {
@@ -187,10 +215,19 @@ impl Store {
 
     /// Same as [`Store::query`], encoded as one JSON array.
     pub fn query_json(&self, from_ms: i64, to_ms: i64) -> Result<Vec<u8>> {
-        self.flush()?;
-        if from_ms > to_ms {
+        self.query_json_with_filter(from_ms, to_ms, &[])
+    }
+
+    /// Same as [`Store::query_with_filter`], encoded as one JSON array.
+    pub fn query_json_with_filter(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+    ) -> Result<Vec<u8>> {
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(b"[]".to_vec());
-        }
+        };
         let blocks = {
             let catalog = self.catalog();
             catalog
@@ -208,10 +245,8 @@ impl Store {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(out.len())?;
-            if block.min_ts >= from_ms
-                && block.max_ts <= to_ms
-                && block.uncompressed_len as usize > string_budget
-            {
+            let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
+            if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = segment::read_block_payload(
@@ -219,13 +254,17 @@ impl Store {
                 &block,
             )?;
             let nrows = block_row_count(&payload)?;
-            if block.min_ts >= from_ms && block.max_ts <= to_ms {
-                if row_count + nrows > MAX_QUERY_ROWS {
-                    return Err(Error::event("query row limit exceeded"));
-                }
+            if resolved.is_empty() && contained && row_count + nrows > MAX_QUERY_ROWS {
+                return Err(Error::event("query row limit exceeded"));
             }
-            let rows =
-                decode_rows_in_range(&self.schema, &payload, from_ms, to_ms, string_budget)?;
+            let rows = decode_rows_in_range_filtered(
+                &self.schema,
+                &payload,
+                from_ms,
+                to_ms,
+                string_budget,
+                &resolved,
+            )?;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
                     if row_count >= MAX_QUERY_ROWS {
@@ -270,6 +309,23 @@ impl Store {
         self.pipeline.shutdown()
     }
 
+    fn prepare_scan(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+    ) -> Result<Option<Vec<ColumnPredicate>>> {
+        if from_ms > to_ms {
+            return Ok(None);
+        }
+        let resolved = resolve_predicates(&self.schema, predicates)?;
+        if resolved.iter().any(|pred| pred.allowed.is_empty()) {
+            return Ok(None);
+        }
+        self.flush()?;
+        Ok(Some(resolved))
+    }
+
     fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
         self.pipeline
             .catalog
@@ -287,6 +343,41 @@ impl Drop for Store {
 /// Bytes already written, including the opening `[`. A further row needs at
 /// least one payload byte plus the closing `]`, so a full buffer stops the
 /// next block before it is read or decoded.
+fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<Vec<ColumnPredicate>> {
+    let mut grouped: Vec<ColumnPredicate> = Vec::new();
+    for predicate in predicates {
+        let (name, values) = match predicate {
+            Predicate::Eq(name, value) => (name.as_str(), vec![value.clone()]),
+            Predicate::In(name, values) => (name.as_str(), values.clone()),
+        };
+        let index = schema
+            .fields
+            .iter()
+            .position(|field| field.name == name)
+            .ok_or_else(|| Error::schema(format!("unknown filter field `{name}`")))?;
+        let ty = schema.fields[index].ty;
+        for value in &values {
+            if !value::scalar_matches_field(value, ty) {
+                return Err(Error::schema(format!(
+                    "filter value for `{name}` does not match type {}",
+                    ty.name()
+                )));
+            }
+        }
+        if let Some(existing) = grouped.iter_mut().find(|pred| pred.index == index) {
+            existing
+                .allowed
+                .retain(|current| values.iter().any(|next| next == current));
+        } else {
+            grouped.push(ColumnPredicate {
+                index,
+                allowed: values,
+            });
+        }
+    }
+    Ok(grouped)
+}
+
 fn remaining_query_bytes(produced: usize) -> Result<usize> {
     if produced >= MAX_QUERY_BYTES || MAX_QUERY_BYTES - produced <= 1 {
         return Err(Error::event("query response size limit exceeded"));
@@ -453,7 +544,14 @@ mod tests {
         assert_eq!(row_value(&store, &middle[0])["ts"], 2000);
         assert_eq!(row_value(&store, &middle[1])["amount"], "0.05");
         assert!(row_value(&store, &middle[1])["user_id"].is_null());
-        assert!(row_value(&store, &middle[1]).get("note").unwrap().as_str().unwrap() == "b");
+        assert!(
+            row_value(&store, &middle[1])
+                .get("note")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                == "b"
+        );
 
         let one = store.query(2000, 2000).unwrap();
         assert_eq!(one.len(), 1);
@@ -658,12 +756,14 @@ mod tests {
         }
         store.flush().unwrap();
         for input in cases {
-            let ts = serde_json::from_slice::<serde_json::Value>(input)
-                .unwrap()["ts"]
+            let ts = serde_json::from_slice::<serde_json::Value>(input).unwrap()["ts"]
                 .as_i64()
                 .unwrap();
             let out = store.query_json(ts, ts).unwrap();
-            assert_eq!(out, format!("[{}]", String::from_utf8(input.to_vec()).unwrap()).as_bytes());
+            assert_eq!(
+                out,
+                format!("[{}]", String::from_utf8(input.to_vec()).unwrap()).as_bytes()
+            );
         }
         store.close().unwrap();
     }
@@ -762,10 +862,7 @@ mod tests {
 
         let rows = store.query(1, 1).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_to_json_bytes(&schema_model, &rows[0]).unwrap(),
-            number
-        );
+        assert_eq!(row_to_json_bytes(&schema_model, &rows[0]).unwrap(), number);
 
         let json_out = store.query_json(3, 3).unwrap();
         assert_eq!(
@@ -773,7 +870,134 @@ mod tests {
             format!("[{}]", String::from_utf8(dup_keys.to_vec()).unwrap()).as_bytes()
         );
         let rows = store.query(3, 3).unwrap();
-        assert_eq!(row_to_json_bytes(&schema_model, &rows[0]).unwrap(), dup_keys);
+        assert_eq!(
+            row_to_json_bytes(&schema_model, &rows[0]).unwrap(),
+            dup_keys
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn query_with_filter_pushes_equality_and_in_predicates() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1000, Some(1), "click", Some("alpha"), "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2000, Some(2), "view", Some("beta"), "2.50"))
+            .unwrap();
+        store
+            .append_json(&event(3000, None, "buy", Some("alpha"), "0.05"))
+            .unwrap();
+        store
+            .append_json(&event(4000, Some(4), "click", None, "8.00"))
+            .unwrap();
+
+        let clicks = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("action".into(), "click".into())])
+            .unwrap();
+        assert_eq!(clicks.len(), 2);
+        assert_eq!(row_value(&store, &clicks[0])["ts"], 1000);
+        assert_eq!(row_value(&store, &clicks[1])["ts"], 4000);
+        assert!(row_value(&store, &clicks[1])["note"].is_null());
+
+        let narrowed = store
+            .query_with_filter(
+                1500,
+                4000,
+                &[Predicate::Eq("action".into(), "click".into())],
+            )
+            .unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(row_value(&store, &narrowed[0])["user_id"], 4);
+
+        let either = store
+            .query_with_filter(
+                0,
+                10_000,
+                &[Predicate::In(
+                    "action".into(),
+                    vec!["view".into(), "buy".into()],
+                )],
+            )
+            .unwrap();
+        assert_eq!(either.len(), 2);
+        assert_eq!(row_value(&store, &either[0])["action"], "view");
+        assert_eq!(row_value(&store, &either[1])["action"], "buy");
+
+        let both = store
+            .query_with_filter(
+                0,
+                10_000,
+                &[
+                    Predicate::Eq("action".into(), "buy".into()),
+                    Predicate::Eq("note".into(), "alpha".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(row_value(&store, &both[0])["ts"], 3000);
+
+        let null_user = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("user_id".into(), Scalar::Null)])
+            .unwrap();
+        assert_eq!(null_user.len(), 1);
+        assert_eq!(row_value(&store, &null_user[0])["action"], "buy");
+
+        assert!(store
+            .query_with_filter(0, 10_000, &[Predicate::In("action".into(), Vec::new())])
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .query_with_filter(
+                0,
+                10_000,
+                &[Predicate::Eq("action".into(), "missing".into())],
+            )
+            .unwrap()
+            .is_empty());
+
+        let unknown =
+            store.query_with_filter(0, 10_000, &[Predicate::Eq("type".into(), "click".into())]);
+        assert!(unknown
+            .unwrap_err()
+            .to_string()
+            .contains("unknown filter field"));
+
+        let wrong = store.query_with_filter(
+            0,
+            10_000,
+            &[Predicate::Eq("user_id".into(), "click".into())],
+        );
+        assert!(wrong
+            .unwrap_err()
+            .to_string()
+            .contains("does not match type"));
+
+        let disagree = store.query_with_filter(
+            0,
+            10_000,
+            &[
+                Predicate::Eq("action".into(), "click".into()),
+                Predicate::Eq("action".into(), "view".into()),
+            ],
+        );
+        assert!(disagree.unwrap().is_empty());
+
+        let same = store
+            .query_with_filter(
+                0,
+                10_000,
+                &[
+                    Predicate::Eq("action".into(), "click".into()),
+                    Predicate::In("action".into(), vec!["click".into(), "view".into()]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(same.len(), 2);
         store.close().unwrap();
     }
 }

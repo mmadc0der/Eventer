@@ -2,18 +2,19 @@
 //!
 //! `POST /events` appends one JSON object and waits until it is fsynced.
 //! `GET /events?from=&to=` returns a JSON array of events in that inclusive
-//! millisecond range.
+//! millisecond range. Repeat `eq=field=value` to AND equality filters into the scan.
 
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
 use axum::routing::get;
 use axum::{Json, Router};
+use eventer::Predicate;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -63,7 +64,11 @@ struct RangeParams {
     to: Option<String>,
 }
 
-async fn get_events(State(state): State<AppState>, Query(params): Query<RangeParams>) -> Response {
+async fn get_events(
+    State(state): State<AppState>,
+    Query(params): Query<RangeParams>,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let from = match parse_bound(params.from, "from") {
         Ok(value) => value,
         Err(response) => return *response,
@@ -72,8 +77,22 @@ async fn get_events(State(state): State<AppState>, Query(params): Query<RangePar
         Ok(value) => value,
         Err(response) => return *response,
     };
+    let specs = match eq_specs(raw.as_deref().unwrap_or("")) {
+        Ok(specs) => specs,
+        Err(response) => return *response,
+    };
+    let mut predicates = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        match parse_eq(state.store.schema(), spec) {
+            Ok(predicate) => predicates.push(predicate),
+            Err(response) => return *response,
+        }
+    }
     let store = Arc::clone(&state.store);
-    let joined = tokio::task::spawn_blocking(move || store.query_json(from, to)).await;
+    let joined = tokio::task::spawn_blocking(move || {
+        store.query_json_with_filter(from, to, &predicates)
+    })
+    .await;
     match joined {
         Ok(Ok(bytes)) => (
             StatusCode::OK,
@@ -87,6 +106,95 @@ async fn get_events(State(state): State<AppState>, Query(params): Query<RangePar
             Json(json!({"error": "query task failed"})),
         )
             .into_response(),
+    }
+}
+
+fn eq_specs(query: &str) -> std::result::Result<Vec<String>, Box<Response>> {
+    let mut specs = Vec::new();
+    if query.is_empty() {
+        return Ok(specs);
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = pair.split_once('=') else {
+            if percent_decode(pair)? == "eq" {
+                return Err(bad_request("`eq` must be field=value"));
+            }
+            continue;
+        };
+        if percent_decode(key)? == "eq" {
+            specs.push(percent_decode(value)?);
+        }
+    }
+    Ok(specs)
+}
+
+fn percent_decode(input: &str) -> std::result::Result<String, Box<Response>> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return Err(bad_request("`eq` has an invalid percent-encoding"));
+                }
+                let hex = &input[index + 1..index + 3];
+                let byte = u8::from_str_radix(hex, 16)
+                    .map_err(|_| bad_request("`eq` has an invalid percent-encoding"))?;
+                out.push(byte);
+                index += 3;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| bad_request("`eq` is not valid UTF-8"))
+}
+
+fn bad_request(message: &str) -> Box<Response> {
+    Box::new((StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response())
+}
+
+fn parse_eq(schema: &eventer::Schema, spec: &str) -> std::result::Result<Predicate, Box<Response>> {
+    let Some((name, literal)) = spec.split_once('=') else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "`eq` must be field=value"})),
+            )
+                .into_response(),
+        ));
+    };
+    if name.is_empty() {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "`eq` is missing a field name"})),
+            )
+                .into_response(),
+        ));
+    }
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unknown filter field `{name}`")})),
+            )
+                .into_response(),
+        ));
+    };
+    match eventer::scalar_from_literal(field.ty, literal) {
+        Ok(scalar) => Ok(Predicate::Eq(name.to_string(), scalar)),
+        Err(err) => Err(Box::new(error_response(&err))),
     }
 }
 
@@ -210,7 +318,38 @@ mod tests {
         assert_eq!(rows[0]["action"], "click");
         assert_eq!(rows[0]["amount"], "1.25");
 
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ts":1001,"action":"view","amount":"2.00"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
+
+        let filtered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/events?from=1000&to=2000&eq=action=click")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.status(), StatusCode::OK);
+        let filtered_bytes = filtered.into_body().collect().await.unwrap().to_bytes();
+        let filtered_rows: Vec<Value> = serde_json::from_slice(&filtered_bytes).unwrap();
+        assert_eq!(filtered_rows.len(), 1);
+        assert_eq!(filtered_rows[0]["action"], "click");
+
         let missing = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/events?from=5")
@@ -220,6 +359,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+        let encoded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/events?from=1000&to=2000&eq=action%3Dclick")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(encoded.status(), StatusCode::OK);
+
+        let bare = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/events?from=1000&to=2000&eq")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bare.status(), StatusCode::BAD_REQUEST);
+
+        let bad_pct = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/events?from=1000&to=2000&eq=action%3D%80")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_pct.status(), StatusCode::BAD_REQUEST);
 
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);
