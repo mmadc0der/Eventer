@@ -12,6 +12,10 @@ use crate::value::{Row, Scalar};
 
 const MAX_EXACT_STRINGS: usize = 16;
 const BLOOM_BYTES: usize = 32;
+
+/// `read_index` refuses a larger blob. Writers must stay at or under this so a
+/// sealed block can be opened again without rebuilding the segment.
+pub(crate) const MAX_SUMMARY_LEN: usize = 8 * 1024 * 1024;
 const HAS_NULL: u8 = 0b0000_0001;
 
 const KIND_ALL_NULL: u8 = 0;
@@ -67,7 +71,12 @@ pub(crate) fn summarize(schema: &Schema, rows: &[Row]) -> Vec<u8> {
         if index > u16::MAX as usize {
             continue;
         }
-        let Some(body) = summarize_column(field.ty, rows, index) else {
+        let used = 2 + encoded.len();
+        if used >= MAX_SUMMARY_LEN {
+            break;
+        }
+        let max_body = MAX_SUMMARY_LEN - used - 2;
+        let Some(body) = summarize_column(field.ty, rows, index, max_body) else {
             continue;
         };
         count = count.saturating_add(1);
@@ -88,24 +97,15 @@ pub(crate) fn might_match(summary: &[u8], predicates: &[SummaryPredicate<'_>]) -
     if summary.is_empty() || predicates.is_empty() {
         return true;
     }
-    let Some(columns) = parse(summary) else {
-        return true;
-    };
-    for predicate in predicates {
-        if predicate.allowed.is_empty() {
-            return false;
-        }
-        let Some(column) = columns
-            .iter()
-            .find(|column| column.field_index == predicate.field_index)
-        else {
-            continue;
-        };
-        if !column_may_contain(&column.body, predicate.allowed) {
-            return false;
-        }
+    if predicates.iter().any(|predicate| predicate.allowed.is_empty()) {
+        return false;
     }
-    true
+    // A summary that does not parse is not a miss. Only columns named by a
+    // predicate are decoded; other exact sets are skipped without copying them.
+    match column_misses(summary, predicates) {
+        Some(miss) => !miss,
+        None => true,
+    }
 }
 
 /// `Some` when `field_index` is a string bloom. Used to force a false positive.
@@ -121,13 +121,18 @@ pub(crate) fn bloom_may_contain(summary: &[u8], field_index: usize, text: &str) 
     }
 }
 
-fn summarize_column(ty: FieldType, rows: &[Row], index: usize) -> Option<Vec<u8>> {
-    match ty {
-        FieldType::Int => summarize_i64(rows, index, false),
-        FieldType::Timestamp => summarize_i64(rows, index, true),
-        FieldType::Decimal { .. } => summarize_i128(rows, index),
-        FieldType::String => summarize_string(rows, index),
-        FieldType::Float | FieldType::Bool | FieldType::Text | FieldType::Json => None,
+fn summarize_column(ty: FieldType, rows: &[Row], index: usize, max_body: usize) -> Option<Vec<u8>> {
+    let body = match ty {
+        FieldType::Int => summarize_i64(rows, index, false)?,
+        FieldType::Timestamp => summarize_i64(rows, index, true)?,
+        FieldType::Decimal { .. } => summarize_i128(rows, index)?,
+        FieldType::String => return summarize_string(rows, index, max_body),
+        FieldType::Float | FieldType::Bool | FieldType::Text | FieldType::Json => return None,
+    };
+    if body.len() <= max_body {
+        Some(body)
+    } else {
+        None
     }
 }
 
@@ -195,7 +200,7 @@ fn summarize_i128(rows: &[Row], index: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn summarize_string(rows: &[Row], index: usize) -> Option<Vec<u8>> {
+fn summarize_string(rows: &[Row], index: usize, max_body: usize) -> Option<Vec<u8>> {
     let mut has_null = false;
     // Borrow the row text. Sixteen values are compared linearly; past that the
     // block switches to a bloom and the borrowed set is dropped.
@@ -228,18 +233,22 @@ fn summarize_string(rows: &[Row], index: usize) -> Option<Vec<u8>> {
         }
     }
     if let Some(words) = bloom {
-        let mut out = Vec::with_capacity(2 + BLOOM_BYTES);
-        out.push(KIND_BLOOM);
-        out.push(u8::from(has_null));
-        out.extend_from_slice(&bloom_bytes(&words));
-        return Some(out);
+        return encode_bloom(has_null, words, max_body);
     }
     if distinct.is_empty() {
-        return Some(vec![KIND_ALL_NULL]);
+        return fits(vec![KIND_ALL_NULL], max_body);
     }
-    let mut values: Vec<String> = distinct.into_iter().map(str::to_string).collect();
-    values.sort();
-    let mut out = Vec::new();
+    let exact_len = 3 + distinct.iter().map(|value| 4 + value.len()).sum::<usize>();
+    if exact_len > max_body {
+        let mut words = [0u32; 8];
+        for value in &distinct {
+            bloom_insert(&mut words, value.as_bytes());
+        }
+        return encode_bloom(has_null, words, max_body);
+    }
+    let mut values: Vec<&str> = distinct;
+    values.sort_unstable();
+    let mut out = Vec::with_capacity(exact_len);
     out.push(KIND_EXACT);
     out.push(u8::from(has_null));
     out.push(values.len() as u8);
@@ -249,7 +258,190 @@ fn summarize_string(rows: &[Row], index: usize) -> Option<Vec<u8>> {
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(bytes);
     }
+    debug_assert!(out.len() <= max_body);
     Some(out)
+}
+
+fn encode_bloom(has_null: bool, words: [u32; 8], max_body: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(2 + BLOOM_BYTES);
+    out.push(KIND_BLOOM);
+    out.push(u8::from(has_null));
+    out.extend_from_slice(&bloom_bytes(&words));
+    fits(out, max_body)
+}
+
+fn fits(body: Vec<u8>, max_body: usize) -> Option<Vec<u8>> {
+    if body.len() <= max_body {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+/// `Some(true)` when a named column cannot contain its predicate.
+/// `None` when the summary bytes are not a valid column list.
+fn column_misses(summary: &[u8], predicates: &[SummaryPredicate<'_>]) -> Option<bool> {
+    if summary.len() < 2 {
+        return None;
+    }
+    let count = u16::from_le_bytes(summary[0..2].try_into().ok()?) as usize;
+    let mut cursor = 2;
+    let mut matched = vec![false; predicates.len()];
+    for _ in 0..count {
+        if cursor + 3 > summary.len() {
+            return None;
+        }
+        let field_index = u16::from_le_bytes(summary[cursor..cursor + 2].try_into().ok()?) as usize;
+        cursor += 2;
+        let kind = summary[cursor];
+        cursor += 1;
+        let needed: Vec<usize> = predicates
+            .iter()
+            .enumerate()
+            .filter(|(index, predicate)| {
+                !matched[*index] && predicate.field_index == field_index
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if needed.is_empty() {
+            cursor = skip_body(summary, cursor, kind)?;
+            continue;
+        }
+        let (miss, next) = body_misses(summary, cursor, kind, predicates, &needed)?;
+        cursor = next;
+        if miss {
+            return Some(true);
+        }
+        for index in needed {
+            matched[index] = true;
+        }
+    }
+    if cursor != summary.len() {
+        return None;
+    }
+    Some(false)
+}
+
+fn skip_body(summary: &[u8], cursor: usize, kind: u8) -> Option<usize> {
+    match kind {
+        KIND_ALL_NULL => Some(cursor),
+        KIND_I64 => read_i64_zone(summary, cursor).map(|(_, _, _, next)| next),
+        KIND_I128 => read_i128_zone(summary, cursor).map(|(_, _, _, next)| next),
+        KIND_EXACT => skip_exact(summary, cursor),
+        KIND_BLOOM => read_bloom(summary, cursor).map(|(_, _, next)| next),
+        _ => None,
+    }
+}
+
+fn body_misses(
+    summary: &[u8],
+    cursor: usize,
+    kind: u8,
+    predicates: &[SummaryPredicate<'_>],
+    needed: &[usize],
+) -> Option<(bool, usize)> {
+    match kind {
+        KIND_ALL_NULL => {
+            let miss = needed.iter().any(|index| {
+                !predicates[*index]
+                    .allowed
+                    .iter()
+                    .any(|value| matches!(value, Scalar::Null))
+            });
+            Some((miss, cursor))
+        }
+        KIND_I64 => {
+            let (has_null, min, max, next) = read_i64_zone(summary, cursor)?;
+            let body = Body::I64 { has_null, min, max };
+            Some((predicate_miss(&body, predicates, needed), next))
+        }
+        KIND_I128 => {
+            let (has_null, min, max, next) = read_i128_zone(summary, cursor)?;
+            let body = Body::I128 { has_null, min, max };
+            Some((predicate_miss(&body, predicates, needed), next))
+        }
+        KIND_EXACT => exact_misses(summary, cursor, predicates, needed),
+        KIND_BLOOM => {
+            let (has_null, words, next) = read_bloom(summary, cursor)?;
+            let body = Body::Bloom { has_null, words };
+            Some((predicate_miss(&body, predicates, needed), next))
+        }
+        _ => None,
+    }
+}
+
+fn predicate_miss(body: &Body, predicates: &[SummaryPredicate<'_>], needed: &[usize]) -> bool {
+    needed
+        .iter()
+        .any(|index| !column_may_contain(body, predicates[*index].allowed))
+}
+
+fn skip_exact(summary: &[u8], cursor: usize) -> Option<usize> {
+    let (_, next) = walk_exact(summary, cursor, None)?;
+    Some(next)
+}
+
+fn exact_misses(
+    summary: &[u8],
+    cursor: usize,
+    predicates: &[SummaryPredicate<'_>],
+    needed: &[usize],
+) -> Option<(bool, usize)> {
+    let (hit, next) = walk_exact(summary, cursor, Some((predicates, needed)))?;
+    Some((!hit, next))
+}
+
+/// Walk one exact set. When `needed` is set, `hit` is whether every named
+/// predicate contains a value in the set. Otherwise `hit` is unused.
+fn walk_exact(
+    summary: &[u8],
+    cursor: usize,
+    needed: Option<(&[SummaryPredicate<'_>], &[usize])>,
+) -> Option<(bool, usize)> {
+    if cursor + 2 > summary.len() {
+        return None;
+    }
+    let has_null = summary[cursor] & HAS_NULL != 0;
+    let count = summary[cursor + 1] as usize;
+    if count == 0 || count > MAX_EXACT_STRINGS {
+        return None;
+    }
+    let mut cursor = cursor + 2;
+    let mut satisfied = vec![false; needed.map(|(_, indexes)| indexes.len()).unwrap_or(0)];
+    for _ in 0..count {
+        if cursor + 4 > summary.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(summary[cursor..cursor + 4].try_into().ok()?) as usize;
+        cursor += 4;
+        if cursor + len > summary.len() {
+            return None;
+        }
+        let text = std::str::from_utf8(&summary[cursor..cursor + len]).ok()?;
+        if let Some((predicates, indexes)) = needed {
+            for (slot, index) in indexes.iter().enumerate() {
+                if predicates[*index].allowed.iter().any(|value| match value {
+                    Scalar::Str(candidate) => candidate == text,
+                    _ => false,
+                }) {
+                    satisfied[slot] = true;
+                }
+            }
+        }
+        cursor += len;
+    }
+    let hit = match needed {
+        None => true,
+        Some((predicates, indexes)) => indexes.iter().enumerate().all(|(slot, index)| {
+            satisfied[slot]
+                || predicates[*index].allowed.iter().any(|value| match value {
+                    Scalar::Null => has_null,
+                    Scalar::Str(_) => false,
+                    _ => true,
+                })
+        }),
+    };
+    Some((hit, cursor))
 }
 
 fn column_may_contain(body: &Body, allowed: &[Scalar]) -> bool {
@@ -573,5 +765,15 @@ mod tests {
                 allowed: &note,
             }]
         ));
+    }
+
+    #[test]
+    fn exact_strings_past_the_reader_limit_are_stored_as_a_bloom() {
+        let huge = "x".repeat(MAX_SUMMARY_LEN);
+        let rows = vec![row(1, Scalar::Int(1), Scalar::Str(huge.clone()))];
+        let summary = summarize(&schema(), &rows);
+        assert!(summary.len() <= MAX_SUMMARY_LEN);
+        assert!(summary.len() < 256);
+        assert_eq!(bloom_may_contain(&summary, 2, &huge), Some(true));
     }
 }

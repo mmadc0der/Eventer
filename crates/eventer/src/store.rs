@@ -168,15 +168,7 @@ impl Store {
             return Ok(Vec::new());
         };
         let summary_preds = summary_predicates(&resolved);
-        let blocks = {
-            let catalog = self.catalog();
-            catalog
-                .segments
-                .iter()
-                .flat_map(|segment| segment.blocks.iter().cloned())
-                .filter(|block| block.max_ts >= from_ms && block.min_ts <= to_ms)
-                .collect::<Vec<_>>()
-        };
+        let blocks = self.blocks_overlapping(from_ms, to_ms);
         let mut rows_out = Vec::new();
         let mut response_bytes = 1usize;
         for block in blocks {
@@ -247,15 +239,7 @@ impl Store {
             return Ok(b"[]".to_vec());
         };
         let summary_preds = summary_predicates(&resolved);
-        let blocks = {
-            let catalog = self.catalog();
-            catalog
-                .segments
-                .iter()
-                .flat_map(|segment| segment.blocks.iter().cloned())
-                .filter(|block| block.max_ts >= from_ms && block.min_ts <= to_ms)
-                .collect::<Vec<_>>()
-        };
+        let blocks = self.blocks_overlapping(from_ms, to_ms);
         let mut out = Vec::from(b"[");
         let mut wrote = false;
         let mut row_count = 0usize;
@@ -357,6 +341,21 @@ impl Store {
             segment::read_block_payload(&segment::data_path(&self.dir, block.segment_id), block)?;
         self.decompressed_blocks.fetch_add(1, Ordering::Relaxed);
         Ok(payload)
+    }
+
+    fn blocks_overlapping(&self, from_ms: i64, to_ms: i64) -> Vec<BlockMeta> {
+        let catalog = self.catalog();
+        catalog
+            .segments
+            .iter()
+            .flat_map(|segment| {
+                segment
+                    .blocks
+                    .iter()
+                    .filter(|block| block.max_ts >= from_ms && block.min_ts <= to_ms)
+                    .cloned()
+            })
+            .collect()
     }
 
     fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {

@@ -318,7 +318,7 @@ pub(crate) fn read_index(path: &Path) -> Result<LoadedIndex> {
                 ReadFull::Full => {}
             }
             let summary_len = u32::from_le_bytes(len_buf) as usize;
-            if summary_len > 8 * 1024 * 1024 {
+            if summary_len > crate::summary::MAX_SUMMARY_LEN {
                 return Err(Error::corrupt("index summary is larger than 8 MiB"));
             }
             let mut summary = vec![0u8; summary_len];
