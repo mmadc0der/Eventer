@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -161,6 +162,7 @@ impl Store {
         };
         let mut rows_out = Vec::new();
         let mut response_bytes = 1usize;
+        let mut dictionaries = HashMap::new();
         for block in blocks {
             if rows_out.len() >= MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
@@ -170,10 +172,7 @@ impl Store {
             if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = segment::read_block_payload(
-                &segment::data_path(&self.dir, block.segment_id),
-                &block,
-            )?;
+            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
             if resolved.is_empty() && contained && rows_out.len() + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
@@ -240,6 +239,7 @@ impl Store {
         let mut out = Vec::from(b"[");
         let mut wrote = false;
         let mut row_count = 0usize;
+        let mut dictionaries = HashMap::new();
         for block in blocks {
             if row_count >= MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
@@ -249,10 +249,7 @@ impl Store {
             if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = segment::read_block_payload(
-                &segment::data_path(&self.dir, block.segment_id),
-                &block,
-            )?;
+            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
             if resolved.is_empty() && contained && row_count + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
@@ -324,6 +321,26 @@ impl Store {
         }
         self.flush()?;
         Ok(Some(resolved))
+    }
+
+    fn read_block_bytes(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+    ) -> Result<Vec<u8>> {
+        if !dictionaries.contains_key(&block.segment_id) {
+            let stored =
+                segment::read_dictionary(&segment::dictionary_path(&self.dir, block.segment_id))?;
+            dictionaries.insert(block.segment_id, stored.map(|dict| dict.bytes));
+        }
+        let dictionary = dictionaries
+            .get(&block.segment_id)
+            .and_then(|dict| dict.as_deref());
+        segment::read_block_payload(
+            &segment::data_path(&self.dir, block.segment_id),
+            block,
+            dictionary,
+        )
     }
 
     fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
@@ -999,5 +1016,203 @@ mod tests {
             .unwrap();
         assert_eq!(same.len(), 2);
         store.close().unwrap();
+    }
+
+    fn block_kinds(path: &Path) -> Vec<([u8; 4], i64, i64)> {
+        let data = fs::read(path).unwrap();
+        let mut off = 0usize;
+        let mut out = Vec::new();
+        while off + segment::BLOCK_HEADER_LEN <= data.len() {
+            let magic: [u8; 4] = data[off..off + 4].try_into().unwrap();
+            if magic != *segment::BLOCK_MAGIC && magic != *segment::BLOCK_MAGIC_DICT {
+                break;
+            }
+            let compressed_len =
+                u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+            let min_ts = i64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
+            let max_ts = i64::from_le_bytes(data[off + 24..off + 32].try_into().unwrap());
+            out.push((magic, min_ts, max_ts));
+            off += segment::BLOCK_HEADER_LEN + compressed_len;
+        }
+        out
+    }
+
+    #[test]
+    fn legacy_segment_without_dictionary_round_trips() {
+        let dir = TempDir::new();
+        let schema_path = write_schema(dir.path());
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let rows: Vec<Row> = (0..5)
+            .map(|ts| {
+                crate::value::parse_event(&schema, &event(ts, Some(ts), "click", None, "1.00"))
+                    .unwrap()
+            })
+            .collect();
+        let encoded = crate::codec::encode_block(&schema, &rows).unwrap();
+        let compressed = zstd::bulk::compress(&encoded.bytes, 3).unwrap();
+        let framed = segment::frame_block(
+            &compressed,
+            encoded.bytes.len() as u32,
+            encoded.row_count,
+            encoded.min_ts,
+            encoded.max_ts,
+            false,
+        )
+        .unwrap();
+        assert_eq!(&framed[..4], segment::BLOCK_MAGIC);
+        let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
+        let meta = segment::BlockMeta {
+            segment_id: 1,
+            offset: 0,
+            compressed_len: compressed.len() as u32,
+            uncompressed_len: encoded.bytes.len() as u32,
+            row_count: encoded.row_count,
+            min_ts: encoded.min_ts,
+            max_ts: encoded.max_ts,
+        };
+        active.write_framed(&framed, &meta).unwrap();
+        active.flush_os(true).unwrap();
+        drop(active);
+        assert!(
+            segment::read_dictionary(&segment::dictionary_path(&data, 1))
+                .unwrap()
+                .is_none()
+        );
+
+        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
+        let got = store.query(0, 10).unwrap();
+        assert_eq!(got.len(), 5);
+        assert_eq!(row_value(&store, &got[0])["user_id"], 0);
+        assert_eq!(row_value(&store, &got[4])["action"], "click");
+        assert_eq!(row_value(&store, &got[4])["amount"], "1.00");
+        assert!(!segment::dictionary_path(&data, 1).exists());
+        store.close().unwrap();
+    }
+
+    fn write_until_dictionary(dir: &Path) -> (PathBuf, StoreOptions, i64) {
+        let schema = write_schema(dir);
+        let data = dir.join("data");
+        let mut options = test_options(2048);
+        options.zstd_level = 3;
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let dict_path = segment::dictionary_path(&data, 1);
+        let mut n = 0i64;
+        while !dict_path.exists() {
+            for _ in 0..2048 {
+                store
+                    .append_json(&event(n, Some(n % 50), "click", Some("hello"), "19.99"))
+                    .unwrap();
+                n += 1;
+            }
+            store.flush().unwrap();
+            assert!(n <= 100_000, "dictionary was not trained");
+        }
+        for _ in 0..2048 {
+            store
+                .append_json(&event(n, Some(n % 50), "click", Some("hello"), "19.99"))
+                .unwrap();
+            n += 1;
+        }
+        store.flush().unwrap();
+        store.close().unwrap();
+        (schema, options, n)
+    }
+
+    #[test]
+    fn dictionary_segment_round_trips_across_the_training_boundary() {
+        let dir = TempDir::new();
+        let (schema, options, n) = write_until_dictionary(dir.path());
+        let data = dir.path().join("data");
+        let data_file = segment::data_path(&data, 1);
+        let dict_file = segment::dictionary_path(&data, 1);
+        let kinds = block_kinds(&data_file);
+        let first_dict = kinds
+            .iter()
+            .position(|(magic, _, _)| magic == segment::BLOCK_MAGIC_DICT)
+            .expect("dictionary frame");
+        assert!(
+            first_dict > 0,
+            "blocks before the dictionary must stay plain"
+        );
+        assert!(kinds
+            .iter()
+            .any(|(magic, _, _)| magic == segment::BLOCK_MAGIC));
+        let span_from = kinds[first_dict - 1].1;
+        let span_to = kinds[first_dict].2;
+        assert!(span_from <= kinds[first_dict].1);
+
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let spanned = store.query(span_from, span_to).unwrap();
+        assert_eq!(spanned.len(), (span_to - span_from + 1) as usize);
+        assert_eq!(row_value(&store, &spanned[0])["ts"], span_from);
+        assert_eq!(
+            row_value(&store, spanned.last().unwrap())["user_id"],
+            span_to % 50
+        );
+        assert_eq!(store.query(0, n).unwrap().len(), n as usize);
+        let data_len = fs::metadata(&data_file).unwrap().len();
+        let dict_len = fs::metadata(&dict_file).unwrap().len();
+        assert_eq!(store.stats().data_bytes, data_len + dict_len);
+        assert!(dict_len > segment::DICT_HEADER_LEN as u64);
+        assert!(dict_len <= (segment::DICT_HEADER_LEN + segment::DICT_MAX_BYTES) as u64);
+        store.close().unwrap();
+
+        let reopened = Store::open_with(&data, &schema, options).unwrap();
+        assert_eq!(
+            reopened.query(span_from, span_to).unwrap().len(),
+            spanned.len()
+        );
+        assert_eq!(reopened.query(0, n - 1).unwrap().len(), n as usize);
+        assert_eq!(reopened.stats().data_bytes, data_len + dict_len);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn truncated_or_missing_dictionary_is_corrupt() {
+        let dir = TempDir::new();
+        let (schema, options, n) = write_until_dictionary(dir.path());
+        let data = dir.path().join("data");
+        let dict_file = segment::dictionary_path(&data, 1);
+        let original = fs::read(&dict_file).unwrap();
+        assert!(original.len() > 1);
+        fs::write(&dict_file, &original[..original.len() - 1]).unwrap();
+
+        match Store::open_with(&data, &schema, options.clone()) {
+            Err(err) => assert!(
+                err.to_string().contains("corrupt"),
+                "truncated dictionary opened: {err}"
+            ),
+            Ok(_) => panic!("truncated dictionary opened"),
+        }
+
+        fs::write(&dict_file, &original).unwrap();
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        fs::write(&dict_file, &original[..8]).unwrap();
+        let queried = store.query(0, n).unwrap_err();
+        assert!(
+            queried.to_string().contains("corrupt"),
+            "truncated dictionary queried: {queried}"
+        );
+        store.close().unwrap();
+
+        fs::write(&dict_file, &original).unwrap();
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        fs::remove_file(&dict_file).unwrap();
+        let missing = store.query(0, n).unwrap_err();
+        assert!(
+            missing.to_string().contains("corrupt"),
+            "missing dictionary queried: {missing}"
+        );
+        store.close().unwrap();
+
+        match Store::open_with(&data, &schema, options) {
+            Err(err) => assert!(
+                err.to_string().contains("corrupt"),
+                "missing dictionary opened: {err}"
+            ),
+            Ok(_) => panic!("missing dictionary opened"),
+        }
     }
 }

@@ -5,11 +5,24 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 
 pub const BLOCK_MAGIC: &[u8; 4] = b"EVBK";
+/// Block payload is a zstd frame compressed with the segment dictionary.
+pub const BLOCK_MAGIC_DICT: &[u8; 4] = b"EVBD";
+pub const DICT_MAGIC: &[u8; 4] = b"EVZD";
 pub const INDEX_MAGIC: &[u8; 4] = b"EVIX";
 pub const BLOCK_HEADER_LEN: usize = 36;
 pub const INDEX_HEADER_LEN: usize = 8;
 pub const INDEX_ENTRY_LEN: usize = 40;
+pub const DICT_HEADER_LEN: usize = 16;
 pub const INDEX_VERSION: u16 = 1;
+pub const DICT_VERSION: u16 = 1;
+/// Trained dictionary cap. The sidecar stores this plus a 16-byte header.
+pub const DICT_MAX_BYTES: usize = 4 * 1024;
+/// Uncompressed sealed-block sample kept before training one dictionary.
+pub const DICT_SAMPLE_MAX: usize = 256 * 1024;
+/// Slice size for `zstd::dict::from_continuous`. Fast cover keeps a train/test
+/// split and rejects a handful of ~40KB blocks, which is all that fits in
+/// [`DICT_SAMPLE_MAX`]. The slices are still the same capped sample.
+pub const DICT_SAMPLE_CHUNK: usize = 8 * 1024;
 
 /// One compressed block inside a segment file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +42,8 @@ pub struct SegmentState {
     pub blocks: Vec<BlockMeta>,
     pub data_len: u64,
     pub index_len: u64,
+    /// Sidecar bytes already counted in [`Catalog::data_bytes`].
+    pub dict_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -57,8 +72,21 @@ impl Catalog {
             blocks: Vec::new(),
             data_len: 0,
             index_len: INDEX_HEADER_LEN as u64,
+            dict_bytes: 0,
         });
         self.index_bytes += INDEX_HEADER_LEN as u64;
+    }
+
+    /// Count a segment dictionary sidecar in the same total as block bytes.
+    pub fn add_dictionary_bytes(&mut self, segment_id: u32, nbytes: u64) {
+        if let Some(segment) = self
+            .segments
+            .iter_mut()
+            .find(|segment| segment.id == segment_id)
+        {
+            segment.dict_bytes = segment.dict_bytes.saturating_add(nbytes);
+        }
+        self.data_bytes = self.data_bytes.saturating_add(nbytes);
     }
 
     pub fn append_blocks(&mut self, metas: &[BlockMeta]) {
@@ -85,6 +113,10 @@ pub fn data_path(dir: &Path, id: u32) -> PathBuf {
 
 pub fn index_path(dir: &Path, id: u32) -> PathBuf {
     dir.join(format!("seg-{id:06}.idx"))
+}
+
+pub fn dictionary_path(dir: &Path, id: u32) -> PathBuf {
+    dir.join(format!("seg-{id:06}.dict"))
 }
 
 pub fn list_segment_ids(dir: &Path) -> Result<Vec<u32>> {
@@ -116,7 +148,14 @@ pub fn load_catalog(dir: &Path) -> Result<Catalog> {
     for id in list_segment_ids(dir)? {
         let data = data_path(dir, id);
         let index = index_path(dir, id);
-        let (blocks, data_len) = scan_and_repair(&data, id)?;
+        let (blocks, data_len, uses_dict) = scan_and_repair(&data, id)?;
+        let stored = read_dictionary(&dictionary_path(dir, id))?;
+        if uses_dict && stored.is_none() {
+            return Err(Error::corrupt(format!(
+                "segment {id} has dictionary-compressed blocks but the dictionary file is missing"
+            )));
+        }
+        let dict_bytes = stored.as_ref().map(|dict| dict.file_len).unwrap_or(0);
         let mut indexed = read_index(&index).unwrap_or_default();
         for block in &mut indexed {
             block.segment_id = id;
@@ -126,7 +165,7 @@ pub fn load_catalog(dir: &Path) -> Result<Catalog> {
         if index_on_disk != index_len || !index_matches(&indexed, &blocks) {
             write_index(&index, &blocks)?;
         }
-        catalog.data_bytes += data_len;
+        catalog.data_bytes += data_len.saturating_add(dict_bytes);
         catalog.index_bytes += index_len;
         catalog.rows += blocks
             .iter()
@@ -138,6 +177,7 @@ pub fn load_catalog(dir: &Path) -> Result<Catalog> {
             blocks,
             data_len,
             index_len,
+            dict_bytes,
         });
     }
     Ok(catalog)
@@ -157,12 +197,17 @@ pub fn frame_block(
     row_count: u32,
     min_ts: i64,
     max_ts: i64,
+    dictionary: bool,
 ) -> Result<Vec<u8>> {
     if compressed.len() > u32::MAX as usize {
         return Err(Error::event("compressed block does not fit in u32"));
     }
     let mut out = Vec::with_capacity(BLOCK_HEADER_LEN + compressed.len());
-    out.extend_from_slice(BLOCK_MAGIC);
+    out.extend_from_slice(if dictionary {
+        BLOCK_MAGIC_DICT
+    } else {
+        BLOCK_MAGIC
+    });
     out.extend_from_slice(&uncompressed_len.to_le_bytes());
     out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
     out.extend_from_slice(&row_count.to_le_bytes());
@@ -174,12 +219,13 @@ pub fn frame_block(
     Ok(out)
 }
 
-pub fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<BlockMeta>, u64)> {
+pub fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<BlockMeta>, u64, bool)> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let file_len = file.seek(SeekFrom::End(0))?;
     file.seek(SeekFrom::Start(0))?;
     let mut offset = 0u64;
     let mut blocks = Vec::new();
+    let mut uses_dict = false;
     loop {
         if offset >= file_len || file_len - offset < BLOCK_HEADER_LEN as u64 {
             break;
@@ -189,9 +235,13 @@ pub fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<BlockMeta>, 
         if file.read_exact(&mut header).is_err() {
             break;
         }
-        if &header[0..4] != BLOCK_MAGIC {
+        let dictionary_frame = if header[0..4] == BLOCK_MAGIC[..] {
+            false
+        } else if header[0..4] == BLOCK_MAGIC_DICT[..] {
+            true
+        } else {
             break;
-        }
+        };
         let uncompressed_len = u32::from_le_bytes(header[4..8].try_into().unwrap());
         let compressed_len = u32::from_le_bytes(header[8..12].try_into().unwrap());
         let row_count = u32::from_le_bytes(header[12..16].try_into().unwrap());
@@ -218,13 +268,85 @@ pub fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<BlockMeta>, 
             min_ts,
             max_ts,
         });
+        uses_dict |= dictionary_frame;
         offset = payload_end;
     }
     if offset < file_len {
         file.set_len(offset)?;
         file.sync_all()?;
     }
-    Ok((blocks, offset))
+    Ok((blocks, offset, uses_dict))
+}
+
+/// Dictionary bytes plus the on-disk sidecar length, which includes the header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDictionary {
+    pub bytes: Vec<u8>,
+    pub file_len: u64,
+}
+
+pub fn read_dictionary(path: &Path) -> Result<Option<StoredDictionary>> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let dict = parse_dictionary_file(&bytes)?;
+            Ok(Some(StoredDictionary {
+                bytes: dict,
+                file_len: bytes.len() as u64,
+            }))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+pub fn write_dictionary(dir: &Path, id: u32, dict: &[u8]) -> Result<u64> {
+    if dict.is_empty() || dict.len() > DICT_MAX_BYTES {
+        return Err(Error::corrupt(
+            "refusing to store an empty or oversized segment dictionary",
+        ));
+    }
+    let path = dictionary_path(dir, id);
+    let mut header = [0u8; DICT_HEADER_LEN];
+    header[0..4].copy_from_slice(DICT_MAGIC);
+    header[4..6].copy_from_slice(&DICT_VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&(dict.len() as u32).to_le_bytes());
+    header[12..16].copy_from_slice(&crc32fast::hash(dict).to_le_bytes());
+    let mut file = File::create(&path)?;
+    file.write_all(&header)?;
+    file.write_all(dict)?;
+    file.sync_all()?;
+    Ok((DICT_HEADER_LEN + dict.len()) as u64)
+}
+
+fn parse_dictionary_file(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() < DICT_HEADER_LEN {
+        return Err(Error::corrupt("truncated segment dictionary"));
+    }
+    if bytes[0..4] != DICT_MAGIC[..] {
+        return Err(Error::corrupt("segment dictionary magic mismatch"));
+    }
+    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+    if version != DICT_VERSION {
+        return Err(Error::corrupt(format!(
+            "unsupported dictionary version {version}"
+        )));
+    }
+    let dict_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let crc = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let total = DICT_HEADER_LEN
+        .checked_add(dict_len)
+        .ok_or_else(|| Error::corrupt("segment dictionary length overflow"))?;
+    if bytes.len() != total {
+        return Err(Error::corrupt("truncated segment dictionary"));
+    }
+    let dict = &bytes[DICT_HEADER_LEN..];
+    if dict.is_empty() || dict.len() > DICT_MAX_BYTES {
+        return Err(Error::corrupt("segment dictionary size is invalid"));
+    }
+    if crc32fast::hash(dict) != crc {
+        return Err(Error::corrupt("segment dictionary checksum mismatch"));
+    }
+    Ok(dict.to_vec())
 }
 
 fn read_index(path: &Path) -> Result<Vec<BlockMeta>> {
@@ -290,15 +412,23 @@ fn write_index(path: &Path, blocks: &[BlockMeta]) -> Result<()> {
     Ok(())
 }
 
-pub fn read_block_payload(path: &Path, meta: &BlockMeta) -> Result<Vec<u8>> {
+pub fn read_block_payload(
+    path: &Path,
+    meta: &BlockMeta,
+    dictionary: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(meta.offset))?;
     let total = BLOCK_HEADER_LEN + meta.compressed_len as usize;
     let mut buf = vec![0u8; total];
     file.read_exact(&mut buf)?;
-    if &buf[0..4] != BLOCK_MAGIC {
+    let dictionary_frame = if buf[0..4] == BLOCK_MAGIC[..] {
+        false
+    } else if buf[0..4] == BLOCK_MAGIC_DICT[..] {
+        true
+    } else {
         return Err(Error::corrupt("block magic mismatch while reading"));
-    }
+    };
     let compressed = &buf[BLOCK_HEADER_LEN..];
     let crc = u32::from_le_bytes(buf[32..36].try_into().unwrap());
     if crc32fast::hash(compressed) != crc {
@@ -313,8 +443,32 @@ pub fn read_block_payload(path: &Path, meta: &BlockMeta) -> Result<Vec<u8>> {
             "uncompressed length does not match the index",
         ));
     }
-    zstd::bulk::decompress(compressed, uncompressed_len as usize)
-        .map_err(|err| Error::corrupt(format!("zstd decompress failed: {err}")))
+    if dictionary_frame {
+        let Some(dictionary) = dictionary else {
+            return Err(Error::corrupt(format!(
+                "dictionary frame at offset {} in segment {} has no dictionary",
+                meta.offset, meta.segment_id
+            )));
+        };
+        let mut decompressor =
+            zstd::bulk::Decompressor::with_dictionary(dictionary).map_err(|err| {
+                Error::corrupt(format!(
+                    "zstd dictionary decompressor failed at offset {} in segment {}: {err}",
+                    meta.offset, meta.segment_id
+                ))
+            })?;
+        decompressor
+            .decompress(compressed, uncompressed_len as usize)
+            .map_err(|err| {
+                Error::corrupt(format!(
+                    "zstd dictionary decompress failed at offset {} in segment {}: {err}",
+                    meta.offset, meta.segment_id
+                ))
+            })
+    } else {
+        zstd::bulk::decompress(compressed, uncompressed_len as usize)
+            .map_err(|err| Error::corrupt(format!("zstd decompress failed: {err}")))
+    }
 }
 
 /// Append-only writer for the current segment.
