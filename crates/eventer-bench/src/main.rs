@@ -120,10 +120,13 @@ fn main() -> ExitCode {
     match eventer::uncompressed_column_sizes(&schema, &events[..sample_end]) {
         Ok(sizes) => {
             for (name, size) in sizes {
-                if matches!(name.as_str(), "ts" | "user_id" | "amount") {
+                if matches!(name.as_str(), "ts" | "user_id" | "amount" | "score") {
                     println!("uncompressed_column_bytes {name}: {size}");
                 }
             }
+            // Kind 2 is one null flag, the kind byte, and 8 bytes per present
+            // score. The bench writes a score on every row.
+            println!("uncompressed_score_kind2_bytes: {}", 1 + 1 + sample_end * 8);
         }
         Err(err) => {
             eprintln!("column size measurement failed: {err}");

@@ -536,23 +536,202 @@ pub fn uncompressed_column_sizes(schema: &Schema, rows: &[Row]) -> Result<Vec<(S
     Ok(sizes)
 }
 
+/// Float kind bytes. Kinds 0–2 are the original empty, constant, and raw
+/// little-endian encodings. Kind 3 is unused: the float dictionary experiment
+/// did not ship. Kind 4 is ALP decimal integers.
+const FLOAT_KIND_EMPTY: u8 = 0;
+const FLOAT_KIND_CONSTANT: u8 = 1;
+const FLOAT_KIND_RAW: u8 = 2;
+const FLOAT_KIND_ALP: u8 = 4;
+
+/// Decimal exponents searched for ALP. `10^e` stays inside the range where an
+/// `i64` code can still round-trip through `f64` for ordinary magnitudes.
+const ALP_MAX_EXP: u8 = 18;
+
+const fn pow10_table() -> [f64; ALP_MAX_EXP as usize + 1] {
+    let mut table = [0.0; ALP_MAX_EXP as usize + 1];
+    table[0] = 1.0;
+    let mut exp = 1;
+    while exp < table.len() {
+        table[exp] = table[exp - 1] * 10.0;
+        exp += 1;
+    }
+    table
+}
+
+const POW10: [f64; ALP_MAX_EXP as usize + 1] = pow10_table();
+
 fn encode_f64s(values: &[Option<f64>]) -> Vec<u8> {
     let present: Vec<f64> = values.iter().copied().flatten().collect();
     if present.is_empty() {
-        return vec![0];
+        return vec![FLOAT_KIND_EMPTY];
     }
     let first = present[0].to_bits();
     if present.iter().all(|value| value.to_bits() == first) {
-        let mut out = vec![1];
+        let mut out = vec![FLOAT_KIND_CONSTANT];
         out.extend_from_slice(&present[0].to_le_bytes());
         return out;
     }
+    let raw = encode_raw_f64s(&present);
+    if !alp_might_beat_raw(&present, raw.len()) {
+        return raw;
+    }
+    match encode_alp(&present) {
+        Some(alp) if alp.len() < raw.len() => alp,
+        _ => raw,
+    }
+}
+
+fn encode_raw_f64s(present: &[f64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + present.len() * 8);
-    out.push(2);
+    out.push(FLOAT_KIND_RAW);
     for value in present {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out
+}
+
+/// `round(value * 10^e)` when that integer decodes back to the same bits.
+/// Non-finite values, values that overflow `i64`, and values that are not an
+/// exact decimal at this exponent return `None` and are stored as exceptions.
+fn decimal_code(value: f64, exp: u8) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let scale = POW10[exp as usize];
+    let scaled = value * scale;
+    if !scaled.is_finite() {
+        return None;
+    }
+    let rounded = scaled.round();
+    if !rounded.is_finite() {
+        return None;
+    }
+    let code = rounded as i64;
+    // Saturating casts turn an out-of-range magnitude into `i64::MIN`/`MAX`.
+    if code as f64 != rounded {
+        return None;
+    }
+    let decoded = (code as f64) / scale;
+    if decoded.to_bits() == value.to_bits() {
+        Some(code)
+    } else {
+        None
+    }
+}
+
+fn alp_probe_indices(count: usize) -> Vec<usize> {
+    const MAX_PROBES: usize = 32;
+    if count <= MAX_PROBES {
+        return (0..count).collect();
+    }
+    (0..MAX_PROBES)
+        .map(|index| index * (count - 1) / (MAX_PROBES - 1))
+        .collect()
+}
+
+/// Skip ALP when every probed exponent is already larger than the raw body
+/// even if every unprobed value packed into a single bit. Unique strings use
+/// the same idea: do not build an encoding that cannot win.
+fn alp_might_beat_raw(present: &[f64], raw_len: usize) -> bool {
+    let count = present.len();
+    let probes = alp_probe_indices(count);
+    for exp in 0..=ALP_MAX_EXP {
+        let probe_exceptions = probes
+            .iter()
+            .filter(|index| decimal_code(present[**index], exp).is_none())
+            .count();
+        let coded = count - probe_exceptions;
+        let min_ints = if coded == 0 {
+            1
+        } else {
+            bitpack_len(8, 1, coded)
+        };
+        let lower = alp_body_len(probe_exceptions, min_ints);
+        if lower < raw_len {
+            return true;
+        }
+    }
+    false
+}
+
+fn alp_body_len(exceptions: usize, int_len: usize) -> usize {
+    1 + 1 + 4 + exceptions * 12 + int_len
+}
+
+struct ProbeChoice {
+    exp: u8,
+    exceptions: usize,
+    bits: u32,
+}
+
+/// Smallest probe exception count, then narrowest code span. That is the
+/// exponent whose integer body is most likely to beat raw `f64`s.
+fn choose_alp_exponent(present: &[f64]) -> Option<u8> {
+    let probes = alp_probe_indices(present.len());
+    let mut best: Option<ProbeChoice> = None;
+    for exp in 0..=ALP_MAX_EXP {
+        let mut exceptions = 0usize;
+        let mut min_code = i64::MAX;
+        let mut max_code = i64::MIN;
+        let mut any = false;
+        for index in &probes {
+            match decimal_code(present[*index], exp) {
+                Some(code) => {
+                    any = true;
+                    min_code = min_code.min(code);
+                    max_code = max_code.max(code);
+                }
+                None => exceptions += 1,
+            }
+        }
+        if !any {
+            continue;
+        }
+        let bits = if min_code == max_code {
+            0
+        } else {
+            let span = (max_code as u64).wrapping_sub(min_code as u64);
+            bit_width_for_span(u128::from(span))
+        };
+        let replace = match &best {
+            None => true,
+            Some(current) => {
+                (exceptions, bits, exp) < (current.exceptions, current.bits, current.exp)
+            }
+        };
+        if replace {
+            best = Some(ProbeChoice {
+                exp,
+                exceptions,
+                bits,
+            });
+        }
+    }
+    best.map(|choice| choice.exp)
+}
+
+fn encode_alp(present: &[f64]) -> Option<Vec<u8>> {
+    let exp = choose_alp_exponent(present)?;
+    let mut codes = Vec::with_capacity(present.len());
+    let mut exceptions = Vec::new();
+    for (index, value) in present.iter().enumerate() {
+        match decimal_code(*value, exp) {
+            Some(code) => codes.push(Some(code)),
+            None => exceptions.push((index as u32, value.to_bits())),
+        }
+    }
+    let ints = encode_i64s(&codes);
+    let mut out = Vec::with_capacity(alp_body_len(exceptions.len(), ints.len()));
+    out.push(FLOAT_KIND_ALP);
+    out.push(exp);
+    out.extend_from_slice(&(exceptions.len() as u32).to_le_bytes());
+    for (index, bits) in exceptions {
+        out.extend_from_slice(&index.to_le_bytes());
+        out.extend_from_slice(&bits.to_le_bytes());
+    }
+    out.extend_from_slice(&ints);
+    Some(out)
 }
 
 fn encode_bools(values: &[Option<bool>]) -> Vec<u8> {
@@ -1127,20 +1306,53 @@ fn skip_packed(
 
 fn skip_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
     if count == 0 {
-        return expect_kind(bytes, cursor, 0);
+        return expect_kind(bytes, cursor, FLOAT_KIND_EMPTY);
     }
     let kind = read_u8(bytes, cursor)?;
     match kind {
-        1 => {
+        FLOAT_KIND_CONSTANT => {
             let _ = read_f64(bytes, cursor)?;
             Ok(())
         }
-        2 => {
+        FLOAT_KIND_RAW => {
             let _ = read_exact(bytes, cursor, count.saturating_mul(8))?;
             Ok(())
         }
+        FLOAT_KIND_ALP => {
+            let code_count = read_alp_prefix(bytes, cursor, count)?.0;
+            skip_i64s(bytes, cursor, code_count)
+        }
         _ => Err(Error::corrupt(format!("unknown float encoding {kind}"))),
     }
+}
+
+/// Exception count is `count - code_count`. Returns `(code_count, exponent, exceptions)`
+/// where each exception is `(index in the present-value vector, raw bits)`.
+fn read_alp_prefix(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<(usize, u8, Vec<(usize, u64)>)> {
+    let exp = read_u8(bytes, cursor)?;
+    if exp > ALP_MAX_EXP {
+        return Err(Error::corrupt("float decimal exponent is invalid"));
+    }
+    let exception_count = read_u32(bytes, cursor)? as usize;
+    if exception_count > count {
+        return Err(Error::corrupt("float decimal exception count is invalid"));
+    }
+    let mut exceptions = Vec::with_capacity(exception_count);
+    let mut previous: Option<usize> = None;
+    for _ in 0..exception_count {
+        let index = read_u32(bytes, cursor)? as usize;
+        if index >= count || previous.is_some_and(|prior| index <= prior) {
+            return Err(Error::corrupt("float decimal exception index is invalid"));
+        }
+        previous = Some(index);
+        let bits = u64::from_le_bytes(read_exact(bytes, cursor, 8)?.try_into().unwrap());
+        exceptions.push((index, bits));
+    }
+    Ok((count - exception_count, exp, exceptions))
 }
 
 fn skip_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
@@ -1325,24 +1537,48 @@ fn read_packed<'a>(
 
 fn decode_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<f64>> {
     if count == 0 {
-        expect_kind(bytes, cursor, 0)?;
+        expect_kind(bytes, cursor, FLOAT_KIND_EMPTY)?;
         return Ok(Vec::new());
     }
     let kind = read_u8(bytes, cursor)?;
     match kind {
-        1 => {
+        FLOAT_KIND_CONSTANT => {
             let value = read_f64(bytes, cursor)?;
             Ok(vec![value; count])
         }
-        2 => {
+        FLOAT_KIND_RAW => {
             let mut out = Vec::with_capacity(count);
             for _ in 0..count {
                 out.push(read_f64(bytes, cursor)?);
             }
             Ok(out)
         }
+        FLOAT_KIND_ALP => decode_alp(bytes, cursor, count),
         _ => Err(Error::corrupt(format!("unknown float encoding {kind}"))),
     }
+}
+
+fn decode_alp(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<f64>> {
+    let (code_count, exp, exceptions) = read_alp_prefix(bytes, cursor, count)?;
+    let codes = decode_i64s(bytes, cursor, code_count)?;
+    let scale = POW10[exp as usize];
+    let mut out = Vec::with_capacity(count);
+    let mut codes_at = 0;
+    let mut exceptions_at = 0;
+    for index in 0..count {
+        if exceptions_at < exceptions.len() && exceptions[exceptions_at].0 == index {
+            out.push(f64::from_bits(exceptions[exceptions_at].1));
+            exceptions_at += 1;
+        } else {
+            let code = codes[codes_at];
+            codes_at += 1;
+            out.push((code as f64) / scale);
+        }
+    }
+    if codes_at != codes.len() || exceptions_at != exceptions.len() {
+        return Err(Error::corrupt("float decimal codes do not fill the column"));
+    }
+    Ok(out)
 }
 
 fn decode_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<bool>> {
@@ -1564,6 +1800,11 @@ fn width_for_kind(kind: u8) -> Result<usize> {
         6 => Ok(16),
         _ => Err(Error::corrupt(format!("unknown integer encoding {kind}"))),
     }
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+    let slice = read_exact(bytes, cursor, 4)?;
+    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
 }
 
 fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8> {
@@ -2962,5 +3203,203 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert!(matches!(&decoded[0].values[2], Scalar::Int(1)));
         assert!(matches!(&decoded[0].values[1], Scalar::Str(text) if text == &note));
+    }
+
+    fn float_bits(value: &Scalar) -> u64 {
+        match value {
+            Scalar::Float(number) => number.to_bits(),
+            other => panic!("expected float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repeated_tenths_use_alp_and_roundtrip_bits() {
+        let values: Vec<Option<f64>> = (0..2048).map(|i| Some((i % 100) as f64 / 10.0)).collect();
+        let encoded = encode_f64s(&values);
+        let raw_len = 1 + values.len() * 8;
+        assert_eq!(encoded[0], FLOAT_KIND_ALP);
+        assert_eq!(encoded[1], 1, "tenths encode at exponent 1");
+        assert!(encoded.len() < raw_len);
+        let mut cursor = 0;
+        let decoded = decode_f64s(&encoded, &mut cursor, values.len()).unwrap();
+        assert_eq!(cursor, encoded.len());
+        for (index, value) in decoded.iter().enumerate() {
+            assert_eq!(value.to_bits(), values[index].unwrap().to_bits());
+        }
+        let mut skip = 0;
+        skip_f64s(&encoded, &mut skip, values.len()).unwrap();
+        assert_eq!(skip, encoded.len());
+
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "score", "type": "float"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for (index, score) in values.iter().enumerate().take(300) {
+            let mut obj = serde_json::json!({"ts": 1_000 + index as i64});
+            if index % 17 != 0 {
+                obj["score"] = serde_json::json!(score.unwrap());
+            }
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let block = encode_block(&schema, &rows).unwrap();
+        let decoded = decode_block(&schema, &block.bytes).unwrap();
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            match (&left.values[1], &right.values[1]) {
+                (Scalar::Null, Scalar::Null) => {}
+                (Scalar::Float(left_score), Scalar::Float(right_score)) => {
+                    assert_eq!(left_score.to_bits(), right_score.to_bits());
+                }
+                (left_score, right_score) => {
+                    panic!("score mismatch {left_score:?} vs {right_score:?}")
+                }
+            }
+        }
+        let sizes = uncompressed_column_sizes(&schema, &rows).unwrap();
+        let score = sizes.iter().find(|(name, _)| name == "score").unwrap().1;
+        let present = rows
+            .iter()
+            .filter(|row| matches!(row.values[1], Scalar::Float(_)))
+            .count();
+        let kind2 = 1 + rows.len().div_ceil(8) + 1 + present * 8;
+        assert!(score < kind2);
+    }
+
+    #[test]
+    fn spread_unique_floats_stay_on_raw_kind() {
+        let values: Vec<Option<f64>> = (0..64)
+            .map(|i| {
+                let exp = (i % 11) as i32 - 5;
+                Some((i as f64 + 0.37) * 10f64.powi(exp * 3))
+            })
+            .collect();
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], FLOAT_KIND_RAW);
+        let mut cursor = 0;
+        let decoded = decode_f64s(&encoded, &mut cursor, values.len()).unwrap();
+        assert_eq!(cursor, encoded.len());
+        for (index, value) in decoded.iter().enumerate() {
+            assert_eq!(value.to_bits(), values[index].unwrap().to_bits());
+        }
+    }
+
+    #[test]
+    fn constant_float_stays_on_kind_one() {
+        let values = vec![Some(-2.5f64); 32];
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], FLOAT_KIND_CONSTANT);
+        assert_ne!(encoded[0], FLOAT_KIND_ALP);
+        let mut cursor = 0;
+        let decoded = decode_f64s(&encoded, &mut cursor, values.len()).unwrap();
+        assert!(decoded
+            .iter()
+            .all(|value| value.to_bits() == (-2.5f64).to_bits()));
+    }
+
+    #[test]
+    fn alp_preserves_nan_payloads_negative_zero_and_inexact_values() {
+        let mut values: Vec<Option<f64>> =
+            (0..128).map(|i| Some((i % 100) as f64 / 10.0)).collect();
+        let neg_zero = -0.0f64;
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0x7ff8_0000_0000_0002);
+        let inexact = std::f64::consts::PI;
+        values[3] = Some(neg_zero);
+        values[4] = Some(nan_a);
+        values[20] = Some(nan_b);
+        values[21] = Some(inexact);
+        assert!(decimal_code(inexact, 1).is_none());
+        assert!(decimal_code(neg_zero, 1).is_none());
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], FLOAT_KIND_ALP);
+        let mut cursor = 0;
+        let decoded = decode_f64s(&encoded, &mut cursor, values.len()).unwrap();
+        assert_eq!(cursor, encoded.len());
+        for (index, value) in decoded.iter().enumerate() {
+            assert_eq!(
+                value.to_bits(),
+                values[index].unwrap().to_bits(),
+                "row {index}"
+            );
+        }
+        assert_eq!(decoded[3].to_bits(), neg_zero.to_bits());
+        assert_ne!(decoded[3].to_bits(), 0.0f64.to_bits());
+        assert_eq!(decoded[4].to_bits(), nan_a.to_bits());
+        assert_eq!(decoded[20].to_bits(), nan_b.to_bits());
+        assert_ne!(decoded[4].to_bits(), decoded[20].to_bits());
+        assert_eq!(decoded[21].to_bits(), inexact.to_bits());
+    }
+
+    #[test]
+    fn legacy_kind2_float_block_decodes() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "score", "type": "float"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(KIND_CONSTANT);
+        bytes.extend_from_slice(&1000i64.to_le_bytes());
+        bytes.push(0);
+        bytes.push(FLOAT_KIND_RAW);
+        bytes.extend_from_slice(&1.25f64.to_le_bytes());
+        bytes.extend_from_slice(&(-0.0f64).to_le_bytes());
+        let rows = decode_block(&schema, &bytes).unwrap();
+        assert_eq!(rows[0].ts, 1000);
+        assert_eq!(float_bits(&rows[0].values[1]), 1.25f64.to_bits());
+        assert_eq!(float_bits(&rows[1].values[1]), (-0.0f64).to_bits());
+        assert_ne!(float_bits(&rows[1].values[1]), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn filtered_miss_skips_an_alp_float_column() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "score", "type": "float"},
+                    {"name": "action", "type": "string"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for i in 0..64i64 {
+            let obj = serde_json::json!({
+                "ts": 5_000 + i,
+                "score": (i % 100) as f64 / 10.0,
+                "action": if i % 2 == 0 { "click" } else { "view" },
+            });
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let miss = ColumnPredicate {
+            index: 2,
+            allowed: vec![Scalar::Str("missing".into())],
+        };
+        let rows = decode_rows_in_range_filtered(
+            &schema,
+            &encoded.bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[miss],
+        )
+        .unwrap();
+        assert!(rows.is_empty());
     }
 }
