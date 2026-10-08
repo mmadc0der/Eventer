@@ -350,28 +350,37 @@ fn encode_i64s(values: &[Option<i64>]) -> Vec<u8> {
         out.extend_from_slice(&min.to_le_bytes());
         return out;
     }
-    let mut best = encode_i64s_frame(min, &present);
+    let span = (max as u64).wrapping_sub(min as u64);
+    let width = width_of(u128::from(span));
+    let count = present.len();
+    let mut best_len = frame_len(8, width, count);
+    let mut choice = IntEncoding::Frame;
     if let Some((base, stride)) = constant_stride_i64(&present) {
-        let encoded = encode_stride_i64(base, stride);
-        if encoded.len() < best.len() {
-            best = encoded;
+        let stride_len = 1 + 8 + 8;
+        if stride_len < best_len {
+            best_len = stride_len;
+            choice = IntEncoding::Stride {
+                base: i128::from(base),
+                stride: i128::from(stride),
+            };
         }
     }
-    let span = (max as u64).wrapping_sub(min as u64);
     let bits = bit_width_for_span(u128::from(span));
-    if bitpack_len(8, bits, present.len()) < best.len() {
-        let packed = encode_bitpack(
+    let packed_len = bitpack_len(8, bits, count);
+    if packed_len < best_len {
+        choice = IntEncoding::Bitpack { bits };
+    }
+    match choice {
+        IntEncoding::Frame => encode_i64s_frame(min, width, &present),
+        IntEncoding::Stride { base, stride } => encode_stride_i64(base as i64, stride as i64),
+        IntEncoding::Bitpack { bits } => encode_bitpack(
             &min.to_le_bytes(),
             bits,
             present
                 .iter()
                 .map(|value| u128::from((*value as u64).wrapping_sub(min as u64))),
-        );
-        if packed.len() < best.len() {
-            best = packed;
-        }
+        ),
     }
-    best
 }
 
 fn encode_i128s(values: &[Option<i128>]) -> Vec<u8> {
@@ -386,33 +395,47 @@ fn encode_i128s(values: &[Option<i128>]) -> Vec<u8> {
         out.extend_from_slice(&min.to_le_bytes());
         return out;
     }
-    let mut best = encode_i128s_frame(min, &present);
+    let span = (max as u128).wrapping_sub(min as u128);
+    let width = width_of(span);
+    let count = present.len();
+    let mut best_len = frame_len(16, width, count);
+    let mut choice = IntEncoding::Frame;
     if let Some((base, stride)) = constant_stride_i128(&present) {
-        let encoded = encode_stride_i128(base, stride);
-        if encoded.len() < best.len() {
-            best = encoded;
+        let stride_len = 1 + 16 + 16;
+        if stride_len < best_len {
+            best_len = stride_len;
+            choice = IntEncoding::Stride { base, stride };
         }
     }
-    let span = (max as u128).wrapping_sub(min as u128);
     let bits = bit_width_for_span(span);
-    if bitpack_len(16, bits, present.len()) < best.len() {
-        let packed = encode_bitpack(
+    let packed_len = bitpack_len(16, bits, count);
+    if packed_len < best_len {
+        choice = IntEncoding::Bitpack { bits };
+    }
+    match choice {
+        IntEncoding::Frame => encode_i128s_frame(min, width, &present),
+        IntEncoding::Stride { base, stride } => encode_stride_i128(base, stride),
+        IntEncoding::Bitpack { bits } => encode_bitpack(
             &min.to_le_bytes(),
             bits,
             present
                 .iter()
                 .map(|value| (*value as u128).wrapping_sub(min as u128)),
-        );
-        if packed.len() < best.len() {
-            best = packed;
-        }
+        ),
     }
-    best
 }
 
-fn encode_i64s_frame(min: i64, present: &[i64]) -> Vec<u8> {
-    let span = (present.iter().copied().max().unwrap() as u64).wrapping_sub(min as u64);
-    let width = width_of(u128::from(span));
+enum IntEncoding {
+    Frame,
+    Stride { base: i128, stride: i128 },
+    Bitpack { bits: u32 },
+}
+
+fn frame_len(base_len: usize, width: usize, count: usize) -> usize {
+    1 + base_len + width * count
+}
+
+fn encode_i64s_frame(min: i64, width: usize, present: &[i64]) -> Vec<u8> {
     let mut out = vec![kind_for_width(width)];
     out.extend_from_slice(&min.to_le_bytes());
     for value in present {
@@ -422,9 +445,7 @@ fn encode_i64s_frame(min: i64, present: &[i64]) -> Vec<u8> {
     out
 }
 
-fn encode_i128s_frame(min: i128, present: &[i128]) -> Vec<u8> {
-    let span = (present.iter().copied().max().unwrap() as u128).wrapping_sub(min as u128);
-    let width = width_of(span);
+fn encode_i128s_frame(min: i128, width: usize, present: &[i128]) -> Vec<u8> {
     let mut out = vec![kind_for_width(width)];
     out.extend_from_slice(&min.to_le_bytes());
     for value in present {
@@ -697,13 +718,10 @@ fn write_uint(out: &mut Vec<u8>, value: u128, width: usize) {
     out.extend_from_slice(&bytes[..width]);
 }
 
-/// `ceil(log2(span + 1))`, the bits needed to store every delta in `0..=span`.
+/// Bit length of `span`, which is enough for every delta in `0..=span`.
+/// `u128::MAX` is already 128. A zero span is the constant kind and is not packed.
 fn bit_width_for_span(span: u128) -> u32 {
-    if span == u128::MAX {
-        return 128;
-    }
-    let distinct = span + 1;
-    u128::BITS - distinct.leading_zeros()
+    u128::BITS - span.leading_zeros()
 }
 
 #[derive(Default)]
@@ -715,6 +733,10 @@ struct BitPacker {
 
 impl BitPacker {
     fn push(&mut self, value: u128, width: u32) {
+        debug_assert!(
+            width >= 128 || value >> width == 0,
+            "delta {value} does not fit in {width} bits"
+        );
         let value = if width >= 128 {
             value
         } else {
@@ -2191,6 +2213,33 @@ mod tests {
         for (left, right) in rows.iter().zip(decoded.iter()) {
             assert_eq!(left.values, right.values);
         }
+    }
+
+    #[test]
+    fn exact_bit_width_uses_span_on_power_of_two_boundaries() {
+        fn roundtrip(values: &[Option<i64>], bits: u8) {
+            let encoded = encode_i64s(values);
+            assert_eq!(encoded[0], KIND_BITPACK);
+            assert_eq!(encoded[1], bits);
+            let mut cursor = 0;
+            let decoded = decode_i64s(&encoded, &mut cursor, values.len()).unwrap();
+            assert_eq!(cursor, encoded.len());
+            assert_eq!(decoded, values.iter().copied().flatten().collect::<Vec<_>>());
+            let mut skip = 0;
+            skip_i64s(&encoded, &mut skip, values.len()).unwrap();
+            assert_eq!(skip, encoded.len());
+        }
+
+        // Not an arithmetic progression, so kind 7 cannot steal the column.
+        roundtrip(&[Some(0), Some(1), Some(0)], 1);
+
+        let mut seven_bits = vec![Some(0i64), Some(127)];
+        seven_bits.extend(std::iter::repeat(Some(3)).take(14));
+        roundtrip(&seven_bits, 7);
+
+        let mut fifteen_bits = vec![Some(0i64), Some(32_767)];
+        fifteen_bits.extend(std::iter::repeat(Some(1)).take(14));
+        roundtrip(&fifteen_bits, 15);
     }
 
     #[test]
