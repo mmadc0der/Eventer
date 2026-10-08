@@ -163,7 +163,8 @@ pub(crate) fn decode_rows_in_range_filtered(
             }
         } else if filters_remain {
             let start = cursor;
-            skip_column(field.ty, bytes, &mut cursor, nrows)?;
+            // The event timestamp is always a filter, so this skip is another column.
+            skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
             skipped.push((index, start, cursor));
         } else {
             columns[index] = Some(decode_column(
@@ -747,12 +748,19 @@ fn read_timestamp_column(schema: &Schema, bytes: &[u8]) -> Result<Vec<i64>> {
             }
             return Ok(out);
         }
-        skip_column(field.ty, bytes, &mut cursor, nrows)?;
+        // Columns before the event timestamp may themselves be nullable timestamps.
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
     }
     Err(Error::corrupt("timestamp column is missing"))
 }
 
-fn skip_column(ty: FieldType, bytes: &[u8], cursor: &mut usize, nrows: usize) -> Result<()> {
+fn skip_column(
+    ty: FieldType,
+    bytes: &[u8],
+    cursor: &mut usize,
+    nrows: usize,
+    reject_null_timestamp: bool,
+) -> Result<()> {
     let present = read_present(bytes, cursor, nrows)?;
     let present_count = match &present {
         None => nrows,
@@ -761,7 +769,11 @@ fn skip_column(ty: FieldType, bytes: &[u8], cursor: &mut usize, nrows: usize) ->
     match ty {
         FieldType::Int => skip_i64s(bytes, cursor, present_count),
         FieldType::Timestamp => {
-            if present.as_ref().is_some_and(|flags| flags.iter().any(|flag| !*flag)) {
+            if reject_null_timestamp
+                && present
+                    .as_ref()
+                    .is_some_and(|flags| flags.iter().any(|flag| !*flag))
+            {
                 return Err(Error::corrupt("timestamp column is null or the wrong type"));
             }
             skip_i64s(bytes, cursor, present_count)
@@ -1263,8 +1275,15 @@ fn finish_empty(
     from_index: usize,
 ) -> Result<Vec<Row>> {
     let nrows = block_row_count(bytes)?;
-    for field in &schema.fields[from_index..] {
-        skip_column(field.ty, bytes, cursor, nrows)?;
+    for (offset, field) in schema.fields[from_index..].iter().enumerate() {
+        let index = from_index + offset;
+        skip_column(
+            field.ty,
+            bytes,
+            cursor,
+            nrows,
+            index == schema.timestamp_index,
+        )?;
     }
     if *cursor != bytes.len() {
         return Err(Error::corrupt("block has trailing bytes"));
@@ -2191,6 +2210,81 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(filtered.contains("timestamp column is null or the wrong type"));
+    }
+
+    fn extra_timestamp_event(seen_at_first: bool) -> (Schema, Vec<u8>) {
+        let schema = if seen_at_first {
+            parse_schema(
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "seen_at", "type": "timestamp"},
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "action", "type": "string"}
+                    ]
+                }"#,
+            )
+            .unwrap()
+        } else {
+            parse_schema(
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "seen_at", "type": "timestamp"},
+                        {"name": "action", "type": "string"}
+                    ]
+                }"#,
+            )
+            .unwrap()
+        };
+        let row = parse_event(&schema, br#"{"ts":1000,"action":"click"}"#).unwrap();
+        let encoded = encode_block(&schema, &[row]).unwrap();
+        (schema, encoded.bytes)
+    }
+
+    #[test]
+    fn nullable_timestamp_column_is_not_the_event_timestamp() {
+        let (schema, bytes) = extra_timestamp_event(true);
+        let decoded = decode_block(&schema, &bytes).unwrap();
+        assert!(matches!(decoded[0].values[0], Scalar::Null));
+        let ranged = decode_rows_in_range(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX).unwrap();
+        assert_eq!(ranged.len(), 1);
+        assert!(matches!(ranged[0].values[0], Scalar::Null));
+
+        let (schema, bytes) = extra_timestamp_event(false);
+        let ranged = decode_rows_in_range(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX).unwrap();
+        assert_eq!(ranged.len(), 1);
+        assert!(matches!(ranged[0].values[1], Scalar::Null));
+        let hit = ColumnPredicate {
+            index: 2,
+            allowed: vec![Scalar::Str("click".into())],
+        };
+        let rows = decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[hit],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].values[1], Scalar::Null));
+        let miss = ColumnPredicate {
+            index: 2,
+            allowed: vec![Scalar::Str("missing".into())],
+        };
+        let rows = decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[miss],
+        )
+        .unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
