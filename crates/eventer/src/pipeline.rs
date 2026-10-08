@@ -715,7 +715,7 @@ fn scalar_encoded_upper_bound(ty: FieldType, scalar: &Scalar) -> usize {
 
 fn compress_loop(rx: Receiver<CompIn>, tx: Sender<CompOut>, level: i32, publish: Arc<DictPublish>) {
     let mut plain = zstd::bulk::Compressor::new(level).ok();
-    let mut with_dict: Option<(usize, zstd::bulk::Compressor<'static>)> = None;
+    let mut with_dict: Option<(Arc<Vec<u8>>, zstd::bulk::Compressor<'static>)> = None;
     while let Ok(msg) = rx.recv() {
         let out = match msg {
             CompIn::Flush { seq, ack } => CompOut::Flush { seq, ack },
@@ -732,7 +732,7 @@ fn compress_loop(rx: Receiver<CompIn>, tx: Sender<CompOut>, level: i32, publish:
 
 fn compress_block(
     plain: &mut Option<zstd::bulk::Compressor<'static>>,
-    with_dict: &mut Option<(usize, zstd::bulk::Compressor<'static>)>,
+    with_dict: &mut Option<(Arc<Vec<u8>>, zstd::bulk::Compressor<'static>)>,
     publish: &DictPublish,
     level: i32,
     block: BlockIn,
@@ -743,10 +743,12 @@ fn compress_block(
         None
     };
     let compressed = if let Some(dict) = dict.as_ref() {
-        let key = Arc::as_ptr(dict) as usize;
-        if with_dict.as_ref().map(|(existing, _)| *existing) != Some(key) {
+        let installed = with_dict
+            .as_ref()
+            .is_some_and(|(existing, _)| Arc::ptr_eq(existing, dict));
+        if !installed {
             match zstd::bulk::Compressor::with_dictionary(level, dict) {
-                Ok(compressor) => *with_dict = Some((key, compressor)),
+                Ok(compressor) => *with_dict = Some((Arc::clone(dict), compressor)),
                 Err(err) => {
                     return CompOut::Skip {
                         seq: block.seq,
@@ -815,7 +817,7 @@ struct Disk {
     poison: Arc<Mutex<Option<Error>>>,
     publish: Arc<DictPublish>,
     plain: Option<zstd::bulk::Compressor<'static>>,
-    dict_compressor: Option<(usize, zstd::bulk::Compressor<'static>)>,
+    dict_compressor: Option<(Arc<Vec<u8>>, zstd::bulk::Compressor<'static>)>,
     dict: Option<Arc<Vec<u8>>>,
     segment_epoch: u32,
 }
@@ -835,13 +837,18 @@ impl Disk {
             .segments
             .last()
             .cloned();
-        let (active, next_id) = match last {
+        let (active, next_id, resume_uses_dict) = match last {
             Some(state) if state.data_len < rotate_at => {
                 let next_id = state.id.saturating_add(1);
-                (Some(ActiveSegment::open_existing(&dir, &state)?), next_id)
+                let uses_dict = state.uses_dict;
+                (
+                    Some(ActiveSegment::open_existing(&dir, &state)?),
+                    next_id,
+                    uses_dict,
+                )
             }
-            Some(state) => (None, state.id.saturating_add(1)),
-            None => (None, 1),
+            Some(state) => (None, state.id.saturating_add(1), false),
+            None => (None, 1, false),
         };
         let mut disk = Self {
             dir,
@@ -858,21 +865,25 @@ impl Disk {
             segment_epoch: 0,
         };
         if let Some(segment) = disk.active.as_ref() {
-            disk.load_existing_dictionary(segment.id)?;
+            disk.load_existing_dictionary(segment.id, resume_uses_dict)?;
         }
         Ok(disk)
     }
 
-    fn load_existing_dictionary(&mut self, id: u32) -> Result<()> {
-        match read_dictionary(&segment::dictionary_path(&self.dir, id))? {
-            Some(stored) => {
+    fn load_existing_dictionary(&mut self, id: u32, uses_dict: bool) -> Result<()> {
+        match read_dictionary(&segment::dictionary_path(&self.dir, id)) {
+            Ok(Some(stored)) => {
                 let dict = Arc::new(stored.bytes);
                 self.dict = Some(Arc::clone(&dict));
                 self.publish.set(self.segment_epoch, dict);
             }
-            None => {
+            Ok(None) => {
                 self.dict = None;
             }
+            Err(Error::Corrupt(_)) if !uses_dict => {
+                self.dict = None;
+            }
+            Err(err) => return Err(err),
         }
         Ok(())
     }
@@ -1050,11 +1061,14 @@ impl Disk {
         dict: Option<Arc<Vec<u8>>>,
     ) -> Result<(Vec<u8>, u32)> {
         let compressed = if let Some(dict) = dict.as_ref() {
-            let key = Arc::as_ptr(dict) as usize;
-            if self.dict_compressor.as_ref().map(|(existing, _)| *existing) != Some(key) {
+            let installed = self
+                .dict_compressor
+                .as_ref()
+                .is_some_and(|(existing, _)| Arc::ptr_eq(existing, dict));
+            if !installed {
                 let compressor =
                     zstd::bulk::Compressor::with_dictionary(self.level, dict).map_err(Error::io)?;
-                self.dict_compressor = Some((key, compressor));
+                self.dict_compressor = Some((Arc::clone(dict), compressor));
             }
             self.dict_compressor
                 .as_mut()

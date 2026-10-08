@@ -328,19 +328,21 @@ impl Store {
         block: &segment::BlockMeta,
         dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
     ) -> Result<Vec<u8>> {
-        if !dictionaries.contains_key(&block.segment_id) {
+        let data_path = segment::data_path(&self.dir, block.segment_id);
+        let uses_dict = segment::frame_uses_dictionary(&data_path, block)?;
+        if uses_dict && !dictionaries.contains_key(&block.segment_id) {
             let stored =
                 segment::read_dictionary(&segment::dictionary_path(&self.dir, block.segment_id))?;
             dictionaries.insert(block.segment_id, stored.map(|dict| dict.bytes));
         }
-        let dictionary = dictionaries
-            .get(&block.segment_id)
-            .and_then(|dict| dict.as_deref());
-        segment::read_block_payload(
-            &segment::data_path(&self.dir, block.segment_id),
-            block,
-            dictionary,
-        )
+        let dictionary = if uses_dict {
+            dictionaries
+                .get(&block.segment_id)
+                .and_then(|dict| dict.as_deref())
+        } else {
+            None
+        };
+        segment::read_block_payload(&data_path, block, dictionary)
     }
 
     fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
@@ -1089,6 +1091,18 @@ mod tests {
         assert_eq!(row_value(&store, &got[4])["amount"], "1.00");
         assert!(!segment::dictionary_path(&data, 1).exists());
         store.close().unwrap();
+
+        let dict_path = segment::dictionary_path(&data, 1);
+        fs::write(&dict_path, [0u8, 1]).unwrap();
+        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
+        assert_eq!(store.query(0, 10).unwrap().len(), 5);
+        store.close().unwrap();
+
+        let oversized = vec![0u8; segment::DICT_HEADER_LEN + segment::DICT_MAX_BYTES + 1];
+        fs::write(&dict_path, &oversized).unwrap();
+        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
+        assert_eq!(store.query(0, 10).unwrap().len(), 5);
+        store.close().unwrap();
     }
 
     fn write_until_dictionary(dir: &Path) -> (PathBuf, StoreOptions, i64) {
@@ -1107,7 +1121,9 @@ mod tests {
                 n += 1;
             }
             store.flush().unwrap();
-            assert!(n <= 100_000, "dictionary was not trained");
+            // Compact integer blocks on current main are about 1.6 KiB, so
+            // filling DICT_SAMPLE_MAX (256 KiB) takes well past 100k rows.
+            assert!(n <= 1_048_576, "dictionary was not trained");
         }
         for _ in 0..2048 {
             store

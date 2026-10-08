@@ -44,6 +44,8 @@ pub struct SegmentState {
     pub index_len: u64,
     /// Sidecar bytes already counted in [`Catalog::data_bytes`].
     pub dict_bytes: u64,
+    /// Scan saw at least one `EVBD` frame. A bad sidecar is fatal only then.
+    pub uses_dict: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,7 @@ impl Catalog {
             data_len: 0,
             index_len: INDEX_HEADER_LEN as u64,
             dict_bytes: 0,
+            uses_dict: false,
         });
         self.index_bytes += INDEX_HEADER_LEN as u64;
     }
@@ -149,7 +152,13 @@ pub fn load_catalog(dir: &Path) -> Result<Catalog> {
         let data = data_path(dir, id);
         let index = index_path(dir, id);
         let (blocks, data_len, uses_dict) = scan_and_repair(&data, id)?;
-        let stored = read_dictionary(&dictionary_path(dir, id))?;
+        let stored = match read_dictionary(&dictionary_path(dir, id)) {
+            Ok(stored) => stored,
+            // A torn sidecar must not hide segments that never used a dictionary.
+            // Dictionary frames still fail below, including a missing file.
+            Err(Error::Corrupt(_)) if !uses_dict => None,
+            Err(err) => return Err(err),
+        };
         if uses_dict && stored.is_none() {
             return Err(Error::corrupt(format!(
                 "segment {id} has dictionary-compressed blocks but the dictionary file is missing"
@@ -178,6 +187,7 @@ pub fn load_catalog(dir: &Path) -> Result<Catalog> {
             data_len,
             index_len,
             dict_bytes,
+            uses_dict,
         });
     }
     Ok(catalog)
@@ -286,17 +296,24 @@ pub struct StoredDictionary {
 }
 
 pub fn read_dictionary(path: &Path) -> Result<Option<StoredDictionary>> {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let dict = parse_dictionary_file(&bytes)?;
-            Ok(Some(StoredDictionary {
-                bytes: dict,
-                file_len: bytes.len() as u64,
-            }))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
+    let len = match fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let max = (DICT_HEADER_LEN + DICT_MAX_BYTES) as u64;
+    if len > max {
+        return Err(Error::corrupt("segment dictionary exceeds the size cap"));
     }
+    let bytes = fs::read(path)?;
+    if bytes.len() as u64 > max {
+        return Err(Error::corrupt("segment dictionary exceeds the size cap"));
+    }
+    let dict = parse_dictionary_file(&bytes)?;
+    Ok(Some(StoredDictionary {
+        bytes: dict,
+        file_len: bytes.len() as u64,
+    }))
 }
 
 pub fn write_dictionary(dir: &Path, id: u32, dict: &[u8]) -> Result<u64> {
@@ -306,16 +323,36 @@ pub fn write_dictionary(dir: &Path, id: u32, dict: &[u8]) -> Result<u64> {
         ));
     }
     let path = dictionary_path(dir, id);
+    // Publish via rename so a crash cannot leave a truncated sidecar in place
+    // of a previous dictionary, or invent one before the bytes are durable.
+    let tmp = dir.join(format!(".seg-{id:06}.dict.partial"));
     let mut header = [0u8; DICT_HEADER_LEN];
     header[0..4].copy_from_slice(DICT_MAGIC);
     header[4..6].copy_from_slice(&DICT_VERSION.to_le_bytes());
     header[8..12].copy_from_slice(&(dict.len() as u32).to_le_bytes());
     header[12..16].copy_from_slice(&crc32fast::hash(dict).to_le_bytes());
-    let mut file = File::create(&path)?;
+    let mut file = File::create(&tmp)?;
     file.write_all(&header)?;
     file.write_all(dict)?;
     file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, &path)?;
     Ok((DICT_HEADER_LEN + dict.len()) as u64)
+}
+
+/// True when the block frame at `meta.offset` is dictionary-compressed (`EVBD`).
+pub fn frame_uses_dictionary(path: &Path, meta: &BlockMeta) -> Result<bool> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(meta.offset))?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    if magic == *BLOCK_MAGIC {
+        Ok(false)
+    } else if magic == *BLOCK_MAGIC_DICT {
+        Ok(true)
+    } else {
+        Err(Error::corrupt("block magic mismatch while reading"))
+    }
 }
 
 fn parse_dictionary_file(bytes: &[u8]) -> Result<Vec<u8>> {
