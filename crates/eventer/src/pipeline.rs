@@ -9,9 +9,9 @@ use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 
 use crate::codec::encode_block;
 use crate::error::{Error, Result};
-use crate::schema::Schema;
+use crate::schema::{FieldType, Schema};
 use crate::segment::{frame_block, ActiveSegment, BlockMeta, Catalog, BLOCK_HEADER_LEN};
-use crate::value::{parse_event, Row};
+use crate::value::{parse_event, Row, Scalar};
 
 const WRITE_BATCH_BLOCKS: usize = 8;
 
@@ -447,33 +447,79 @@ fn emit_block(
     tx: &Sender<CompIn>,
     schema: &Schema,
 ) {
-    let chunk: Vec<Row> = rows.drain(..n).collect();
-    let chunk_acks: Vec<_> = acks.drain(..n).collect();
-    match encode_block(schema, &chunk) {
-        Ok(encoded) => {
-            let msg = CompIn::Block(BlockIn {
-                seq: *stage_seq,
-                raw: encoded.bytes,
-                min_ts: encoded.min_ts,
-                max_ts: encoded.max_ts,
-                row_count: encoded.row_count,
-                acks: chunk_acks,
-            });
-            if let Err(err) = tx.send(msg) {
-                if let CompIn::Block(block) = err.into_inner() {
-                    for ack in block.acks.into_iter().flatten() {
-                        let _ = ack.send(Err(Error::Closed));
+    let mut left = n.min(rows.len());
+    while left > 0 {
+        let take = sealed_prefix_len(schema, &rows[..left]);
+        let chunk: Vec<Row> = rows.drain(..take).collect();
+        let chunk_acks: Vec<_> = acks.drain(..take).collect();
+        left -= take;
+        match encode_block(schema, &chunk) {
+            Ok(encoded) => {
+                let msg = CompIn::Block(BlockIn {
+                    seq: *stage_seq,
+                    raw: encoded.bytes,
+                    min_ts: encoded.min_ts,
+                    max_ts: encoded.max_ts,
+                    row_count: encoded.row_count,
+                    acks: chunk_acks,
+                });
+                if let Err(err) = tx.send(msg) {
+                    if let CompIn::Block(block) = err.into_inner() {
+                        for ack in block.acks.into_iter().flatten() {
+                            let _ = ack.send(Err(Error::Closed));
+                        }
                     }
+                    return;
                 }
-                return;
+                *stage_seq += 1;
             }
-            *stage_seq += 1;
-        }
-        Err(err) => {
-            for ack in chunk_acks.into_iter().flatten() {
-                let _ = ack.send(Err(err.clone()));
+            Err(err) => {
+                for ack in chunk_acks.into_iter().flatten() {
+                    let _ = ack.send(Err(err.clone()));
+                }
             }
         }
+    }
+}
+
+/// A sealed block is decompressed even when the query range only overlaps it.
+/// Cut the batch before `encode_block` so each sealed block stays inside one
+/// query response (`store::MAX_QUERY_BYTES`) and every accepted row is written.
+const MAX_SEALED_BLOCK_UNCOMPRESSED: usize = 64 * 1024 * 1024;
+
+fn sealed_prefix_len(schema: &Schema, rows: &[Row]) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let mut used = 4usize;
+    for _ in &schema.fields {
+        used = used.saturating_add(16);
+    }
+    let mut count = 0usize;
+    for row in rows {
+        let mut add = 16usize;
+        for (index, field) in schema.fields.iter().enumerate() {
+            let scalar = row.values.get(index).unwrap_or(&Scalar::Null);
+            add = add.saturating_add(scalar_encoded_upper_bound(field.ty, scalar));
+        }
+        if count > 0 && used.saturating_add(add) > MAX_SEALED_BLOCK_UNCOMPRESSED {
+            break;
+        }
+        used = used.saturating_add(add);
+        count += 1;
+    }
+    count.max(1)
+}
+
+fn scalar_encoded_upper_bound(ty: FieldType, scalar: &Scalar) -> usize {
+    match (ty, scalar) {
+        (_, Scalar::Null) => 1,
+        (FieldType::Bool, _) => 1,
+        (FieldType::Decimal { .. }, _) => 24,
+        (FieldType::String | FieldType::Text, Scalar::Str(text)) => 10 + text.len(),
+        (FieldType::Json, Scalar::Json(text)) => 10 + text.len(),
+        (FieldType::String | FieldType::Text | FieldType::Json, _) => 10,
+        _ => 16,
     }
 }
 
@@ -762,5 +808,42 @@ fn writer_loop(rx: Receiver<CompOut>, mut disk: Disk, linger: Duration) {
                 Some(CompOut::Block(_)) | None => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::parse_schema;
+
+    #[test]
+    fn sealed_prefix_splits_before_encode_and_keeps_every_row() {
+        let schema = parse_schema(
+            r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"timestamp"},{"name":"props","type":"json"}]}"#,
+        )
+        .unwrap();
+        let body = "x".repeat(890 * 1024);
+        let rows: Vec<Row> = (1..=100)
+            .map(|ts| {
+                let json = format!(r#"{{"n":{ts},"body":"{body}"}}"#);
+                Row {
+                    ts,
+                    values: vec![Scalar::Timestamp(ts), Scalar::Json(json)],
+                }
+            })
+            .collect();
+        let mut offset = 0;
+        let mut blocks = 0usize;
+        while offset < rows.len() {
+            let take = sealed_prefix_len(&schema, &rows[offset..]);
+            assert!(take >= 1);
+            let encoded = encode_block(&schema, &rows[offset..offset + take]).unwrap();
+            assert!(encoded.bytes.len() <= MAX_SEALED_BLOCK_UNCOMPRESSED);
+            offset += take;
+            blocks += 1;
+        }
+        assert!(blocks > 1);
+        assert_eq!(offset, rows.len());
+        assert_eq!(sealed_prefix_len(&schema, &rows[..1]), 1);
     }
 }

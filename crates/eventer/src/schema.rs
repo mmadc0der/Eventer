@@ -19,6 +19,9 @@ pub enum FieldType {
         scale: u32,
     },
     Timestamp,
+    /// Any JSON value except null: object, array, string, number, or bool.
+    /// Each row may use a different shape. JSON null and a missing field are column nulls.
+    Json,
 }
 
 impl FieldType {
@@ -31,6 +34,7 @@ impl FieldType {
             FieldType::Text => "text",
             FieldType::Decimal { .. } => "decimal",
             FieldType::Timestamp => "timestamp",
+            FieldType::Json => "json",
         }
     }
 }
@@ -123,6 +127,7 @@ pub fn parse_schema(text: &str) -> Result<Schema> {
             "string" => FieldType::String,
             "text" => FieldType::Text,
             "timestamp" => FieldType::Timestamp,
+            "json" => FieldType::Json,
             "decimal" => {
                 let scale = field_obj
                     .get("scale")
@@ -368,6 +373,28 @@ mod tests {
         let err = parse_schema(r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"int"}]}"#)
             .unwrap_err();
         assert!(err.to_string().contains("timestamp"));
+    }
+
+    #[test]
+    fn parses_a_json_field_and_rejects_scale() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(schema.fields[1].ty, FieldType::Json);
+        assert!(schema.canonical().contains("\"type\": \"json\""));
+
+        let err = parse_schema(
+            r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"timestamp"},{"name":"props","type":"json","scale":1}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("scale"));
     }
 
     #[test]

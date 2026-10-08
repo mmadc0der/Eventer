@@ -13,5 +13,5 @@ crate-type = ["cdylib", "rlib"]
 crc32fast = "1"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip", "preserve_order", "raw_value"] }
 zstd = "0.13"

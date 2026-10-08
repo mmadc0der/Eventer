@@ -19,7 +19,7 @@ The library is both an rlib and a cdylib (`libeventer.so` / `eventer.dll`) with 
 
 Events are JSON objects. The schema names the timestamp field and the column types. Field order is the on-disk column order. Unknown JSON fields are ignored. Missing values become null, except the timestamp, which is required.
 
-Types: `int` (i64), `float` (f64), `bool`, `string` (dictionary-encoded when that is smaller), `text` (raw UTF-8), `decimal` (JSON string, stored as i128 with a schema scale), `timestamp` (unix milliseconds, or an RFC3339 string such as `2024-01-02T03:04:05.123Z`).
+Types: `int` (i64), `float` (f64), `bool`, `string` (dictionary-encoded when that is smaller), `text` (raw UTF-8), `decimal` (JSON string, stored as i128 with a schema scale), `timestamp` (unix milliseconds, or an RFC3339 string such as `2024-01-02T03:04:05.123Z`), `json` (any JSON value other than null). A `json` column returns the nested value as JSON, so one field can hold an object on one row, an array on the next, and a scalar after that. The stored form keeps the original field text from ingest (including key order, whitespace inside the value, and duplicate object keys). Dictionary encoding is used only when repeated values in a block make it smaller. JSON null and a missing field are both column nulls; a repeated top-level field follows last-wins semantics like `serde_json`.
 
 ```json
 {
@@ -31,7 +31,8 @@ Types: `int` (i64), `float` (f64), `bool`, `string` (dictionary-encoded when tha
     {"name": "ok", "type": "bool"},
     {"name": "action", "type": "string"},
     {"name": "note", "type": "text"},
-    {"name": "amount", "type": "decimal", "scale": 2}
+    {"name": "amount", "type": "decimal", "scale": 2},
+    {"name": "props", "type": "json"}
   ]
 }
 ```
@@ -60,7 +61,7 @@ cargo run -p eventer-server -- --data ./data --schema examples/schema.json --bin
 ```bash
 curl -sS -X POST http://127.0.0.1:43123/events \
   -H 'content-type: application/json' \
-  --data '{"ts":1700000000000,"user_id":7,"score":1.5,"ok":true,"action":"click","note":"demo","amount":"19.99"}'
+  --data '{"ts":1700000000000,"user_id":7,"score":1.5,"ok":true,"action":"click","note":"demo","amount":"19.99","props":{"plan":"pro","flags":["a",1]}}'
 ```
 
 `GET /events?from=&to=` returns a JSON array. `from` and `to` are inclusive unix milliseconds.
@@ -99,7 +100,7 @@ Return codes: `0` ok, `-1` bad argument, `-2` I/O, `-3` event or schema, `-4` qu
 
 Segments rotate after 64 MiB (`seg-000001.dat` plus `seg-000001.idx`). Each block stores its own min/max timestamp. A crash can leave a torn tail; the next open scans complete blocks, truncates the tear, and rebuilds the index if it disagrees.
 
-Inside a block, integers, timestamps, and decimals are stored as a base plus a narrow unsigned delta. Bools are bit-packed. Repeated strings use a dictionary when that encoding is smaller. Nulls are a bitmap.
+Inside a block, integers, timestamps, and decimals are stored as a base plus a narrow unsigned delta. Bools are bit-packed. Repeated strings use a dictionary when that encoding is smaller. JSON columns use that same string encoding on the preserved field text. Nulls are a bitmap.
 
 ## Benchmark
 
@@ -123,4 +124,4 @@ Stored size was identical across the runs (394,005 data bytes, 49 blocks, one se
 
 ## Rust API
 
-`Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced; the HTTP `POST` uses it. `Store::query(from_ms, to_ms)` returns matching rows in ingest order.
+`Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced; the HTTP `POST` uses it. `Store::query(from_ms, to_ms)` returns matching [`Row`] values in ingest order; use [`RowSerializable`] or [`row_to_json_bytes`] when you need the original JSON lexemes (including duplicate keys). `Store::query_json` returns the same data as one JSON array for HTTP.
