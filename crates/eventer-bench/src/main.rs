@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use eventer::{Store, StoreOptions};
+use eventer::{Predicate, Store, StoreOptions};
 
 const SCHEMA: &str = r#"{
   "timestamp_field": "ts",
@@ -24,6 +24,8 @@ fn main() -> ExitCode {
         .nth(1)
         .and_then(|value| value.parse().ok())
         .unwrap_or(100_000);
+    let clustered = env::var("EVENTER_BENCH_CLUSTERED").ok().as_deref() == Some("1");
+    let ignore_summary = env::var("EVENTER_BENCH_IGNORE_SUMMARY").ok().as_deref() == Some("1");
     let root = env::args()
         .nth(2)
         .map(PathBuf::from)
@@ -58,12 +60,17 @@ fn main() -> ExitCode {
         let amount_cents = (i % 5_000) as i64;
         let amount = format!("{}.{:02}", amount_cents / 100, amount_cents % 100);
         let note = notes[i % notes.len()];
+        let action = if clustered {
+            actions[(i / 2048) % actions.len()]
+        } else {
+            actions[i % actions.len()]
+        };
         let mut value = serde_json::json!({
             "ts": ts,
             "user_id": (i % 1_000) as i64,
             "score": (i % 100) as f64 / 10.0,
             "ok": i % 2 == 0,
-            "action": actions[i % actions.len()],
+            "action": action,
             "amount": amount,
         });
         if !note.is_empty() {
@@ -88,7 +95,28 @@ fn main() -> ExitCode {
     let elapsed = started.elapsed();
 
     let stats = store.stats();
-    let queried = match store.query(1_700_000_000_000, 1_700_000_000_000 + count as i64 * 10) {
+    let from = 1_700_000_000_000;
+    let to = 1_700_000_000_000 + count as i64 * 10;
+    // Time the action predicate before the full scan so decompression is not
+    // already warm from reading every block.
+    store.set_ignore_summaries(ignore_summary);
+    let before_filter = store.decompressed_blocks();
+    let filter_started = Instant::now();
+    let filtered = match store.query_with_filter(
+        from,
+        to,
+        &[Predicate::Eq("action".into(), "click".into())],
+    ) {
+        Ok(rows) => rows.len(),
+        Err(err) => {
+            eprintln!("filtered query failed: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let filter_elapsed = filter_started.elapsed();
+    let filter_decompressed = store.decompressed_blocks() - before_filter;
+    store.set_ignore_summaries(false);
+    let queried = match store.query(from, to) {
         Ok(rows) => rows.len(),
         Err(err) => {
             eprintln!("query failed: {err}");
@@ -97,6 +125,19 @@ fn main() -> ExitCode {
     };
     if queried != count {
         eprintln!("query returned {queried} rows, expected {count}");
+        return ExitCode::from(1);
+    }
+    if clustered {
+        let expected = clustered_click_rows(count);
+        if filtered != expected {
+            eprintln!("clustered query returned {filtered} rows, expected {expected}");
+            return ExitCode::from(1);
+        }
+    } else if filtered != count.div_ceil(4) {
+        eprintln!(
+            "filtered query returned {filtered} rows, expected {}",
+            count.div_ceil(4)
+        );
         return ExitCode::from(1);
     }
 
@@ -115,6 +156,26 @@ fn main() -> ExitCode {
     println!("segments: {}", stats.segments);
     println!("elapsed_sec: {seconds:.4}");
     println!("events_per_sec: {:.0}", count as f64 / seconds);
+    println!("query_elapsed_sec: {:.6}", filter_elapsed.as_secs_f64());
+    println!("decompressed_blocks: {filter_decompressed}");
+    println!("time_selected_blocks: {}", stats.blocks);
+    println!("clustered: {clustered}");
+    println!("ignore_summary: {ignore_summary}");
     let _ = store.close();
     ExitCode::SUCCESS
+}
+
+fn clustered_click_rows(count: usize) -> usize {
+    let full = count / 2048;
+    let rem = count % 2048;
+    let mut rows = 0;
+    for block in 0..full {
+        if block % 4 == 0 {
+            rows += 2048;
+        }
+    }
+    if rem > 0 && full % 4 == 0 {
+        rows += rem;
+    }
+    rows
 }

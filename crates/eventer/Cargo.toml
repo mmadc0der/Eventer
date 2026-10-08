@@ -14,4 +14,5 @@ crc32fast = "1"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip", "preserve_order", "raw_value"] }
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] }
 zstd = "0.13"

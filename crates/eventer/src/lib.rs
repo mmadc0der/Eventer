@@ -2,9 +2,10 @@
 //!
 //! Events are parsed against a typed schema, packed into columnar blocks, compressed
 //! with zstd, and written by a single thread. A sparse index stores each block's
-//! time range so queries skip blocks that cannot match. Equality predicates are
-//! applied while a block is decoded, so a column that cannot contain the requested
-//! value stops the rest of that block from being materialized.
+//! time range so queries skip blocks that cannot match. Version-2 entries also
+//! store a per-column presence summary, so an equality predicate can skip the
+//! block before it is decompressed. Equality predicates that survive that check
+//! are applied while the block is decoded.
 
 mod c_api;
 mod codec;
@@ -14,6 +15,7 @@ mod pipeline;
 mod schema;
 mod segment;
 mod store;
+mod summary;
 mod value;
 
 pub use error::{Error, Result};

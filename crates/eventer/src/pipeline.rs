@@ -51,6 +51,7 @@ struct BlockIn {
     min_ts: i64,
     max_ts: i64,
     row_count: u32,
+    summary: Vec<u8>,
     acks: Vec<Option<Ack>>,
 }
 
@@ -68,6 +69,7 @@ struct BlockOut {
     row_count: u32,
     min_ts: i64,
     max_ts: i64,
+    summary: Vec<u8>,
     acks: Vec<Option<Ack>>,
 }
 
@@ -461,6 +463,7 @@ fn emit_block(
                     min_ts: encoded.min_ts,
                     max_ts: encoded.max_ts,
                     row_count: encoded.row_count,
+                    summary: encoded.summary,
                     acks: chunk_acks,
                 });
                 if let Err(err) = tx.send(msg) {
@@ -551,6 +554,7 @@ fn compress_loop(rx: Receiver<CompIn>, tx: Sender<CompOut>, level: i32) {
                             row_count: block.row_count,
                             min_ts: block.min_ts,
                             max_ts: block.max_ts,
+                            summary: block.summary,
                             acks: block.acks,
                         }),
                         Err(err) => CompOut::Skip {
@@ -679,6 +683,7 @@ impl Disk {
                     row_count: item.row_count,
                     min_ts: item.min_ts,
                     max_ts: item.max_ts,
+                    summary: item.summary.clone(),
                 };
                 segment.write_framed(&item.framed, &meta)?;
                 metas.push(meta);

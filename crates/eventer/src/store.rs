@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +8,8 @@ use crate::codec::{block_row_count, decode_rows_in_range_filtered, ColumnPredica
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, Schema};
-use crate::segment::{self, Catalog};
+use crate::segment::{self, BlockMeta, Catalog};
+use crate::summary::{self, SummaryPredicate};
 use crate::value::{self, row_to_json_bytes, Row, Scalar};
 
 /// Maximum JSON bytes a single query may materialize in the response buffer.
@@ -75,6 +77,8 @@ pub struct Store {
     schema: Schema,
     dir: PathBuf,
     pipeline: Pipeline,
+    decompressed_blocks: AtomicU64,
+    ignore_summaries: AtomicBool,
 }
 
 impl Store {
@@ -92,7 +96,7 @@ impl Store {
         fs::create_dir_all(&dir)?;
         let schema = schema::load_schema(schema_path.as_ref())?;
         ensure_schema_lock(&dir, &schema)?;
-        let catalog = Arc::new(std::sync::Mutex::new(segment::load_catalog(&dir)?));
+        let catalog = Arc::new(std::sync::Mutex::new(segment::load_catalog(&dir, &schema)?));
         let pipeline = pipeline::spawn(PipelineConfig {
             dir: dir.clone(),
             schema: Arc::new(schema.clone()),
@@ -108,6 +112,8 @@ impl Store {
             schema,
             dir,
             pipeline,
+            decompressed_blocks: AtomicU64::new(0),
+            ignore_summaries: AtomicBool::new(false),
         })
     }
 
@@ -130,6 +136,17 @@ impl Store {
         &self.schema
     }
 
+    /// Compressed blocks whose bodies were decompressed by queries on this store.
+    pub fn decompressed_blocks(&self) -> u64 {
+        self.decompressed_blocks.load(Ordering::Relaxed)
+    }
+
+    /// When set, queries ignore version-2 presence summaries and decompress every
+    /// time-overlapping block. The exact predicate still runs.
+    pub fn set_ignore_summaries(&self, ignore: bool) {
+        self.ignore_summaries.store(ignore, Ordering::Relaxed);
+    }
+
     /// Inclusive range on the schema timestamp, in unix milliseconds. Results are in ingest order.
     pub fn query(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Row>> {
         self.query_with_filter(from_ms, to_ms, &[])
@@ -150,6 +167,7 @@ impl Store {
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(Vec::new());
         };
+        let summary_preds = summary_predicates(&resolved);
         let blocks = {
             let catalog = self.catalog();
             catalog
@@ -170,10 +188,10 @@ impl Store {
             if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = segment::read_block_payload(
-                &segment::data_path(&self.dir, block.segment_id),
-                &block,
-            )?;
+            if self.summary_miss(&block, &summary_preds) {
+                continue;
+            }
+            let payload = self.read_block(&block)?;
             let nrows = block_row_count(&payload)?;
             if resolved.is_empty() && contained && rows_out.len() + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
@@ -228,6 +246,7 @@ impl Store {
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(b"[]".to_vec());
         };
+        let summary_preds = summary_predicates(&resolved);
         let blocks = {
             let catalog = self.catalog();
             catalog
@@ -249,10 +268,10 @@ impl Store {
             if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = segment::read_block_payload(
-                &segment::data_path(&self.dir, block.segment_id),
-                &block,
-            )?;
+            if self.summary_miss(&block, &summary_preds) {
+                continue;
+            }
+            let payload = self.read_block(&block)?;
             let nrows = block_row_count(&payload)?;
             if resolved.is_empty() && contained && row_count + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
@@ -326,6 +345,20 @@ impl Store {
         Ok(Some(resolved))
     }
 
+    fn summary_miss(&self, block: &BlockMeta, predicates: &[SummaryPredicate<'_>]) -> bool {
+        if self.ignore_summaries.load(Ordering::Relaxed) || block.summary.is_empty() {
+            return false;
+        }
+        !summary::might_match(&block.summary, predicates)
+    }
+
+    fn read_block(&self, block: &BlockMeta) -> Result<Vec<u8>> {
+        let payload =
+            segment::read_block_payload(&segment::data_path(&self.dir, block.segment_id), block)?;
+        self.decompressed_blocks.fetch_add(1, Ordering::Relaxed);
+        Ok(payload)
+    }
+
     fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
         self.pipeline
             .catalog
@@ -343,6 +376,16 @@ impl Drop for Store {
 /// Bytes already written, including the opening `[`. A further row needs at
 /// least one payload byte plus the closing `]`, so a full buffer stops the
 /// next block before it is read or decoded.
+fn summary_predicates(predicates: &[ColumnPredicate]) -> Vec<SummaryPredicate<'_>> {
+    predicates
+        .iter()
+        .map(|predicate| SummaryPredicate {
+            field_index: predicate.index,
+            allowed: predicate.allowed.as_slice(),
+        })
+        .collect()
+}
+
 fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<Vec<ColumnPredicate>> {
     let mut grouped: Vec<ColumnPredicate> = Vec::new();
     for predicate in predicates {
@@ -998,6 +1041,208 @@ mod tests {
             )
             .unwrap();
         assert_eq!(same.len(), 2);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn presence_summary_skips_blocks_and_keeps_matching_rows() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(4)).unwrap();
+        for block in 0..8 {
+            let action = ["click", "view", "buy", "scroll"][block % 4];
+            for row in 0..4 {
+                let ts = (block * 4 + row) as i64;
+                let user = if row == 0 {
+                    None
+                } else {
+                    Some(block as i64 * 10 + row as i64)
+                };
+                store
+                    .append_json(&event(ts, user, action, Some("note"), "1.50"))
+                    .unwrap();
+            }
+        }
+        store.flush().unwrap();
+        assert_eq!(store.stats().blocks, 8);
+
+        let all = store.query(0, 100).unwrap();
+        assert_eq!(all.len(), 32);
+        let decompressed_full = store.decompressed_blocks();
+        assert_eq!(decompressed_full, 8);
+
+        let clicks = store
+            .query_with_filter(0, 100, &[Predicate::Eq("action".into(), "click".into())])
+            .unwrap();
+        assert_eq!(clicks.len(), 8);
+        assert!(clicks
+            .iter()
+            .all(|row| row_value(&store, row)["action"] == "click"));
+        let click_blocks = store.decompressed_blocks() - decompressed_full;
+        assert!(
+            click_blocks * 10 <= 8 * 3,
+            "decompressed {click_blocks} of 8"
+        );
+
+        let outside = store
+            .query_with_filter(0, 100, &[Predicate::Eq("user_id".into(), Scalar::Int(99))])
+            .unwrap();
+        assert!(outside.is_empty());
+        assert_eq!(
+            store.decompressed_blocks(),
+            decompressed_full + click_blocks
+        );
+
+        let null_users = store
+            .query_with_filter(0, 100, &[Predicate::Eq("user_id".into(), Scalar::Null)])
+            .unwrap();
+        assert_eq!(null_users.len(), 8);
+        assert!(null_users
+            .iter()
+            .all(|row| row_value(&store, row)["user_id"].is_null()));
+
+        let before_amount = store.decompressed_blocks();
+        let amount = store
+            .query_with_filter(
+                0,
+                100,
+                &[Predicate::Eq(
+                    "amount".into(),
+                    crate::value::scalar_from_literal(
+                        crate::schema::FieldType::Decimal { scale: 2 },
+                        "9.99",
+                    )
+                    .unwrap(),
+                )],
+            )
+            .unwrap();
+        assert!(amount.is_empty());
+        assert_eq!(store.decompressed_blocks(), before_amount);
+
+        store.set_ignore_summaries(true);
+        let before_ignore = store.decompressed_blocks();
+        let ignored = store
+            .query_with_filter(0, 100, &[Predicate::Eq("action".into(), "click".into())])
+            .unwrap();
+        assert_eq!(ignored.len(), clicks.len());
+        assert_eq!(store.decompressed_blocks() - before_ignore, 8);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn version_1_segment_queries_without_rewriting_the_index() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, Some(2), "view", None, "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        let skipped = store
+            .query_with_filter(0, 10, &[Predicate::Eq("user_id".into(), Scalar::Int(1))])
+            .unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(store.decompressed_blocks(), 1);
+        store.close().unwrap();
+
+        let index = segment::index_path(&data, 1);
+        let loaded = segment::read_index(&index).unwrap();
+        assert_eq!(loaded.version, 2);
+        assert!(loaded.blocks.iter().all(|block| !block.summary.is_empty()));
+        segment::write_index(&index, 1, &loaded.blocks).unwrap();
+        let v1 = fs::read(&index).unwrap();
+        assert_eq!(v1[4], 1);
+        assert_eq!(v1[5], 0);
+
+        let store = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        let rows = store
+            .query_with_filter(0, 10, &[Predicate::Eq("user_id".into(), Scalar::Int(1))])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_value(&store, &rows[0])["action"], "click");
+        assert_eq!(row_value(&store, &rows[0])["user_id"], 1);
+        assert_eq!(store.decompressed_blocks(), 2);
+        let missing = store
+            .query_with_filter(0, 10, &[Predicate::Eq("action".into(), "buy".into())])
+            .unwrap();
+        assert!(missing.is_empty());
+        store.close().unwrap();
+        assert_eq!(fs::read(&index).unwrap(), v1);
+    }
+
+    #[test]
+    fn bloom_false_positive_still_drops_non_matching_rows() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(80)).unwrap();
+        for index in 0..80 {
+            store
+                .append_json(&event(
+                    index,
+                    Some(index),
+                    &format!("action-{index}"),
+                    None,
+                    "1.00",
+                ))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.stats().blocks, 1);
+        let catalog = segment::load_catalog(&data, store.schema()).unwrap();
+        let summary = &catalog.segments[0].blocks[0].summary;
+        let action_index = store
+            .schema()
+            .fields
+            .iter()
+            .position(|field| field.name == "action")
+            .unwrap();
+        let mut probe = None;
+        for index in 0..20_000 {
+            let text = format!("missing-{index}");
+            if summary::bloom_may_contain(summary, action_index, &text) == Some(true) {
+                probe = Some(text);
+                break;
+            }
+        }
+        let probe = probe.expect("bloom false positive");
+        let rows = store
+            .query_with_filter(0, 100, &[Predicate::Eq("action".into(), probe.into())])
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(store.decompressed_blocks(), 1);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn round_robin_actions_do_not_have_to_skip_blocks() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        for index in 0..16 {
+            store
+                .append_json(&event(
+                    index,
+                    Some(index),
+                    actions[index as usize % 4],
+                    None,
+                    "1.00",
+                ))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let clicks = store
+            .query_with_filter(0, 100, &[Predicate::Eq("action".into(), "click".into())])
+            .unwrap();
+        assert_eq!(clicks.len(), 4);
+        assert_eq!(store.decompressed_blocks(), store.stats().blocks);
         store.close().unwrap();
     }
 }

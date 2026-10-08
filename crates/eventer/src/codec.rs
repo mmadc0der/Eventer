@@ -11,6 +11,8 @@ pub struct EncodedBlock {
     pub min_ts: i64,
     pub max_ts: i64,
     pub row_count: u32,
+    /// Version-2 sparse-index summary. Empty when no column can be summarized.
+    pub summary: Vec<u8>,
 }
 
 pub fn encode_block(schema: &Schema, rows: &[Row]) -> Result<EncodedBlock> {
@@ -34,11 +36,13 @@ pub fn encode_block(schema: &Schema, rows: &[Row]) -> Result<EncodedBlock> {
     for (index, field) in schema.fields.iter().enumerate() {
         encode_column(&mut bytes, field.ty, rows, index)?;
     }
+    let summary = crate::summary::summarize(schema, rows);
     Ok(EncodedBlock {
         bytes,
         min_ts,
         max_ts,
         row_count: rows.len() as u32,
+        summary,
     })
 }
 
@@ -119,13 +123,12 @@ pub(crate) fn decode_rows_in_range_filtered(
                 return finish_empty(schema, bytes, &mut cursor, index);
             }
             if let Some(predicate) = predicate {
-                if matches!(field.ty, FieldType::String | FieldType::Text | FieldType::Json) {
-                    let spans = read_text_spans(
-                        bytes,
-                        &mut cursor,
-                        nrows,
-                        field.ty == FieldType::Json,
-                    )?;
+                if matches!(
+                    field.ty,
+                    FieldType::String | FieldType::Text | FieldType::Json
+                ) {
+                    let spans =
+                        read_text_spans(bytes, &mut cursor, nrows, field.ty == FieldType::Json)?;
                     mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
                     if !mask.iter().any(|keep| *keep) {
                         return finish_empty(schema, bytes, &mut cursor, index + 1);
@@ -197,7 +200,11 @@ pub(crate) fn decode_rows_in_range_filtered(
     }
     for (index, json, spans) in deferred {
         columns[index] = Some(materialize_text_spans(
-            bytes, &spans, &mask, &mut budget, json,
+            bytes,
+            &spans,
+            &mask,
+            &mut budget,
+            json,
         )?);
     }
 
@@ -1954,16 +1961,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let click = parse_event(
-            &schema,
-            br#"{"ts":1000,"action":"click","props":{"a":1}}"#,
-        )
-        .unwrap();
-        let view = parse_event(
-            &schema,
-            br#"{"ts":2000,"action":"view","props":{"b":2}}"#,
-        )
-        .unwrap();
+        let click =
+            parse_event(&schema, br#"{"ts":1000,"action":"click","props":{"a":1}}"#).unwrap();
+        let view = parse_event(&schema, br#"{"ts":2000,"action":"view","props":{"b":2}}"#).unwrap();
         let view_json = match &view.values[2] {
             Scalar::Json(text) => text.clone(),
             other => panic!("expected json, got {other:?}"),
@@ -2191,9 +2191,16 @@ mod tests {
             index: 0,
             allowed: vec![Scalar::Timestamp(999)],
         };
-        let filtered = decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[filter])
-            .unwrap_err()
-            .to_string();
+        let filtered = decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[filter],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(filtered.contains("timestamp column is null or the wrong type"));
     }
 
@@ -2206,9 +2213,16 @@ mod tests {
             index: 0,
             allowed: vec![Scalar::Str("click".into())],
         };
-        let filtered = decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[filter])
-            .unwrap_err()
-            .to_string();
+        let filtered = decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[filter],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(filtered.contains("timestamp column is null or the wrong type"));
     }
 
@@ -2260,30 +2274,18 @@ mod tests {
             index: 2,
             allowed: vec![Scalar::Str("click".into())],
         };
-        let rows = decode_rows_in_range_filtered(
-            &schema,
-            &bytes,
-            i64::MIN,
-            i64::MAX,
-            usize::MAX,
-            &[hit],
-        )
-        .unwrap();
+        let rows =
+            decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[hit])
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].values[1], Scalar::Null));
         let miss = ColumnPredicate {
             index: 2,
             allowed: vec![Scalar::Str("missing".into())],
         };
-        let rows = decode_rows_in_range_filtered(
-            &schema,
-            &bytes,
-            i64::MIN,
-            i64::MAX,
-            usize::MAX,
-            &[miss],
-        )
-        .unwrap();
+        let rows =
+            decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[miss])
+                .unwrap();
         assert!(rows.is_empty());
     }
 
@@ -2311,7 +2313,7 @@ mod tests {
             })
             .collect();
         let encoded = encode_block(&schema, &rows).unwrap();
-        let predicates = | | {
+        let predicates = || {
             vec![
                 ColumnPredicate {
                     index: 1,
