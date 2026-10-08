@@ -119,13 +119,12 @@ pub(crate) fn decode_rows_in_range_filtered(
                 return finish_empty(schema, bytes, &mut cursor, index);
             }
             if let Some(predicate) = predicate {
-                if matches!(field.ty, FieldType::String | FieldType::Text | FieldType::Json) {
-                    let spans = read_text_spans(
-                        bytes,
-                        &mut cursor,
-                        nrows,
-                        field.ty == FieldType::Json,
-                    )?;
+                if matches!(
+                    field.ty,
+                    FieldType::String | FieldType::Text | FieldType::Json
+                ) {
+                    let spans =
+                        read_text_spans(bytes, &mut cursor, nrows, field.ty == FieldType::Json)?;
                     mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
                     if !mask.iter().any(|keep| *keep) {
                         return finish_empty(schema, bytes, &mut cursor, index + 1);
@@ -197,7 +196,11 @@ pub(crate) fn decode_rows_in_range_filtered(
     }
     for (index, json, spans) in deferred {
         columns[index] = Some(materialize_text_spans(
-            bytes, &spans, &mask, &mut budget, json,
+            bytes,
+            &spans,
+            &mask,
+            &mut budget,
+            json,
         )?);
     }
 
@@ -536,7 +539,57 @@ pub fn uncompressed_column_sizes(schema: &Schema, rows: &[Row]) -> Result<Vec<(S
     Ok(sizes)
 }
 
+/// Uncompressed float column size before dictionary encoding, then the size actually
+/// stored. Both include the null bitmap. Kinds 0 and 1 are unchanged, so the two
+/// lengths match for an empty or constant column.
+pub fn float_column_uncompressed_sizes(
+    schema: &Schema,
+    rows: &[Row],
+    index: usize,
+) -> Result<(usize, usize)> {
+    if schema.fields.get(index).map(|field| field.ty) != Some(FieldType::Float) {
+        return Err(Error::event("column is not a float"));
+    }
+    let mut nulls = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.values.len() != schema.fields.len() {
+            return Err(Error::event("row width does not match schema"));
+        }
+        nulls.push(matches!(row.values[index], Scalar::Null));
+    }
+    let values = floats(rows, index)?;
+    let mut raw = Vec::new();
+    write_nulls(&mut raw, &nulls);
+    raw.extend_from_slice(&encode_f64s_plain(&values));
+    let mut chosen = Vec::new();
+    encode_column(&mut chosen, FieldType::Float, rows, index)?;
+    Ok((raw.len(), chosen.len()))
+}
+
+/// Float dictionary. Kinds 0 (empty), 1 (constant), and 2 (raw little-endian) stay
+/// as they are so older blocks still decode.
+const FLOAT_KIND_DICT: u8 = 3;
+
 fn encode_f64s(values: &[Option<f64>]) -> Vec<u8> {
+    let plain = encode_f64s_plain(values);
+    if plain.first().copied() != Some(2) {
+        return plain;
+    }
+    let present: Vec<f64> = values.iter().copied().flatten().collect();
+    if !float_dict_might_compress(&present) {
+        return plain;
+    }
+    let dict = encode_dict_f64s(&present);
+    if dict.len() < plain.len() {
+        dict
+    } else {
+        plain
+    }
+}
+
+/// Kinds 0, 1, and 2 only. This is the size a float column had before dictionary
+/// encoding, including a constant or empty column when those kinds still apply.
+fn encode_f64s_plain(values: &[Option<f64>]) -> Vec<u8> {
     let present: Vec<f64> = values.iter().copied().flatten().collect();
     if present.is_empty() {
         return vec![0];
@@ -547,10 +600,88 @@ fn encode_f64s(values: &[Option<f64>]) -> Vec<u8> {
         out.extend_from_slice(&present[0].to_le_bytes());
         return out;
     }
+    encode_raw_f64s(&present)
+}
+
+fn encode_raw_f64s(present: &[f64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + present.len() * 8);
     out.push(2);
     for value in present {
         out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+fn float_code_width(dict_len: usize) -> usize {
+    if dict_len <= 256 {
+        1
+    } else if dict_len <= 65_536 {
+        2
+    } else {
+        4
+    }
+}
+
+fn varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value > 0x7f {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+fn float_raw_body_len(count: usize) -> usize {
+    1 + count * 8
+}
+
+fn float_dict_body_len(dict_len: usize, count: usize) -> usize {
+    1 + varint_len(dict_len as u64) + dict_len * 8 + 1 + count * float_code_width(dict_len)
+}
+
+/// Same idea as `string_dict_might_compress`: unique values only add a code table,
+/// so stop before building a dictionary that cannot beat raw little-endian `f64`.
+fn float_dict_might_compress(present: &[f64]) -> bool {
+    let count = present.len();
+    if count < 2 {
+        return false;
+    }
+    let raw = float_raw_body_len(count);
+    let mut seen = HashSet::new();
+    for value in present {
+        seen.insert(value.to_bits());
+        if float_dict_body_len(seen.len(), count) >= raw {
+            return false;
+        }
+    }
+    true
+}
+
+fn encode_dict_f64s(present: &[f64]) -> Vec<u8> {
+    let mut lookup: HashMap<u64, u32> = HashMap::new();
+    let mut dict: Vec<f64> = Vec::new();
+    let mut codes = Vec::with_capacity(present.len());
+    for value in present {
+        let bits = value.to_bits();
+        let code = if let Some(code) = lookup.get(&bits) {
+            *code
+        } else {
+            let code = dict.len() as u32;
+            dict.push(*value);
+            lookup.insert(bits, code);
+            code
+        };
+        codes.push(code);
+    }
+    let width = float_code_width(dict.len());
+    let mut out = vec![FLOAT_KIND_DICT];
+    write_varint(&mut out, dict.len() as u64);
+    for value in &dict {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.push(width as u8);
+    for code in codes {
+        write_uint(&mut out, u128::from(code), width);
     }
     out
 }
@@ -1139,8 +1270,24 @@ fn skip_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
             let _ = read_exact(bytes, cursor, count.saturating_mul(8))?;
             Ok(())
         }
+        FLOAT_KIND_DICT => skip_f64_dict(bytes, cursor, count),
         _ => Err(Error::corrupt(format!("unknown float encoding {kind}"))),
     }
+}
+
+fn skip_f64_dict(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
+    let dict_len = read_f64_dict(bytes, cursor)?.len();
+    let width = read_u8(bytes, cursor)? as usize;
+    if !matches!(width, 1 | 2 | 4) {
+        return Err(Error::corrupt("float dictionary code width is invalid"));
+    }
+    for _ in 0..count {
+        let code = read_uint(bytes, cursor, width)?;
+        if code >= dict_len as u128 {
+            return Err(Error::corrupt("float dictionary code is out of range"));
+        }
+    }
+    Ok(())
 }
 
 fn skip_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
@@ -1341,8 +1488,39 @@ fn decode_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<f64
             }
             Ok(out)
         }
+        FLOAT_KIND_DICT => decode_f64_dict(bytes, cursor, count),
         _ => Err(Error::corrupt(format!("unknown float encoding {kind}"))),
     }
+}
+
+fn read_f64_dict(bytes: &[u8], cursor: &mut usize) -> Result<Vec<f64>> {
+    let dict_len = read_varint(bytes, cursor)? as usize;
+    if dict_len == 0 {
+        return Err(Error::corrupt("float dictionary is empty"));
+    }
+    let mut dict = Vec::with_capacity(dict_len);
+    for _ in 0..dict_len {
+        dict.push(read_f64(bytes, cursor)?);
+    }
+    Ok(dict)
+}
+
+fn decode_f64_dict(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<f64>> {
+    let dict = read_f64_dict(bytes, cursor)?;
+    let width = read_u8(bytes, cursor)? as usize;
+    if !matches!(width, 1 | 2 | 4) {
+        return Err(Error::corrupt("float dictionary code width is invalid"));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let code = read_uint(bytes, cursor, width)? as usize;
+        let value = dict
+            .get(code)
+            .copied()
+            .ok_or_else(|| Error::corrupt("float dictionary code is out of range"))?;
+        out.push(value);
+    }
+    Ok(out)
 }
 
 fn decode_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<bool>> {
@@ -1995,6 +2173,175 @@ mod tests {
         assert_eq!(encoded[0], 1, "expected dictionary encoding kind 1");
     }
 
+    fn assert_f64_roundtrip(values: &[Option<f64>]) {
+        let encoded = encode_f64s(values);
+        let present: Vec<f64> = values.iter().copied().flatten().collect();
+        let mut cursor = 0;
+        let decoded = decode_f64s(&encoded, &mut cursor, present.len()).unwrap();
+        assert_eq!(cursor, encoded.len());
+        assert_eq!(decoded.len(), present.len());
+        for (left, right) in present.iter().zip(decoded.iter()) {
+            assert_eq!(left.to_bits(), right.to_bits());
+        }
+        let mut skip = 0;
+        skip_f64s(&encoded, &mut skip, present.len()).unwrap();
+        assert_eq!(skip, encoded.len());
+    }
+
+    #[test]
+    fn float_dictionary_encodes_a_repeated_score_column() {
+        let values: Vec<Option<f64>> = (0..2048).map(|i| Some((i % 100) as f64 / 10.0)).collect();
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], FLOAT_KIND_DICT);
+        let present: Vec<f64> = values.iter().copied().flatten().collect();
+        let raw = encode_raw_f64s(&present);
+        assert!(encoded.len() < raw.len());
+        assert_f64_roundtrip(&values);
+
+        let mut with_nulls = values.clone();
+        with_nulls[3] = None;
+        with_nulls[100] = None;
+        let encoded = encode_f64s(&with_nulls);
+        assert_eq!(encoded[0], FLOAT_KIND_DICT);
+        assert_f64_roundtrip(&with_nulls);
+    }
+
+    #[test]
+    fn all_unique_floats_stay_on_the_raw_kind() {
+        let values: Vec<Option<f64>> = (0..300).map(|i| Some(i as f64 + 0.1)).collect();
+        assert!(!float_dict_might_compress(
+            &values.iter().copied().flatten().collect::<Vec<_>>()
+        ));
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], 2);
+        assert_f64_roundtrip(&values);
+    }
+
+    #[test]
+    fn constant_and_empty_floats_keep_kinds_0_and_1() {
+        assert_eq!(encode_f64s(&[None, None, None]), vec![0]);
+        let values = vec![Some(-2.5); 16];
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], 1);
+        assert_eq!(encoded.len(), 9);
+        assert_f64_roundtrip(&values);
+
+        let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+        let constant_nan = vec![Some(nan); 4];
+        let encoded = encode_f64s(&constant_nan);
+        assert_eq!(encoded[0], 1);
+        assert_f64_roundtrip(&constant_nan);
+    }
+
+    #[test]
+    fn float_dictionary_distinguishes_nan_payloads_and_negative_zero() {
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0x7ff8_0000_0000_0002);
+        let values = vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(nan_a),
+            Some(nan_b),
+            Some(0.0),
+            Some(-0.0),
+            Some(nan_a),
+            Some(nan_b),
+        ];
+        assert_ne!(0.0f64.to_bits(), (-0.0f64).to_bits());
+        assert_ne!(nan_a.to_bits(), nan_b.to_bits());
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], FLOAT_KIND_DICT);
+        assert_f64_roundtrip(&values);
+    }
+
+    #[test]
+    fn legacy_raw_float_kind_still_decodes() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "score", "type": "float"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let scores = [1.5f64, -0.0, f64::from_bits(0x7ff8_0000_0000_0001)];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(1);
+        bytes.extend_from_slice(&1_000i64.to_le_bytes());
+        bytes.push(0);
+        bytes.push(2);
+        for score in scores {
+            bytes.extend_from_slice(&score.to_le_bytes());
+        }
+        let decoded = decode_block(&schema, &bytes).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (row, score) in decoded.iter().zip(scores) {
+            match row.values[1] {
+                Scalar::Float(value) => assert_eq!(value.to_bits(), score.to_bits()),
+                _ => panic!("expected float"),
+            }
+        }
+        let ranged = decode_rows_in_range(&schema, &bytes, 1_000, 1_000, usize::MAX).unwrap();
+        assert_eq!(ranged.len(), 3);
+    }
+
+    #[test]
+    fn float_dictionary_roundtrips_through_a_block_and_a_skipped_column() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "score", "type": "float"},
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for i in 0..200i64 {
+            let obj = serde_json::json!({
+                "score": (i % 100) as f64 / 10.0,
+                "ts": 5_000 + i,
+                "action": if i % 2 == 0 { "click" } else { "view" },
+            });
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let block = encode_block(&schema, &rows).unwrap();
+        let decoded = decode_block(&schema, &block.bytes).unwrap();
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            match (&left.values[0], &right.values[0]) {
+                (Scalar::Float(expected), Scalar::Float(actual)) => {
+                    assert_eq!(expected.to_bits(), actual.to_bits());
+                }
+                _ => panic!("expected float"),
+            }
+            assert_eq!(left.values[1], right.values[1]);
+            assert_eq!(left.values[2], right.values[2]);
+        }
+        let filter = ColumnPredicate {
+            index: 2,
+            allowed: vec![Scalar::Str("click".into())],
+        };
+        let filtered = decode_rows_in_range_filtered(
+            &schema,
+            &block.bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[filter],
+        )
+        .unwrap();
+        assert_eq!(filtered.len(), 100);
+        assert!(filtered
+            .iter()
+            .all(|row| matches!(&row.values[2], Scalar::Str(action) if action == "click")));
+    }
+
     #[test]
     fn string_fingerprint_does_not_overflow_on_large_strings() {
         let a = "x".repeat(5000);
@@ -2224,7 +2571,10 @@ mod tests {
             let mut cursor = 0;
             let decoded = decode_i64s(&encoded, &mut cursor, values.len()).unwrap();
             assert_eq!(cursor, encoded.len());
-            assert_eq!(decoded, values.iter().copied().flatten().collect::<Vec<_>>());
+            assert_eq!(
+                decoded,
+                values.iter().copied().flatten().collect::<Vec<_>>()
+            );
             let mut skip = 0;
             skip_i64s(&encoded, &mut skip, values.len()).unwrap();
             assert_eq!(skip, encoded.len());
@@ -2570,16 +2920,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let click = parse_event(
-            &schema,
-            br#"{"ts":1000,"action":"click","props":{"a":1}}"#,
-        )
-        .unwrap();
-        let view = parse_event(
-            &schema,
-            br#"{"ts":2000,"action":"view","props":{"b":2}}"#,
-        )
-        .unwrap();
+        let click =
+            parse_event(&schema, br#"{"ts":1000,"action":"click","props":{"a":1}}"#).unwrap();
+        let view = parse_event(&schema, br#"{"ts":2000,"action":"view","props":{"b":2}}"#).unwrap();
         let view_json = match &view.values[2] {
             Scalar::Json(text) => text.clone(),
             other => panic!("expected json, got {other:?}"),
@@ -2807,9 +3150,16 @@ mod tests {
             index: 0,
             allowed: vec![Scalar::Timestamp(999)],
         };
-        let filtered = decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[filter])
-            .unwrap_err()
-            .to_string();
+        let filtered = decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[filter],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(filtered.contains("timestamp column is null or the wrong type"));
     }
 
@@ -2822,9 +3172,16 @@ mod tests {
             index: 0,
             allowed: vec![Scalar::Str("click".into())],
         };
-        let filtered = decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[filter])
-            .unwrap_err()
-            .to_string();
+        let filtered = decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[filter],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(filtered.contains("timestamp column is null or the wrong type"));
     }
 
@@ -2876,30 +3233,18 @@ mod tests {
             index: 2,
             allowed: vec![Scalar::Str("click".into())],
         };
-        let rows = decode_rows_in_range_filtered(
-            &schema,
-            &bytes,
-            i64::MIN,
-            i64::MAX,
-            usize::MAX,
-            &[hit],
-        )
-        .unwrap();
+        let rows =
+            decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[hit])
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].values[1], Scalar::Null));
         let miss = ColumnPredicate {
             index: 2,
             allowed: vec![Scalar::Str("missing".into())],
         };
-        let rows = decode_rows_in_range_filtered(
-            &schema,
-            &bytes,
-            i64::MIN,
-            i64::MAX,
-            usize::MAX,
-            &[miss],
-        )
-        .unwrap();
+        let rows =
+            decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[miss])
+                .unwrap();
         assert!(rows.is_empty());
     }
 
@@ -2927,7 +3272,7 @@ mod tests {
             })
             .collect();
         let encoded = encode_block(&schema, &rows).unwrap();
-        let predicates = | | {
+        let predicates = || {
             vec![
                 ColumnPredicate {
                     index: 1,

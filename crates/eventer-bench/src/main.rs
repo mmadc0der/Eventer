@@ -130,6 +130,16 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    match eventer::float_column_uncompressed_bytes(&schema, &events[..sample_end], "score") {
+        Ok((raw, chosen)) => {
+            println!("uncompressed_column_bytes score_raw: {raw}");
+            println!("uncompressed_column_bytes score: {chosen}");
+        }
+        Err(err) => {
+            eprintln!("score column size measurement failed: {err}");
+            return ExitCode::from(1);
+        }
+    }
     let _ = store.close();
     ExitCode::SUCCESS
 }

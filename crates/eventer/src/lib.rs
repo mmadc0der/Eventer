@@ -32,3 +32,22 @@ pub fn uncompressed_column_sizes(
     }
     codec::uncompressed_column_sizes(schema, &rows)
 }
+
+/// Uncompressed size of one float column before dictionary encoding, then the size
+/// that is stored. Both include the null bitmap.
+pub fn float_column_uncompressed_bytes(
+    schema: &Schema,
+    json_events: &[impl AsRef<[u8]>],
+    field: &str,
+) -> Result<(usize, usize)> {
+    let index = schema
+        .fields
+        .iter()
+        .position(|candidate| candidate.name == field)
+        .ok_or_else(|| Error::event("float column is missing"))?;
+    let mut rows = Vec::with_capacity(json_events.len());
+    for event in json_events {
+        rows.push(value::parse_event(schema, event.as_ref())?);
+    }
+    codec::float_column_uncompressed_sizes(schema, &rows, index)
+}
