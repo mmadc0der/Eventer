@@ -1077,7 +1077,7 @@ fn decode_strings(
                     charge_string_bytes(budget, text.len())?;
                     out.push(text);
                 } else {
-                    skip_lp_string(bytes, cursor)?;
+                    skip_lp_string_value(bytes, cursor, validate_json)?;
                     out.push(String::new());
                 }
             }
@@ -1102,28 +1102,26 @@ fn decode_strings(
             }
             let mut codes = Vec::with_capacity(count);
             for _ in 0..count {
-                codes.push(read_uint(bytes, cursor, width)? as usize);
+                let code = read_uint(bytes, cursor, width)? as usize;
+                if code >= dict.len() {
+                    return Err(Error::corrupt("string dictionary code is out of range"));
+                }
+                codes.push(code);
             }
             let mut expanded = 0usize;
             for (code, flag) in codes.iter().zip(keep.iter()) {
                 if !*flag {
                     continue;
                 }
-                let text = dict
-                    .get(*code)
-                    .ok_or_else(|| Error::corrupt("string dictionary code is out of range"))?;
                 expanded = expanded
-                    .checked_add(text.len())
+                    .checked_add(dict[*code].len())
                     .ok_or_else(|| Error::event("query response size limit exceeded"))?;
             }
             charge_string_bytes(budget, expanded)?;
             let mut out = Vec::with_capacity(count);
             for (code, flag) in codes.iter().zip(keep.iter()) {
                 if *flag {
-                    let text = dict
-                        .get(*code)
-                        .ok_or_else(|| Error::corrupt("string dictionary code is out of range"))?;
-                    out.push(text.clone());
+                    out.push(dict[*code].clone());
                 } else {
                     out.push(String::new());
                 }
@@ -1154,10 +1152,6 @@ fn validate_json_column_text(text: &str) -> Result<()> {
 fn read_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
     let slice = read_lp_bytes(bytes, cursor)?;
     String::from_utf8(slice.to_vec()).map_err(|_| Error::corrupt("string is not utf-8"))
-}
-
-fn skip_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<()> {
-    skip_lp_string_value(bytes, cursor, false)
 }
 
 fn skip_lp_string_value(bytes: &[u8], cursor: &mut usize, validate_json: bool) -> Result<()> {
@@ -1905,6 +1899,110 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("utf-8"));
+    }
+
+    #[test]
+    fn filtered_decode_rejects_dictionary_code_on_a_dropped_row() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "string"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let rows = [
+            br#"{"ts":1000,"action":"click","note":"alpha"}"#.as_slice(),
+            br#"{"ts":2000,"action":"click","note":"alpha"}"#,
+            br#"{"ts":3000,"action":"view","note":"beta"}"#,
+            br#"{"ts":4000,"action":"view","note":"beta"}"#,
+        ];
+        let parsed: Vec<_> = rows
+            .iter()
+            .map(|raw| parse_event(&schema, raw).unwrap())
+            .collect();
+        let encoded = encode_block(&schema, &parsed).unwrap();
+        let mut bytes = encoded.bytes;
+        let last = bytes.len() - 1;
+        bytes[last] = 0xff;
+        assert!(decode_block(&schema, &bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("string dictionary code is out of range"));
+        let filter = ColumnPredicate {
+            index: 1,
+            allowed: vec![Scalar::Str("click".into())],
+        };
+        assert!(decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[filter]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("string dictionary code is out of range"));
+    }
+
+    #[test]
+    fn filtered_decode_rejects_invalid_json_on_a_dropped_row() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let click = parse_event(
+            &schema,
+            br#"{"ts":1000,"action":"click","props":{"a":1}}"#,
+        )
+        .unwrap();
+        let view = parse_event(
+            &schema,
+            br#"{"ts":2000,"action":"view","props":{"b":2}}"#,
+        )
+        .unwrap();
+        let view_json = match &view.values[2] {
+            Scalar::Json(text) => text.clone(),
+            other => panic!("expected json, got {other:?}"),
+        };
+        let encoded = encode_block(&schema, &[click, view]).unwrap();
+        let mut bytes = encoded.bytes;
+        let needle = view_json.as_bytes();
+        let pos = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("view json");
+        bytes[pos + 1] = b'x';
+        assert!(decode_block(&schema, &bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("json column value is not valid JSON"));
+        let filter = ColumnPredicate {
+            index: 1,
+            allowed: vec![Scalar::Str("click".into())],
+        };
+        assert!(decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[filter]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("json column value is not valid JSON"));
     }
 
     #[test]
