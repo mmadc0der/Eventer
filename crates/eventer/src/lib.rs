@@ -9,6 +9,7 @@
 mod c_api;
 mod codec;
 mod error;
+mod json_scan;
 mod pipeline;
 mod schema;
 mod segment;

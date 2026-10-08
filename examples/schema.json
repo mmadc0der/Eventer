@@ -7,6 +7,7 @@
     {"name": "ok", "type": "bool"},
     {"name": "action", "type": "string"},
     {"name": "note", "type": "text"},
-    {"name": "amount", "type": "decimal", "scale": 2}
+    {"name": "amount", "type": "decimal", "scale": 2},
+    {"name": "props", "type": "json"}
   ]
 }

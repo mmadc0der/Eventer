@@ -10,6 +10,8 @@ use axum::body::Bytes;
 use axum::extract::{Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::body::Body;
+use axum::http::header::CONTENT_TYPE;
 use axum::routing::get;
 use axum::{Json, Router};
 use eventer::Predicate;
@@ -87,10 +89,17 @@ async fn get_events(
         }
     }
     let store = Arc::clone(&state.store);
-    let joined =
-        tokio::task::spawn_blocking(move || store.query_with_filter(from, to, &predicates)).await;
+    let joined = tokio::task::spawn_blocking(move || {
+        store.query_json_with_filter(from, to, &predicates)
+    })
+    .await;
     match joined {
-        Ok(Ok(rows)) => Json(rows).into_response(),
+        Ok(Ok(bytes)) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/json")],
+            Body::from(bytes),
+        )
+            .into_response(),
         Ok(Err(err)) => error_response(&err),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,

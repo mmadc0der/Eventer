@@ -15,7 +15,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *json = "{\"ts\":1700000000000,\"user_id\":7,\"score\":1.5,\"ok\":true,"
-                       "\"action\":\"click\",\"note\":\"demo\",\"amount\":\"19.99\"}";
+                       "\"action\":\"click\",\"note\":\"demo\",\"amount\":\"19.99\","
+                       "\"props\":{\"plan\":\"pro\",\"flags\":[\"a\",1]}}";
     if (eventer_append(store, (const uint8_t *)json, strlen(json)) != 0) {
         fprintf(stderr, "append failed: %s\n", eventer_last_error(store));
         eventer_close(store);

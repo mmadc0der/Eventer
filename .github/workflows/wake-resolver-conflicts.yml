@@ -1,0 +1,50 @@
+# Same Resolver webhook as wake-resolver.yml.
+# pull_request_target still runs when the PR does not merge. Do not checkout the PR head.
+name: Wake resolver on conflicts
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+jobs:
+  wake:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: POST resolver webhook when the PR conflicts
+        env:
+          KEY: ${{ secrets.CURSOR_RESOLVER_KEY }}
+          URL: ${{ secrets.CURSOR_RESOLVER_WEBHOOK_URL }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          KEY="$(printf '%s' "$KEY" | tr -d '\r\n')"
+          URL="$(printf '%s' "$URL" | tr -d '\r\n')"
+          mergeable="null"
+          for _ in 1 2 3 4 5 6 7 8; do
+            mergeable="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.mergeable')"
+            if [ "$mergeable" != "null" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$mergeable" != "false" ]; then
+            echo "mergeable=${mergeable}; not waking"
+            exit 0
+          fi
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          subject="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}" --jq '.commit.message' | head -n 1)"
+          case "$subject" in
+            Resolve-Conflicts:*)
+              echo "head already attempted conflict resolution; not waking"
+              exit 0
+              ;;
+          esac
+          context="PR ${PR_URL}"$'\n'"This pull request conflicts with its base branch. Merge the base into this branch and resolve the conflicts. One commit, subject exactly: Resolve-Conflicts: ${PR_NUMBER}. Do not submit a review."
+          jq -n --arg context "$context" '{context:$context}' \
+            | curl -sS -f -X POST "$URL" \
+                -H "Authorization: Bearer ${KEY}" \
+                -H "Content-Type: application/json" \
+                --data-binary @-
