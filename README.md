@@ -105,7 +105,7 @@ Return codes: `0` ok, `-1` bad argument, `-2` I/O, `-3` event or schema, `-4` qu
 
 Segments rotate after 64 MiB (`seg-000001.dat` plus `seg-000001.idx`). Each block stores its own min/max timestamp. A crash can leave a torn tail; the next open scans complete blocks, truncates the tear, and rebuilds the index if it disagrees.
 
-Inside a block, integers, timestamps, and decimals are stored as a base plus a narrow unsigned delta. Bools are bit-packed. Repeated strings use a dictionary when that encoding is smaller. JSON columns use that same string encoding on the preserved field text. Nulls are a bitmap.
+Inside a block, integers, timestamps, and decimals use a constant, a constant stride, an exact-width bit packing of the delta from the minimum, or a byte-width frame of reference, whichever is smaller. Kinds already written by older blocks still decode. Bools are bit-packed. Repeated strings use a dictionary when that encoding is smaller. JSON columns use that same string encoding on the preserved field text. Nulls are a bitmap.
 
 ## Benchmark
 
