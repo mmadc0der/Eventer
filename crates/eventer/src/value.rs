@@ -21,6 +21,82 @@ pub enum Scalar {
     Json(String),
 }
 
+impl From<&str> for Scalar {
+    fn from(value: &str) -> Self {
+        Scalar::Str(value.to_string())
+    }
+}
+
+impl From<String> for Scalar {
+    fn from(value: String) -> Self {
+        Scalar::Str(value)
+    }
+}
+
+impl From<i64> for Scalar {
+    fn from(value: i64) -> Self {
+        Scalar::Int(value)
+    }
+}
+
+impl From<bool> for Scalar {
+    fn from(value: bool) -> Self {
+        Scalar::Bool(value)
+    }
+}
+
+impl From<f64> for Scalar {
+    fn from(value: f64) -> Self {
+        Scalar::Float(value)
+    }
+}
+
+/// Parse a filter literal the way a query string would spell the value.
+pub fn scalar_from_literal(ty: FieldType, text: &str) -> Result<Scalar> {
+    match ty {
+        FieldType::String | FieldType::Text => Ok(Scalar::Str(text.to_string())),
+        FieldType::Int => text
+            .parse::<i64>()
+            .map(Scalar::Int)
+            .map_err(|_| Error::event(format!("`{text}` is not an integer"))),
+        FieldType::Timestamp => text
+            .parse::<i64>()
+            .map(Scalar::Timestamp)
+            .map_err(|_| Error::event(format!("`{text}` is not a unix millisecond timestamp"))),
+        FieldType::Float => {
+            let number = text
+                .parse::<f64>()
+                .map_err(|_| Error::event(format!("`{text}` is not a number")))?;
+            if !number.is_finite() {
+                return Err(Error::event(format!("`{text}` is not a finite number")));
+            }
+            Ok(Scalar::Float(number))
+        }
+        FieldType::Bool => match text {
+            "true" => Ok(Scalar::Bool(true)),
+            "false" => Ok(Scalar::Bool(false)),
+            _ => Err(Error::event(format!("`{text}` is not true or false"))),
+        },
+        FieldType::Decimal { scale } => Ok(Scalar::Decimal(parse_decimal(text, scale)?)),
+        FieldType::Json => Err(Error::event(
+            "json columns are not supported by equality filters",
+        )),
+    }
+}
+
+pub(crate) fn scalar_matches_field(value: &Scalar, ty: FieldType) -> bool {
+    matches!(
+        (value, ty),
+        (Scalar::Null, _)
+            | (Scalar::Int(_), FieldType::Int)
+            | (Scalar::Float(_), FieldType::Float)
+            | (Scalar::Bool(_), FieldType::Bool)
+            | (Scalar::Str(_), FieldType::String | FieldType::Text)
+            | (Scalar::Decimal(_), FieldType::Decimal { .. })
+            | (Scalar::Timestamp(_), FieldType::Timestamp)
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct Row {
     pub values: Vec<Scalar>,

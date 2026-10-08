@@ -64,10 +64,14 @@ curl -sS -X POST http://127.0.0.1:43123/events \
   --data '{"ts":1700000000000,"user_id":7,"score":1.5,"ok":true,"action":"click","note":"demo","amount":"19.99","props":{"plan":"pro","flags":["a",1]}}'
 ```
 
-`GET /events?from=&to=` returns a JSON array. `from` and `to` are inclusive unix milliseconds.
+`GET /events?from=&to=` returns a JSON array. `from` and `to` are inclusive unix milliseconds. Repeat `eq=field=value` to keep rows where that column equals the value. Filters are AND-ed and applied while each block is decoded.
 
 ```bash
 curl -sS 'http://127.0.0.1:43123/events?from=1700000000000&to=1700000000000'
+curl -sS --get 'http://127.0.0.1:43123/events' \
+  --data-urlencode 'from=1700000000000' \
+  --data-urlencode 'to=1700000000000' \
+  --data-urlencode 'eq=action=click'
 ```
 
 `GET /health` returns `{"status":"ok"}`. The server listens on localhost and has no authentication. Point it at a directory used by only one process.
@@ -86,6 +90,7 @@ LD_LIBRARY_PATH=target/release ./demo ./data examples/schema.json
 | `eventer_append` | Copy one JSON event into the pipeline |
 | `eventer_flush` | Write and fsync queued events |
 | `eventer_query` | Inclusive time range as a JSON array |
+| `eventer_query_filtered` | Time range plus one exact string or text column match |
 | `eventer_last_error` | Last error string for this handle |
 | `eventer_close` | Flush and free the handle |
 
@@ -125,3 +130,5 @@ Stored size was identical across the runs (394,005 data bytes, 49 blocks, one se
 ## Rust API
 
 `Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced; the HTTP `POST` uses it. `Store::query(from_ms, to_ms)` returns matching [`Row`] values in ingest order; use [`RowSerializable`] or [`row_to_json_bytes`] when you need the original JSON lexemes (including duplicate keys). `Store::query_json` returns the same data as one JSON array for HTTP.
+
+`Store::query_with_filter` adds equality predicates. Several predicates are AND-ed. `Predicate::Eq("type".into(), "assistant".into())` keeps one value. `Predicate::In` keeps any listed value. `Scalar::Null` matches null. A block whose filter column is a constant or dictionary that does not contain the value is not fully decoded, so later text columns stay unread. The C equivalent is `eventer_query_filtered` for one string or text column.

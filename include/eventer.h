@@ -24,6 +24,13 @@ int32_t eventer_flush(EventerStore *store);
 int32_t eventer_query(EventerStore *store, int64_t from_ms, int64_t to_ms,
                       uint8_t *out, size_t out_cap, size_t *out_len);
 
+/* Same as eventer_query, keeping rows whose string or text column equals filter_val.
+   filter_col and filter_val are NUL-terminated. Example: column "type", value
+   "dev.genesis.run.assistant". */
+int32_t eventer_query_filtered(EventerStore *store, int64_t from_ms, int64_t to_ms,
+                               const char *filter_col, const char *filter_val,
+                               uint8_t *out, size_t out_cap, size_t *out_len);
+
 const char *eventer_last_error(EventerStore *store);
 
 void eventer_close(EventerStore *store);
