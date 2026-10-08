@@ -41,7 +41,8 @@ pub fn encode_block(schema: &Schema, rows: &[Row]) -> Result<EncodedBlock> {
     })
 }
 
-pub fn decode_block(schema: &Schema, bytes: &[u8]) -> Result<Vec<Row>> {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_block(schema: &Schema, bytes: &[u8]) -> Result<Vec<Row>> {
     if bytes.len() < 4 {
         return Err(Error::corrupt("block is shorter than its row count"));
     }
@@ -54,7 +55,7 @@ pub fn decode_block(schema: &Schema, bytes: &[u8]) -> Result<Vec<Row>> {
     let mut cursor = 4;
     let mut columns = Vec::with_capacity(schema.fields.len());
     for field in &schema.fields {
-        columns.push(decode_column(field.ty, bytes, &mut cursor, nrows)?);
+        columns.push(decode_column(field.ty, bytes, &mut cursor, nrows, None)?);
     }
     if cursor != bytes.len() {
         return Err(Error::corrupt("block has trailing bytes"));
@@ -63,6 +64,143 @@ pub fn decode_block(schema: &Schema, bytes: &[u8]) -> Result<Vec<Row>> {
     for row_idx in 0..nrows {
         let mut values = Vec::with_capacity(columns.len());
         for column in &columns {
+            values.push(column[row_idx].clone());
+        }
+        let ts = match &values[schema.timestamp_index] {
+            Scalar::Timestamp(ts) => *ts,
+            _ => return Err(Error::corrupt("timestamp column is null or the wrong type")),
+        };
+        rows.push(Row { values, ts });
+    }
+    Ok(rows)
+}
+
+/// One column equality set. Several predicates on the same column are already intersected.
+#[derive(Debug, Clone)]
+pub(crate) struct ColumnPredicate {
+    pub index: usize,
+    pub allowed: Vec<Scalar>,
+}
+
+/// Decode rows whose timestamp is inside `from_ms..=to_ms` and that match every predicate.
+///
+/// Filter columns are read first. A constant or dictionary that cannot contain the
+/// requested value returns no rows without decoding later columns. Other columns are
+/// skipped until the match mask is known, then only matching rows are materialized.
+pub(crate) fn decode_rows_in_range(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+) -> Result<Vec<Row>> {
+    if from_ms > to_ms || predicates.iter().any(|pred| pred.allowed.is_empty()) {
+        return Ok(Vec::new());
+    }
+    if bytes.len() < 4 {
+        return Err(Error::corrupt("block is shorter than its row count"));
+    }
+    let nrows = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    if nrows == 0 || nrows > 1_000_000 {
+        return Err(Error::corrupt(format!(
+            "block row count {nrows} is invalid"
+        )));
+    }
+    let mut cursor = 4;
+    let mut mask = vec![true; nrows];
+    let mut columns: Vec<Option<Vec<Scalar>>> = (0..schema.fields.len()).map(|_| None).collect();
+    let mut skipped: Vec<(usize, usize, usize)> = Vec::new();
+
+    for (index, field) in schema.fields.iter().enumerate() {
+        let predicate = predicates.iter().find(|pred| pred.index == index);
+        let is_timestamp = index == schema.timestamp_index;
+        let is_filter = is_timestamp || predicate.is_some();
+        let filters_remain = (index + 1..schema.fields.len()).any(|later| {
+            later == schema.timestamp_index || predicates.iter().any(|pred| pred.index == later)
+        });
+
+        if is_filter {
+            if is_timestamp && timestamp_range_misses(bytes, cursor, nrows, from_ms, to_ms)? {
+                return Ok(Vec::new());
+            }
+            if let Some(predicate) = predicate {
+                if column_misses(field.ty, bytes, cursor, nrows, &predicate.allowed)? {
+                    return Ok(Vec::new());
+                }
+            }
+            let values = decode_column(field.ty, bytes, &mut cursor, nrows, Some(&mask))?;
+            if is_timestamp {
+                for (row, value) in values.iter().enumerate() {
+                    if !mask[row] {
+                        continue;
+                    }
+                    match value {
+                        Scalar::Timestamp(ts) => {
+                            if *ts < from_ms || *ts > to_ms {
+                                mask[row] = false;
+                            }
+                        }
+                        _ => {
+                            return Err(Error::corrupt(
+                                "timestamp column is null or the wrong type",
+                            ))
+                        }
+                    }
+                }
+            }
+            if let Some(predicate) = predicate {
+                for (row, value) in values.iter().enumerate() {
+                    if mask[row] && !predicate.allowed.iter().any(|allowed| allowed == value) {
+                        mask[row] = false;
+                    }
+                }
+            }
+            columns[index] = Some(values);
+            if !mask.iter().any(|keep| *keep) {
+                return Ok(Vec::new());
+            }
+        } else if filters_remain {
+            let start = cursor;
+            skip_column(field.ty, bytes, &mut cursor, nrows)?;
+            skipped.push((index, start, cursor));
+        } else {
+            columns[index] = Some(decode_column(
+                field.ty,
+                bytes,
+                &mut cursor,
+                nrows,
+                Some(&mask),
+            )?);
+        }
+    }
+    if cursor != bytes.len() {
+        return Err(Error::corrupt("block has trailing bytes"));
+    }
+    for (index, start, end) in skipped {
+        let mut replay = start;
+        let values = decode_column(
+            schema.fields[index].ty,
+            bytes,
+            &mut replay,
+            nrows,
+            Some(&mask),
+        )?;
+        if replay != end {
+            return Err(Error::corrupt("column skip and decode disagree"));
+        }
+        columns[index] = Some(values);
+    }
+
+    let mut rows = Vec::new();
+    for row_idx in 0..nrows {
+        if !mask[row_idx] {
+            continue;
+        }
+        let mut values = Vec::with_capacity(columns.len());
+        for column in &columns {
+            let column = column
+                .as_ref()
+                .ok_or_else(|| Error::corrupt("decoded block is missing a column"))?;
             values.push(column[row_idx].clone());
         }
         let ts = match &values[schema.timestamp_index] {
@@ -390,13 +528,27 @@ fn decode_column(
     bytes: &[u8],
     cursor: &mut usize,
     nrows: usize,
+    keep: Option<&[bool]>,
 ) -> Result<Vec<Scalar>> {
     let present = read_present(bytes, cursor, nrows)?;
     let present_count = match &present {
         None => nrows,
         Some(flags) => flags.iter().filter(|flag| **flag).count(),
     };
-    let values: Vec<Scalar> = match ty {
+    let materialize = keep.map(|keep| {
+        let mut flags = Vec::with_capacity(present_count);
+        for row in 0..nrows {
+            let is_present = match &present {
+                None => true,
+                Some(flags) => flags[row],
+            };
+            if is_present {
+                flags.push(keep[row]);
+            }
+        }
+        flags
+    });
+    let mut values: Vec<Scalar> = match ty {
         FieldType::Int | FieldType::Timestamp => {
             let nums = decode_i64s(bytes, cursor, present_count)?;
             let wrap = |value: i64| {
@@ -420,10 +572,12 @@ fn decode_column(
             .into_iter()
             .map(Scalar::Decimal)
             .collect(),
-        FieldType::String | FieldType::Text => decode_strings(bytes, cursor, present_count)?
-            .into_iter()
-            .map(Scalar::Str)
-            .collect(),
+        FieldType::String | FieldType::Text => {
+            decode_strings(bytes, cursor, present_count, materialize.as_deref())?
+                .into_iter()
+                .map(Scalar::Str)
+                .collect()
+        }
     };
     if values.len() != present_count {
         return Err(Error::corrupt(
@@ -438,8 +592,13 @@ fn decode_column(
             Some(flags) => flags[row],
         };
         if is_present {
-            column.push(values[next].clone());
+            let value = std::mem::replace(&mut values[next], Scalar::Null);
             next += 1;
+            if keep.map(|flags| flags[row]).unwrap_or(true) {
+                column.push(value);
+            } else {
+                column.push(Scalar::Null);
+            }
         } else {
             column.push(Scalar::Null);
         }
@@ -567,21 +726,40 @@ fn decode_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<bo
     }
 }
 
-fn decode_strings(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<String>> {
+fn decode_strings(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    materialize: Option<&[bool]>,
+) -> Result<Vec<String>> {
     if count == 0 {
         expect_kind(bytes, cursor, 0)?;
         return Ok(Vec::new());
     }
+    let keep = |index: usize| materialize.map(|flags| flags[index]).unwrap_or(true);
     let kind = read_u8(bytes, cursor)?;
     match kind {
         3 => {
             let text = read_lp_string(bytes, cursor)?;
-            Ok(vec![text; count])
+            let mut out = Vec::with_capacity(count);
+            for index in 0..count {
+                if keep(index) {
+                    out.push(text.clone());
+                } else {
+                    out.push(String::new());
+                }
+            }
+            Ok(out)
         }
         2 => {
             let mut out = Vec::with_capacity(count);
-            for _ in 0..count {
-                out.push(read_lp_string(bytes, cursor)?);
+            for index in 0..count {
+                if keep(index) {
+                    out.push(read_lp_string(bytes, cursor)?);
+                } else {
+                    skip_lp_string(bytes, cursor)?;
+                    out.push(String::new());
+                }
             }
             Ok(out)
         }
@@ -599,12 +777,19 @@ fn decode_strings(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<
                 return Err(Error::corrupt("string dictionary code width is invalid"));
             }
             let mut out = Vec::with_capacity(count);
-            for _ in 0..count {
+            for index in 0..count {
                 let code = read_uint(bytes, cursor, width)? as usize;
-                let text = dict
-                    .get(code)
-                    .ok_or_else(|| Error::corrupt("string dictionary code is out of range"))?;
-                out.push(text.clone());
+                if keep(index) {
+                    let text = dict
+                        .get(code)
+                        .ok_or_else(|| Error::corrupt("string dictionary code is out of range"))?;
+                    out.push(text.clone());
+                } else {
+                    if code >= dict.len() {
+                        return Err(Error::corrupt("string dictionary code is out of range"));
+                    }
+                    out.push(String::new());
+                }
             }
             Ok(out)
         }
@@ -622,6 +807,327 @@ fn read_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
         .ok_or_else(|| Error::corrupt("truncated string"))?;
     *cursor = end;
     String::from_utf8(slice.to_vec()).map_err(|_| Error::corrupt("string is not utf-8"))
+}
+
+fn skip_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<()> {
+    let len = read_varint(bytes, cursor)? as usize;
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| Error::corrupt("string length overflow"))?;
+    if bytes.get(*cursor..end).is_none() {
+        return Err(Error::corrupt("truncated string"));
+    }
+    *cursor = end;
+    Ok(())
+}
+
+fn skip_column(ty: FieldType, bytes: &[u8], cursor: &mut usize, nrows: usize) -> Result<()> {
+    let present = read_present(bytes, cursor, nrows)?;
+    let present_count = match &present {
+        None => nrows,
+        Some(flags) => flags.iter().filter(|flag| **flag).count(),
+    };
+    match ty {
+        FieldType::Int | FieldType::Timestamp => skip_i64s(bytes, cursor, present_count),
+        FieldType::Float => skip_f64s(bytes, cursor, present_count),
+        FieldType::Bool => skip_bools(bytes, cursor, present_count),
+        FieldType::Decimal { .. } => skip_i128s(bytes, cursor, present_count),
+        FieldType::String | FieldType::Text => skip_strings(bytes, cursor, present_count),
+    }
+}
+
+fn skip_i64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
+    if count == 0 {
+        return expect_kind(bytes, cursor, 0);
+    }
+    let kind = read_u8(bytes, cursor)?;
+    if kind == 1 {
+        let _ = read_i64(bytes, cursor)?;
+        return Ok(());
+    }
+    let width = width_for_kind(kind)?;
+    if width > 8 {
+        return Err(Error::corrupt("int column uses a 16-byte delta"));
+    }
+    let _ = read_i64(bytes, cursor)?;
+    let nbytes = count
+        .checked_mul(width)
+        .ok_or_else(|| Error::corrupt("length overflow"))?;
+    let _ = read_exact(bytes, cursor, nbytes)?;
+    Ok(())
+}
+
+fn skip_i128s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
+    if count == 0 {
+        return expect_kind(bytes, cursor, 0);
+    }
+    let kind = read_u8(bytes, cursor)?;
+    if kind == 1 {
+        let _ = read_i128(bytes, cursor)?;
+        return Ok(());
+    }
+    let width = width_for_kind(kind)?;
+    let _ = read_i128(bytes, cursor)?;
+    let nbytes = count
+        .checked_mul(width)
+        .ok_or_else(|| Error::corrupt("length overflow"))?;
+    let _ = read_exact(bytes, cursor, nbytes)?;
+    Ok(())
+}
+
+fn skip_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
+    if count == 0 {
+        return expect_kind(bytes, cursor, 0);
+    }
+    let kind = read_u8(bytes, cursor)?;
+    match kind {
+        1 => {
+            let _ = read_f64(bytes, cursor)?;
+            Ok(())
+        }
+        2 => {
+            let nbytes = count
+                .checked_mul(8)
+                .ok_or_else(|| Error::corrupt("length overflow"))?;
+            let _ = read_exact(bytes, cursor, nbytes)?;
+            Ok(())
+        }
+        _ => Err(Error::corrupt(format!("unknown float encoding {kind}"))),
+    }
+}
+
+fn skip_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
+    if count == 0 {
+        return expect_kind(bytes, cursor, 0);
+    }
+    let kind = read_u8(bytes, cursor)?;
+    match kind {
+        1 => {
+            let _ = read_u8(bytes, cursor)?;
+            Ok(())
+        }
+        2 => {
+            let nbytes = count.div_ceil(8);
+            let _ = read_exact(bytes, cursor, nbytes)?;
+            Ok(())
+        }
+        _ => Err(Error::corrupt(format!("unknown bool encoding {kind}"))),
+    }
+}
+
+fn skip_strings(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
+    if count == 0 {
+        return expect_kind(bytes, cursor, 0);
+    }
+    let kind = read_u8(bytes, cursor)?;
+    match kind {
+        3 => skip_lp_string(bytes, cursor),
+        2 => {
+            for _ in 0..count {
+                skip_lp_string(bytes, cursor)?;
+            }
+            Ok(())
+        }
+        1 => {
+            let dict_len = read_varint(bytes, cursor)? as usize;
+            if dict_len == 0 {
+                return Err(Error::corrupt("string dictionary is empty"));
+            }
+            for _ in 0..dict_len {
+                skip_lp_string(bytes, cursor)?;
+            }
+            let width = read_u8(bytes, cursor)? as usize;
+            if !matches!(width, 1 | 2 | 4) {
+                return Err(Error::corrupt("string dictionary code width is invalid"));
+            }
+            let nbytes = count
+                .checked_mul(width)
+                .ok_or_else(|| Error::corrupt("length overflow"))?;
+            let _ = read_exact(bytes, cursor, nbytes)?;
+            Ok(())
+        }
+        _ => Err(Error::corrupt(format!("unknown string encoding {kind}"))),
+    }
+}
+
+fn present_stats(present: &Option<Vec<bool>>, nrows: usize) -> (usize, bool) {
+    match present {
+        None => (nrows, false),
+        Some(flags) => (
+            flags.iter().filter(|flag| **flag).count(),
+            flags.iter().any(|flag| !flag),
+        ),
+    }
+}
+
+fn column_misses(
+    ty: FieldType,
+    bytes: &[u8],
+    start: usize,
+    nrows: usize,
+    allowed: &[Scalar],
+) -> Result<bool> {
+    if allowed.is_empty() {
+        return Ok(true);
+    }
+    let mut cursor = start;
+    let present = read_present(bytes, &mut cursor, nrows)?;
+    let (present_count, has_null) = present_stats(&present, nrows);
+    let null_ok = allowed.iter().any(|value| matches!(value, Scalar::Null));
+    if present_count == 0 {
+        return Ok(!null_ok);
+    }
+    match ty {
+        FieldType::String | FieldType::Text => {
+            string_column_misses(bytes, &mut cursor, allowed, has_null, null_ok)
+        }
+        FieldType::Int => int_const_misses(bytes, &mut cursor, allowed, has_null, null_ok, false),
+        FieldType::Timestamp => {
+            int_const_misses(bytes, &mut cursor, allowed, has_null, null_ok, true)
+        }
+        FieldType::Float => float_const_misses(bytes, &mut cursor, allowed, has_null, null_ok),
+        FieldType::Bool => bool_const_misses(bytes, &mut cursor, allowed, has_null, null_ok),
+        FieldType::Decimal { .. } => {
+            decimal_const_misses(bytes, &mut cursor, allowed, has_null, null_ok)
+        }
+    }
+}
+
+fn string_column_misses(
+    bytes: &[u8],
+    cursor: &mut usize,
+    allowed: &[Scalar],
+    has_null: bool,
+    null_ok: bool,
+) -> Result<bool> {
+    let kind = read_u8(bytes, cursor)?;
+    let text_hit = |text: &str| {
+        allowed
+            .iter()
+            .any(|value| matches!(value, Scalar::Str(expected) if expected == text))
+    };
+    match kind {
+        3 => {
+            let text = read_lp_string(bytes, cursor)?;
+            Ok(!text_hit(&text) && !(has_null && null_ok))
+        }
+        1 => {
+            let dict_len = read_varint(bytes, cursor)? as usize;
+            if dict_len == 0 {
+                return Err(Error::corrupt("string dictionary is empty"));
+            }
+            let mut hit = false;
+            for _ in 0..dict_len {
+                let text = read_lp_string(bytes, cursor)?;
+                if text_hit(&text) {
+                    hit = true;
+                }
+            }
+            Ok(!hit && !(has_null && null_ok))
+        }
+        2 | 0 => Ok(false),
+        _ => Err(Error::corrupt(format!("unknown string encoding {kind}"))),
+    }
+}
+
+fn int_const_misses(
+    bytes: &[u8],
+    cursor: &mut usize,
+    allowed: &[Scalar],
+    has_null: bool,
+    null_ok: bool,
+    timestamp: bool,
+) -> Result<bool> {
+    let kind = read_u8(bytes, cursor)?;
+    if kind != 1 {
+        return Ok(false);
+    }
+    let base = read_i64(bytes, cursor)?;
+    let hit = allowed.iter().any(|value| match value {
+        Scalar::Int(number) if !timestamp => *number == base,
+        Scalar::Timestamp(number) if timestamp => *number == base,
+        _ => false,
+    });
+    Ok(!hit && !(has_null && null_ok))
+}
+
+fn float_const_misses(
+    bytes: &[u8],
+    cursor: &mut usize,
+    allowed: &[Scalar],
+    has_null: bool,
+    null_ok: bool,
+) -> Result<bool> {
+    let kind = read_u8(bytes, cursor)?;
+    if kind != 1 {
+        return Ok(false);
+    }
+    let base = read_f64(bytes, cursor)?;
+    let hit = allowed
+        .iter()
+        .any(|value| matches!(value, Scalar::Float(number) if *number == base));
+    Ok(!hit && !(has_null && null_ok))
+}
+
+fn bool_const_misses(
+    bytes: &[u8],
+    cursor: &mut usize,
+    allowed: &[Scalar],
+    has_null: bool,
+    null_ok: bool,
+) -> Result<bool> {
+    let kind = read_u8(bytes, cursor)?;
+    if kind != 1 {
+        return Ok(false);
+    }
+    let base = read_u8(bytes, cursor)?;
+    if base > 1 {
+        return Err(Error::corrupt("bool constant is not 0 or 1"));
+    }
+    let flag = base == 1;
+    let hit = allowed
+        .iter()
+        .any(|value| matches!(value, Scalar::Bool(expected) if *expected == flag));
+    Ok(!hit && !(has_null && null_ok))
+}
+
+fn decimal_const_misses(
+    bytes: &[u8],
+    cursor: &mut usize,
+    allowed: &[Scalar],
+    has_null: bool,
+    null_ok: bool,
+) -> Result<bool> {
+    let kind = read_u8(bytes, cursor)?;
+    if kind != 1 {
+        return Ok(false);
+    }
+    let base = read_i128(bytes, cursor)?;
+    let hit = allowed
+        .iter()
+        .any(|value| matches!(value, Scalar::Decimal(number) if *number == base));
+    Ok(!hit && !(has_null && null_ok))
+}
+
+fn timestamp_range_misses(
+    bytes: &[u8],
+    start: usize,
+    nrows: usize,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<bool> {
+    let mut cursor = start;
+    let present = read_present(bytes, &mut cursor, nrows)?;
+    let (present_count, has_null) = present_stats(&present, nrows);
+    if has_null || present_count == 0 {
+        return Ok(false);
+    }
+    let kind = read_u8(bytes, &mut cursor)?;
+    if kind != 1 {
+        return Ok(false);
+    }
+    let base = read_i64(bytes, &mut cursor)?;
+    Ok(base < from_ms || base > to_ms)
 }
 
 fn expect_kind(bytes: &[u8], cursor: &mut usize, expected: u8) -> Result<()> {
@@ -760,5 +1266,82 @@ mod tests {
         }
         assert!(matches!(decoded[0].values[1], Scalar::Null));
         assert!(matches!(decoded[0].values[5], Scalar::Null));
+    }
+
+    #[test]
+    fn filtered_decode_matches_rows_and_skips_a_column_miss() {
+        let schema = schema();
+        let mut rows = Vec::new();
+        for i in 0..16i64 {
+            let action = ["click", "view", "buy"][i as usize % 3];
+            let mut obj = serde_json::json!({
+                "ts": 1_000 + i * 1_000,
+                "score": 1.5,
+                "ok": true,
+                "action": action,
+                "amount": "1.00",
+                "note": format!("payload-{i}-{}", "x".repeat(64)),
+            });
+            if i % 4 != 0 {
+                obj["user_id"] = serde_json::json!(i);
+            }
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let click = ColumnPredicate {
+            index: 4,
+            allowed: vec![Scalar::Str("click".into())],
+        };
+        let filtered = decode_rows_in_range(
+            &schema,
+            &encoded.bytes,
+            2_000,
+            12_000,
+            std::slice::from_ref(&click),
+        )
+        .unwrap();
+        let expected: Vec<_> = decode_block(&schema, &encoded.bytes)
+            .unwrap()
+            .into_iter()
+            .filter(|row| (2_000..=12_000).contains(&row.ts))
+            .filter(|row| matches!(&row.values[4], Scalar::Str(action) if action == "click"))
+            .collect();
+        assert_eq!(filtered.len(), expected.len());
+        assert!(filtered.len() < rows.len());
+        for (left, right) in expected.iter().zip(filtered.iter()) {
+            assert_eq!(
+                row_to_json(&schema, left).unwrap(),
+                row_to_json(&schema, right).unwrap()
+            );
+        }
+
+        let note = ColumnPredicate {
+            index: 5,
+            allowed: vec![Scalar::Str("payload-1-".to_string() + &"x".repeat(64))],
+        };
+        let by_note =
+            decode_rows_in_range(&schema, &encoded.bytes, i64::MIN, i64::MAX, &[note]).unwrap();
+        assert_eq!(by_note.len(), 1);
+        assert_eq!(by_note[0].ts, 2_000);
+
+        let miss = ColumnPredicate {
+            index: 4,
+            allowed: vec![Scalar::Str("missing".into())],
+        };
+        let mut truncated = encoded.bytes.clone();
+        truncated.pop();
+        assert!(
+            decode_rows_in_range(&schema, &truncated, i64::MIN, i64::MAX, &[miss])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(decode_rows_in_range(
+            &schema,
+            &truncated,
+            i64::MIN,
+            i64::MAX,
+            std::slice::from_ref(&click)
+        )
+        .is_err());
     }
 }

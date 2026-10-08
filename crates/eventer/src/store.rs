@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::codec::decode_block;
+use crate::codec::{decode_rows_in_range, ColumnPredicate};
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, Schema};
 use crate::segment::{self, Catalog};
-use crate::value::row_to_json;
+use crate::value::{self, row_to_json, Scalar};
 
 /// Counters for the bytes sitting in segment files after the last flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +52,18 @@ impl Default for StoreOptions {
             linger: Duration::from_millis(5),
         }
     }
+}
+
+/// Equality constraint pushed into block decoding.
+///
+/// Predicates on one query are AND-ed. [`Predicate::In`] matches any listed value.
+/// [`Scalar::Null`] matches a null column. An empty [`Predicate::In`] matches nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Predicate {
+    /// `field == value`, for example `Predicate::Eq("type".into(), "assistant".into())`.
+    Eq(String, Scalar),
+    /// `field` equals one of `values`.
+    In(String, Vec<Scalar>),
 }
 
 /// Append-only event store. Clone the directory handle by wrapping `Store` in `Arc`.
@@ -110,10 +122,34 @@ impl Store {
         self.pipeline.flush()
     }
 
+    /// Schema this store was opened with.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     /// Inclusive range on the schema timestamp, in unix milliseconds. Results are in ingest order.
     pub fn query(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Value>> {
+        self.query_with_filter(from_ms, to_ms, &[])
+    }
+
+    /// Inclusive time range plus equality predicates.
+    ///
+    /// Each predicate is applied while the block is decoded. If a filter column's
+    /// constant or dictionary cannot contain the requested value, the rest of that
+    /// block is not decoded. Unknown fields and values of the wrong column type
+    /// return [`Error::Schema`].
+    pub fn query_with_filter(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+    ) -> Result<Vec<Value>> {
         self.flush()?;
         if from_ms > to_ms {
+            return Ok(Vec::new());
+        }
+        let resolved = resolve_predicates(&self.schema, predicates)?;
+        if resolved.iter().any(|pred| pred.allowed.is_empty()) {
             return Ok(Vec::new());
         }
         let blocks = {
@@ -131,11 +167,9 @@ impl Store {
                 &segment::data_path(&self.dir, block.segment_id),
                 &block,
             )?;
-            let rows = decode_block(&self.schema, &payload)?;
+            let rows = decode_rows_in_range(&self.schema, &payload, from_ms, to_ms, &resolved)?;
             for row in rows {
-                if row.ts >= from_ms && row.ts <= to_ms {
-                    values.push(row_to_json(&self.schema, &row)?);
-                }
+                values.push(row_to_json(&self.schema, &row)?);
             }
         }
         Ok(values)
@@ -143,7 +177,17 @@ impl Store {
 
     /// Same as [`Store::query`], encoded as one JSON array.
     pub fn query_json(&self, from_ms: i64, to_ms: i64) -> Result<Vec<u8>> {
-        let values = self.query(from_ms, to_ms)?;
+        self.query_json_with_filter(from_ms, to_ms, &[])
+    }
+
+    /// Same as [`Store::query_with_filter`], encoded as one JSON array.
+    pub fn query_json_with_filter(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+    ) -> Result<Vec<u8>> {
+        let values = self.query_with_filter(from_ms, to_ms, predicates)?;
         Ok(serde_json::to_vec(&values)?)
     }
 
@@ -196,6 +240,41 @@ fn validate_options(options: &StoreOptions) -> Result<()> {
         return Err(Error::schema("linger must be at least 1ms"));
     }
     Ok(())
+}
+
+fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<Vec<ColumnPredicate>> {
+    let mut grouped: Vec<ColumnPredicate> = Vec::new();
+    for predicate in predicates {
+        let (name, values) = match predicate {
+            Predicate::Eq(name, value) => (name.as_str(), vec![value.clone()]),
+            Predicate::In(name, values) => (name.as_str(), values.clone()),
+        };
+        let index = schema
+            .fields
+            .iter()
+            .position(|field| field.name == name)
+            .ok_or_else(|| Error::schema(format!("unknown filter field `{name}`")))?;
+        let ty = schema.fields[index].ty;
+        for value in &values {
+            if !value::scalar_matches_field(value, ty) {
+                return Err(Error::schema(format!(
+                    "filter value for `{name}` does not match type {}",
+                    ty.name()
+                )));
+            }
+        }
+        if let Some(existing) = grouped.iter_mut().find(|pred| pred.index == index) {
+            existing
+                .allowed
+                .retain(|current| values.iter().any(|next| next == current));
+        } else {
+            grouped.push(ColumnPredicate {
+                index,
+                allowed: values,
+            });
+        }
+    }
+    Ok(grouped)
 }
 
 fn ensure_schema_lock(dir: &Path, schema: &Schema) -> Result<()> {
@@ -465,6 +544,130 @@ mod tests {
             stats.data_bytes,
             raw
         );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn query_with_filter_pushes_equality_and_in_predicates() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1000, Some(1), "click", Some("alpha"), "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2000, Some(2), "view", Some("beta"), "2.50"))
+            .unwrap();
+        store
+            .append_json(&event(3000, None, "buy", Some("alpha"), "0.05"))
+            .unwrap();
+        store
+            .append_json(&event(4000, Some(4), "click", None, "8.00"))
+            .unwrap();
+
+        let clicks = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("action".into(), "click".into())])
+            .unwrap();
+        assert_eq!(clicks.len(), 2);
+        assert_eq!(clicks[0]["ts"], 1000);
+        assert_eq!(clicks[1]["ts"], 4000);
+        assert!(clicks[1]["note"].is_null());
+
+        let narrowed = store
+            .query_with_filter(
+                1500,
+                4000,
+                &[Predicate::Eq("action".into(), "click".into())],
+            )
+            .unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0]["user_id"], 4);
+
+        let either = store
+            .query_with_filter(
+                0,
+                10_000,
+                &[Predicate::In(
+                    "action".into(),
+                    vec!["view".into(), "buy".into()],
+                )],
+            )
+            .unwrap();
+        assert_eq!(either.len(), 2);
+        assert_eq!(either[0]["action"], "view");
+        assert_eq!(either[1]["action"], "buy");
+
+        let both = store
+            .query_with_filter(
+                0,
+                10_000,
+                &[
+                    Predicate::Eq("action".into(), "buy".into()),
+                    Predicate::Eq("note".into(), "alpha".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0]["ts"], 3000);
+
+        let null_user = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("user_id".into(), Scalar::Null)])
+            .unwrap();
+        assert_eq!(null_user.len(), 1);
+        assert_eq!(null_user[0]["action"], "buy");
+
+        assert!(store
+            .query_with_filter(0, 10_000, &[Predicate::In("action".into(), Vec::new())])
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .query_with_filter(
+                0,
+                10_000,
+                &[Predicate::Eq("action".into(), "missing".into())],
+            )
+            .unwrap()
+            .is_empty());
+
+        let unknown =
+            store.query_with_filter(0, 10_000, &[Predicate::Eq("type".into(), "click".into())]);
+        assert!(unknown
+            .unwrap_err()
+            .to_string()
+            .contains("unknown filter field"));
+
+        let wrong = store.query_with_filter(
+            0,
+            10_000,
+            &[Predicate::Eq("user_id".into(), "click".into())],
+        );
+        assert!(wrong
+            .unwrap_err()
+            .to_string()
+            .contains("does not match type"));
+
+        let disagree = store.query_with_filter(
+            0,
+            10_000,
+            &[
+                Predicate::Eq("action".into(), "click".into()),
+                Predicate::Eq("action".into(), "view".into()),
+            ],
+        );
+        assert!(disagree.unwrap().is_empty());
+
+        let same = store
+            .query_with_filter(
+                0,
+                10_000,
+                &[
+                    Predicate::Eq("action".into(), "click".into()),
+                    Predicate::In("action".into(), vec!["click".into(), "view".into()]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(same.len(), 2);
         store.close().unwrap();
     }
 }

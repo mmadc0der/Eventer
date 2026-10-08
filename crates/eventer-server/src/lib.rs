@@ -2,16 +2,17 @@
 //!
 //! `POST /events` appends one JSON object and waits until it is fsynced.
 //! `GET /events?from=&to=` returns a JSON array of events in that inclusive
-//! millisecond range.
+//! millisecond range. Repeat `eq=field=value` to AND equality filters into the scan.
 
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use eventer::Predicate;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -61,7 +62,11 @@ struct RangeParams {
     to: Option<String>,
 }
 
-async fn get_events(State(state): State<AppState>, Query(params): Query<RangeParams>) -> Response {
+async fn get_events(
+    State(state): State<AppState>,
+    Query(params): Query<RangeParams>,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let from = match parse_bound(params.from, "from") {
         Ok(value) => value,
         Err(response) => return *response,
@@ -70,8 +75,17 @@ async fn get_events(State(state): State<AppState>, Query(params): Query<RangePar
         Ok(value) => value,
         Err(response) => return *response,
     };
+    let specs = eq_specs(raw.as_deref().unwrap_or(""));
+    let mut predicates = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        match parse_eq(state.store.schema(), spec) {
+            Ok(predicate) => predicates.push(predicate),
+            Err(response) => return *response,
+        }
+    }
     let store = Arc::clone(&state.store);
-    let joined = tokio::task::spawn_blocking(move || store.query(from, to)).await;
+    let joined =
+        tokio::task::spawn_blocking(move || store.query_with_filter(from, to, &predicates)).await;
     match joined {
         Ok(Ok(rows)) => Json(rows).into_response(),
         Ok(Err(err)) => error_response(&err),
@@ -80,6 +94,83 @@ async fn get_events(State(state): State<AppState>, Query(params): Query<RangePar
             Json(json!({"error": "query task failed"})),
         )
             .into_response(),
+    }
+}
+
+fn eq_specs(query: &str) -> Vec<String> {
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            if key == "eq" {
+                Some(percent_decode(value))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = &input[index + 1..index + 3];
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    index += 3;
+                } else {
+                    out.push(b'%');
+                    index += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_eq(schema: &eventer::Schema, spec: &str) -> std::result::Result<Predicate, Box<Response>> {
+    let Some((name, literal)) = spec.split_once('=') else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "`eq` must be field=value"})),
+            )
+                .into_response(),
+        ));
+    };
+    if name.is_empty() {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "`eq` is missing a field name"})),
+            )
+                .into_response(),
+        ));
+    }
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unknown filter field `{name}`")})),
+            )
+                .into_response(),
+        ));
+    };
+    match eventer::scalar_from_literal(field.ty, literal) {
+        Ok(scalar) => Ok(Predicate::Eq(name.to_string(), scalar)),
+        Err(err) => Err(Box::new(error_response(&err))),
     }
 }
 
@@ -202,6 +293,36 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["action"], "click");
         assert_eq!(rows[0]["amount"], "1.25");
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ts":1001,"action":"view","amount":"2.00"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
+
+        let filtered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/events?from=1000&to=2000&eq=action=click")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.status(), StatusCode::OK);
+        let filtered_bytes = filtered.into_body().collect().await.unwrap().to_bytes();
+        let filtered_rows: Vec<Value> = serde_json::from_slice(&filtered_bytes).unwrap();
+        assert_eq!(filtered_rows.len(), 1);
+        assert_eq!(filtered_rows[0]["action"], "click");
 
         let missing = app
             .oneshot(
