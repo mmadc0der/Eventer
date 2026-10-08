@@ -144,7 +144,6 @@ impl Store {
         to_ms: i64,
         predicates: &[Predicate],
     ) -> Result<Vec<Value>> {
-        self.flush()?;
         if from_ms > to_ms {
             return Ok(Vec::new());
         }
@@ -152,6 +151,7 @@ impl Store {
         if resolved.iter().any(|pred| pred.allowed.is_empty()) {
             return Ok(Vec::new());
         }
+        self.flush()?;
         let blocks = {
             let catalog = self.catalog();
             catalog

@@ -75,7 +75,10 @@ async fn get_events(
         Ok(value) => value,
         Err(response) => return *response,
     };
-    let specs = eq_specs(raw.as_deref().unwrap_or(""));
+    let specs = match eq_specs(raw.as_deref().unwrap_or("")) {
+        Ok(specs) => specs,
+        Err(response) => return *response,
+    };
     let mut predicates = Vec::with_capacity(specs.len());
     for spec in &specs {
         match parse_eq(state.store.schema(), spec) {
@@ -97,21 +100,29 @@ async fn get_events(
     }
 }
 
-fn eq_specs(query: &str) -> Vec<String> {
-    query
-        .split('&')
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            if key == "eq" {
-                Some(percent_decode(value))
-            } else {
-                None
+fn eq_specs(query: &str) -> std::result::Result<Vec<String>, Box<Response>> {
+    let mut specs = Vec::new();
+    if query.is_empty() {
+        return Ok(specs);
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = pair.split_once('=') else {
+            if percent_decode(pair)? == "eq" {
+                return Err(bad_request("`eq` must be field=value"));
             }
-        })
-        .collect()
+            continue;
+        };
+        if percent_decode(key)? == "eq" {
+            specs.push(percent_decode(value)?);
+        }
+    }
+    Ok(specs)
 }
 
-fn percent_decode(input: &str) -> String {
+fn percent_decode(input: &str) -> std::result::Result<String, Box<Response>> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -121,15 +132,15 @@ fn percent_decode(input: &str) -> String {
                 out.push(b' ');
                 index += 1;
             }
-            b'%' if index + 2 < bytes.len() => {
-                let hex = &input[index + 1..index + 3];
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    out.push(byte);
-                    index += 3;
-                } else {
-                    out.push(b'%');
-                    index += 1;
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return Err(bad_request("`eq` has an invalid percent-encoding"));
                 }
+                let hex = &input[index + 1..index + 3];
+                let byte = u8::from_str_radix(hex, 16)
+                    .map_err(|_| bad_request("`eq` has an invalid percent-encoding"))?;
+                out.push(byte);
+                index += 3;
             }
             byte => {
                 out.push(byte);
@@ -137,7 +148,11 @@ fn percent_decode(input: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).map_err(|_| bad_request("`eq` is not valid UTF-8"))
+}
+
+fn bad_request(message: &str) -> Box<Response> {
+    Box::new((StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response())
 }
 
 fn parse_eq(schema: &eventer::Schema, spec: &str) -> std::result::Result<Predicate, Box<Response>> {
@@ -325,6 +340,7 @@ mod tests {
         assert_eq!(filtered_rows[0]["action"], "click");
 
         let missing = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/events?from=5")
@@ -334,6 +350,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+        let encoded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/events?from=1000&to=2000&eq=action%3Dclick")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(encoded.status(), StatusCode::OK);
+
+        let bare = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/events?from=1000&to=2000&eq")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bare.status(), StatusCode::BAD_REQUEST);
+
+        let bad_pct = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/events?from=1000&to=2000&eq=action%3D%80")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_pct.status(), StatusCode::BAD_REQUEST);
 
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);

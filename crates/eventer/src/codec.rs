@@ -121,11 +121,31 @@ pub(crate) fn decode_rows_in_range(
 
         if is_filter {
             if is_timestamp && timestamp_range_misses(bytes, cursor, nrows, from_ms, to_ms)? {
-                return Ok(Vec::new());
+                return finish_empty(schema, bytes, &mut cursor, index);
             }
             if let Some(predicate) = predicate {
-                if column_misses(field.ty, bytes, cursor, nrows, &predicate.allowed)? {
-                    return Ok(Vec::new());
+                if matches!(field.ty, FieldType::String | FieldType::Text) {
+                    match read_string_filter(
+                        bytes,
+                        &mut cursor,
+                        nrows,
+                        &mut mask,
+                        &predicate.allowed,
+                    )? {
+                        StringFilter::Miss => {
+                            return finish_empty(schema, bytes, &mut cursor, index + 1);
+                        }
+                        StringFilter::Values(values) => {
+                            apply_eq(&mut mask, &values, &predicate.allowed);
+                            columns[index] = Some(values);
+                            if !mask.iter().any(|keep| *keep) {
+                                return finish_empty(schema, bytes, &mut cursor, index + 1);
+                            }
+                            continue;
+                        }
+                    }
+                } else if column_misses(field.ty, bytes, cursor, nrows, &predicate.allowed)? {
+                    return finish_empty(schema, bytes, &mut cursor, index);
                 }
             }
             let values = decode_column(field.ty, bytes, &mut cursor, nrows, Some(&mask))?;
@@ -157,7 +177,7 @@ pub(crate) fn decode_rows_in_range(
             }
             columns[index] = Some(values);
             if !mask.iter().any(|keep| *keep) {
-                return Ok(Vec::new());
+                return finish_empty(schema, bytes, &mut cursor, index + 1);
             }
         } else if filters_remain {
             let start = cursor;
@@ -797,7 +817,7 @@ fn decode_strings(
     }
 }
 
-fn read_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
+fn read_lp_str<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str> {
     let len = read_varint(bytes, cursor)? as usize;
     let end = cursor
         .checked_add(len)
@@ -806,18 +826,15 @@ fn read_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
         .get(*cursor..end)
         .ok_or_else(|| Error::corrupt("truncated string"))?;
     *cursor = end;
-    String::from_utf8(slice.to_vec()).map_err(|_| Error::corrupt("string is not utf-8"))
+    std::str::from_utf8(slice).map_err(|_| Error::corrupt("string is not utf-8"))
+}
+
+fn read_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
+    read_lp_str(bytes, cursor).map(str::to_owned)
 }
 
 fn skip_lp_string(bytes: &[u8], cursor: &mut usize) -> Result<()> {
-    let len = read_varint(bytes, cursor)? as usize;
-    let end = cursor
-        .checked_add(len)
-        .ok_or_else(|| Error::corrupt("string length overflow"))?;
-    if bytes.get(*cursor..end).is_none() {
-        return Err(Error::corrupt("truncated string"));
-    }
-    *cursor = end;
+    let _ = read_lp_str(bytes, cursor)?;
     Ok(())
 }
 
@@ -940,11 +957,175 @@ fn skip_strings(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
             if !matches!(width, 1 | 2 | 4) {
                 return Err(Error::corrupt("string dictionary code width is invalid"));
             }
-            let nbytes = count
-                .checked_mul(width)
-                .ok_or_else(|| Error::corrupt("length overflow"))?;
-            let _ = read_exact(bytes, cursor, nbytes)?;
+            for _ in 0..count {
+                let code = read_uint(bytes, cursor, width)?;
+                if code >= dict_len as u128 {
+                    return Err(Error::corrupt("string dictionary code is out of range"));
+                }
+            }
             Ok(())
+        }
+        _ => Err(Error::corrupt(format!("unknown string encoding {kind}"))),
+    }
+}
+
+fn finish_empty(
+    schema: &Schema,
+    bytes: &[u8],
+    cursor: &mut usize,
+    from_index: usize,
+) -> Result<Vec<Row>> {
+    let nrows = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    for field in &schema.fields[from_index..] {
+        skip_column(field.ty, bytes, cursor, nrows)?;
+    }
+    if *cursor != bytes.len() {
+        return Err(Error::corrupt("block has trailing bytes"));
+    }
+    Ok(Vec::new())
+}
+
+fn apply_eq(mask: &mut [bool], values: &[Scalar], allowed: &[Scalar]) {
+    for (row, value) in values.iter().enumerate() {
+        if mask[row] && !allowed.iter().any(|candidate| candidate == value) {
+            mask[row] = false;
+        }
+    }
+}
+
+enum StringFilter {
+    Miss,
+    Values(Vec<Scalar>),
+}
+
+fn scalar_text_hit(allowed: &[Scalar], text: &str) -> bool {
+    allowed
+        .iter()
+        .any(|value| matches!(value, Scalar::Str(expected) if expected == text))
+}
+
+/// One pass over a string or text filter column.
+///
+/// A miss still checks dictionary code bounds. Matching raw values are the only
+/// ones copied into `String`s.
+fn read_string_filter(
+    bytes: &[u8],
+    cursor: &mut usize,
+    nrows: usize,
+    mask: &mut [bool],
+    allowed: &[Scalar],
+) -> Result<StringFilter> {
+    let present = read_present(bytes, cursor, nrows)?;
+    let (present_count, _) = present_stats(&present, nrows);
+    let null_ok = allowed.iter().any(|value| matches!(value, Scalar::Null));
+    let row_present = |row: usize, present: &Option<Vec<bool>>| match present {
+        None => true,
+        Some(flags) => flags[row],
+    };
+    let null_hit = null_ok && (0..nrows).any(|row| mask[row] && !row_present(row, &present));
+    if present_count == 0 {
+        expect_kind(bytes, cursor, 0)?;
+        if !null_hit {
+            return Ok(StringFilter::Miss);
+        }
+        return Ok(StringFilter::Values(vec![Scalar::Null; nrows]));
+    }
+    let kind = read_u8(bytes, cursor)?;
+    match kind {
+        3 => {
+            let text = read_lp_str(bytes, cursor)?;
+            let hit = scalar_text_hit(allowed, text);
+            if !hit && !null_hit {
+                return Ok(StringFilter::Miss);
+            }
+            let owned = text.to_owned();
+            let mut column = Vec::with_capacity(nrows);
+            for (row, keep) in mask.iter_mut().enumerate() {
+                if row_present(row, &present) {
+                    if *keep && hit {
+                        column.push(Scalar::Str(owned.clone()));
+                    } else {
+                        *keep = false;
+                        column.push(Scalar::Null);
+                    }
+                } else if *keep && null_ok {
+                    column.push(Scalar::Null);
+                } else {
+                    *keep = false;
+                    column.push(Scalar::Null);
+                }
+            }
+            Ok(StringFilter::Values(column))
+        }
+        2 => {
+            let mut column = vec![Scalar::Null; nrows];
+            let mut saw = null_hit;
+            for row in 0..nrows {
+                if !row_present(row, &present) {
+                    if !(mask[row] && null_ok) {
+                        mask[row] = false;
+                    }
+                    continue;
+                }
+                let text = read_lp_str(bytes, cursor)?;
+                if mask[row] && scalar_text_hit(allowed, text) {
+                    saw = true;
+                    column[row] = Scalar::Str(text.to_owned());
+                } else {
+                    mask[row] = false;
+                }
+            }
+            Ok(if saw {
+                StringFilter::Values(column)
+            } else {
+                StringFilter::Miss
+            })
+        }
+        1 => {
+            let dict_len = read_varint(bytes, cursor)? as usize;
+            if dict_len == 0 {
+                return Err(Error::corrupt("string dictionary is empty"));
+            }
+            let mut dict = Vec::with_capacity(dict_len);
+            let mut entry_hit = false;
+            for _ in 0..dict_len {
+                let text = read_lp_str(bytes, cursor)?;
+                entry_hit |= scalar_text_hit(allowed, text);
+                dict.push(text);
+            }
+            let width = read_u8(bytes, cursor)? as usize;
+            if !matches!(width, 1 | 2 | 4) {
+                return Err(Error::corrupt("string dictionary code width is invalid"));
+            }
+            let mut codes = Vec::with_capacity(present_count);
+            for _ in 0..present_count {
+                let code = read_uint(bytes, cursor, width)?;
+                if code >= dict_len as u128 {
+                    return Err(Error::corrupt("string dictionary code is out of range"));
+                }
+                codes.push(code as usize);
+            }
+            if !entry_hit && !null_hit {
+                return Ok(StringFilter::Miss);
+            }
+            let mut column = vec![Scalar::Null; nrows];
+            let mut next = 0;
+            for row in 0..nrows {
+                if !row_present(row, &present) {
+                    if !(mask[row] && null_ok) {
+                        mask[row] = false;
+                    }
+                    continue;
+                }
+                let text = dict[codes[next]];
+                next += 1;
+                if mask[row] && scalar_text_hit(allowed, text) {
+                    column[row] = Scalar::Str(text.to_owned());
+                } else {
+                    mask[row] = false;
+                }
+            }
+            Ok(StringFilter::Values(column))
         }
         _ => Err(Error::corrupt(format!("unknown string encoding {kind}"))),
     }
@@ -978,9 +1159,7 @@ fn column_misses(
         return Ok(!null_ok);
     }
     match ty {
-        FieldType::String | FieldType::Text => {
-            string_column_misses(bytes, &mut cursor, allowed, has_null, null_ok)
-        }
+        FieldType::String | FieldType::Text => Ok(false),
         FieldType::Int => int_const_misses(bytes, &mut cursor, allowed, has_null, null_ok, false),
         FieldType::Timestamp => {
             int_const_misses(bytes, &mut cursor, allowed, has_null, null_ok, true)
@@ -990,43 +1169,6 @@ fn column_misses(
         FieldType::Decimal { .. } => {
             decimal_const_misses(bytes, &mut cursor, allowed, has_null, null_ok)
         }
-    }
-}
-
-fn string_column_misses(
-    bytes: &[u8],
-    cursor: &mut usize,
-    allowed: &[Scalar],
-    has_null: bool,
-    null_ok: bool,
-) -> Result<bool> {
-    let kind = read_u8(bytes, cursor)?;
-    let text_hit = |text: &str| {
-        allowed
-            .iter()
-            .any(|value| matches!(value, Scalar::Str(expected) if expected == text))
-    };
-    match kind {
-        3 => {
-            let text = read_lp_string(bytes, cursor)?;
-            Ok(!text_hit(&text) && !(has_null && null_ok))
-        }
-        1 => {
-            let dict_len = read_varint(bytes, cursor)? as usize;
-            if dict_len == 0 {
-                return Err(Error::corrupt("string dictionary is empty"));
-            }
-            let mut hit = false;
-            for _ in 0..dict_len {
-                let text = read_lp_string(bytes, cursor)?;
-                if text_hit(&text) {
-                    hit = true;
-                }
-            }
-            Ok(!hit && !(has_null && null_ok))
-        }
-        2 | 0 => Ok(false),
-        _ => Err(Error::corrupt(format!("unknown string encoding {kind}"))),
     }
 }
 
@@ -1330,11 +1472,7 @@ mod tests {
         };
         let mut truncated = encoded.bytes.clone();
         truncated.pop();
-        assert!(
-            decode_rows_in_range(&schema, &truncated, i64::MIN, i64::MAX, &[miss])
-                .unwrap()
-                .is_empty()
-        );
+        assert!(decode_rows_in_range(&schema, &truncated, i64::MIN, i64::MAX, &[miss]).is_err());
         assert!(decode_rows_in_range(
             &schema,
             &truncated,
@@ -1343,5 +1481,41 @@ mod tests {
             std::slice::from_ref(&click)
         )
         .is_err());
+    }
+
+    #[test]
+    fn filtered_decode_rejects_invalid_utf8_on_a_dropped_row() {
+        let schema = schema();
+        let click = parse_event(
+            &schema,
+            br#"{"ts":1000,"user_id":1,"score":1.0,"ok":true,"action":"click","note":"alpha","amount":"1.00"}"#,
+        )
+        .unwrap();
+        let view = parse_event(
+            &schema,
+            br#"{"ts":2000,"user_id":2,"score":1.0,"ok":true,"action":"view","note":"beta","amount":"1.00"}"#,
+        )
+        .unwrap();
+        let encoded = encode_block(&schema, &[click, view]).unwrap();
+        let mut bytes = encoded.bytes;
+        let pos = bytes
+            .windows(4)
+            .position(|window| window == b"beta")
+            .expect("note payload");
+        bytes[pos] = 0xff;
+        assert!(decode_block(&schema, &bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("utf-8"));
+        let filter = ColumnPredicate {
+            index: 4,
+            allowed: vec![Scalar::Str("click".into())],
+        };
+        assert!(
+            decode_rows_in_range(&schema, &bytes, i64::MIN, i64::MAX, &[filter])
+                .unwrap_err()
+                .to_string()
+                .contains("utf-8")
+        );
     }
 }
