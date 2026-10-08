@@ -306,7 +306,7 @@ fn encode_column(out: &mut Vec<u8>, ty: FieldType, rows: &[Row], index: usize) -
         }
         FieldType::Text => {
             let values = strings(rows, index)?;
-            out.extend_from_slice(&encode_strings(&values, false));
+            out.extend_from_slice(&encode_strings(&values, true));
         }
         FieldType::Json => {
             let values = json_texts(rows, index)?;
@@ -1974,6 +1974,120 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    fn text_schema() -> Schema {
+        parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "note", "type": "text"}
+                ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn rows_with_notes(notes: &[Option<&str>]) -> Vec<Row> {
+        let schema = text_schema();
+        notes
+            .iter()
+            .enumerate()
+            .map(|(i, note)| {
+                let mut obj = serde_json::json!({"ts": 1_700_000_000_000i64 + i as i64});
+                if let Some(text) = note {
+                    obj["note"] = serde_json::json!(text);
+                }
+                parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap()
+            })
+            .collect()
+    }
+
+    fn text_encoding_kind(bytes: &[u8]) -> u8 {
+        let nrows = block_row_count(bytes).unwrap();
+        let mut cursor = 4;
+        skip_column(FieldType::Timestamp, bytes, &mut cursor, nrows, true).unwrap();
+        let null_flag = bytes[cursor];
+        cursor += 1;
+        if null_flag == 1 {
+            cursor += nrows.div_ceil(8);
+        }
+        bytes[cursor]
+    }
+
+    fn assert_text_roundtrip(rows: &[Row]) {
+        let schema = text_schema();
+        let encoded = encode_block(&schema, rows).unwrap();
+        let decoded = decode_block(&schema, &encoded.bytes).unwrap();
+        assert_eq!(decoded.len(), rows.len());
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(left.values[1], right.values[1]);
+        }
+    }
+
+    /// A block whose text column was written with the dictionary disabled.
+    fn encode_legacy_raw_text_block(rows: &[Row]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        encode_column(&mut bytes, FieldType::Timestamp, rows, 0).unwrap();
+        let values = strings(rows, 1).unwrap();
+        let nulls: Vec<bool> = values.iter().map(|value| value.is_none()).collect();
+        write_nulls(&mut bytes, &nulls);
+        bytes.extend_from_slice(&encode_strings(&values, false));
+        bytes
+    }
+
+    #[test]
+    fn text_dictionary_roundtrips_low_cardinality_notes() {
+        let notes = ["landing", "checkout", "search"];
+        let rows = rows_with_notes(
+            &(0..12)
+                .map(|i| if i % 4 == 0 { None } else { Some(notes[i % 3]) })
+                .collect::<Vec<_>>(),
+        );
+        let encoded = encode_block(&text_schema(), &rows).unwrap();
+        assert_eq!(
+            text_encoding_kind(&encoded.bytes),
+            1,
+            "repeated notes should use dictionary kind 1"
+        );
+        assert_text_roundtrip(&rows);
+    }
+
+    #[test]
+    fn unique_text_stays_raw() {
+        let owned: Vec<String> = (0..8).map(|i| format!("unique-note-{i:04}")).collect();
+        let notes: Vec<Option<&str>> = owned.iter().map(|text| Some(text.as_str())).collect();
+        let rows = rows_with_notes(&notes);
+        let encoded = encode_block(&text_schema(), &rows).unwrap();
+        assert_eq!(text_encoding_kind(&encoded.bytes), 2);
+        assert_text_roundtrip(&rows);
+    }
+
+    #[test]
+    fn constant_text_stays_constant() {
+        let rows = rows_with_notes(&[Some("landing"); 6]);
+        let encoded = encode_block(&text_schema(), &rows).unwrap();
+        assert_eq!(text_encoding_kind(&encoded.bytes), 3);
+        assert_text_roundtrip(&rows);
+    }
+
+    #[test]
+    fn legacy_raw_text_block_still_decodes() {
+        let notes = ["landing", "checkout", "search"];
+        let rows = rows_with_notes(&(0..12).map(|i| Some(notes[i % 3])).collect::<Vec<_>>());
+        let bytes = encode_legacy_raw_text_block(&rows);
+        assert_eq!(
+            text_encoding_kind(&bytes),
+            2,
+            "legacy writer left the dictionary disabled"
+        );
+        let decoded = decode_block(&text_schema(), &bytes).unwrap();
+        assert_eq!(decoded.len(), rows.len());
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(left.values[1], right.values[1]);
+        }
     }
 
     #[test]

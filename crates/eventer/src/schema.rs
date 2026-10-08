@@ -13,7 +13,7 @@ pub enum FieldType {
     Bool,
     /// Short, often repeated text. Dictionary-encoded when that is smaller.
     String,
-    /// Long text. Stored raw (or as a constant) and never dictionary-encoded.
+    /// Long text. Dictionary-encoded when that body is smaller than raw bytes.
     Text,
     Decimal {
         scale: u32,
