@@ -115,6 +115,21 @@ fn main() -> ExitCode {
     println!("segments: {}", stats.segments);
     println!("elapsed_sec: {seconds:.4}");
     println!("events_per_sec: {:.0}", count as f64 / seconds);
+    let schema = eventer::parse_schema(SCHEMA).expect("bench schema");
+    let sample_end = count.min(2048);
+    match eventer::uncompressed_column_sizes(&schema, &events[..sample_end]) {
+        Ok(sizes) => {
+            for (name, size) in sizes {
+                if matches!(name.as_str(), "ts" | "user_id" | "amount") {
+                    println!("uncompressed_column_bytes {name}: {size}");
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("column size measurement failed: {err}");
+            return ExitCode::from(1);
+        }
+    }
     let _ = store.close();
     ExitCode::SUCCESS
 }

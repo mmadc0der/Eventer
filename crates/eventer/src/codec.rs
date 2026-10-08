@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::json_scan::validate_json_structure;
 use crate::error::{Error, Result};
+use crate::json_scan::validate_json_structure;
 use crate::schema::{FieldType, Schema};
 use crate::value::{Row, Scalar};
 
@@ -183,50 +183,188 @@ fn write_nulls(out: &mut Vec<u8>, nulls: &[bool]) {
     out.extend_from_slice(&bitmap);
 }
 
+/// Integer kind bytes. Kinds 0–6 are the original empty, constant, and
+/// byte-width frame-of-reference encodings. Kinds 7 and 8 are additive.
+const KIND_EMPTY: u8 = 0;
+const KIND_CONSTANT: u8 = 1;
+const KIND_STRIDE: u8 = 7;
+const KIND_BITPACK: u8 = 8;
+
 fn encode_i64s(values: &[Option<i64>]) -> Vec<u8> {
     let present: Vec<i64> = values.iter().copied().flatten().collect();
     if present.is_empty() {
-        return vec![0];
+        return vec![KIND_EMPTY];
     }
     let min = present.iter().copied().min().unwrap();
     let max = present.iter().copied().max().unwrap();
     if min == max {
-        let mut out = vec![1];
+        let mut out = vec![KIND_CONSTANT];
         out.extend_from_slice(&min.to_le_bytes());
         return out;
     }
-    let span = (max as u64).wrapping_sub(min as u64);
-    let width = width_of(span as u128);
-    let mut out = vec![kind_for_width(width)];
-    out.extend_from_slice(&min.to_le_bytes());
-    for value in present {
-        let delta = (value as u64).wrapping_sub(min as u64);
-        write_uint(&mut out, delta as u128, width);
+    let mut best = encode_i64s_frame(min, &present);
+    if let Some((base, stride)) = constant_stride_i64(&present) {
+        let encoded = encode_stride_i64(base, stride);
+        if encoded.len() < best.len() {
+            best = encoded;
+        }
     }
-    out
+    let span = (max as u64).wrapping_sub(min as u64);
+    let bits = bit_width_for_span(u128::from(span));
+    if bitpack_len(8, bits, present.len()) < best.len() {
+        let packed = encode_bitpack(
+            &min.to_le_bytes(),
+            bits,
+            present
+                .iter()
+                .map(|value| u128::from((*value as u64).wrapping_sub(min as u64))),
+        );
+        if packed.len() < best.len() {
+            best = packed;
+        }
+    }
+    best
 }
 
 fn encode_i128s(values: &[Option<i128>]) -> Vec<u8> {
     let present: Vec<i128> = values.iter().copied().flatten().collect();
     if present.is_empty() {
-        return vec![0];
+        return vec![KIND_EMPTY];
     }
     let min = present.iter().copied().min().unwrap();
     let max = present.iter().copied().max().unwrap();
     if min == max {
-        let mut out = vec![1];
+        let mut out = vec![KIND_CONSTANT];
         out.extend_from_slice(&min.to_le_bytes());
         return out;
     }
+    let mut best = encode_i128s_frame(min, &present);
+    if let Some((base, stride)) = constant_stride_i128(&present) {
+        let encoded = encode_stride_i128(base, stride);
+        if encoded.len() < best.len() {
+            best = encoded;
+        }
+    }
     let span = (max as u128).wrapping_sub(min as u128);
+    let bits = bit_width_for_span(span);
+    if bitpack_len(16, bits, present.len()) < best.len() {
+        let packed = encode_bitpack(
+            &min.to_le_bytes(),
+            bits,
+            present
+                .iter()
+                .map(|value| (*value as u128).wrapping_sub(min as u128)),
+        );
+        if packed.len() < best.len() {
+            best = packed;
+        }
+    }
+    best
+}
+
+fn encode_i64s_frame(min: i64, present: &[i64]) -> Vec<u8> {
+    let span = (present.iter().copied().max().unwrap() as u64).wrapping_sub(min as u64);
+    let width = width_of(u128::from(span));
+    let mut out = vec![kind_for_width(width)];
+    out.extend_from_slice(&min.to_le_bytes());
+    for value in present {
+        let delta = (*value as u64).wrapping_sub(min as u64);
+        write_uint(&mut out, u128::from(delta), width);
+    }
+    out
+}
+
+fn encode_i128s_frame(min: i128, present: &[i128]) -> Vec<u8> {
+    let span = (present.iter().copied().max().unwrap() as u128).wrapping_sub(min as u128);
     let width = width_of(span);
     let mut out = vec![kind_for_width(width)];
     out.extend_from_slice(&min.to_le_bytes());
     for value in present {
-        let delta = (value as u128).wrapping_sub(min as u128);
+        let delta = (*value as u128).wrapping_sub(min as u128);
         write_uint(&mut out, delta, width);
     }
     out
+}
+
+/// `base + index * stride` over non-null values in order. A zero stride is the
+/// constant kind, so it is not reported here.
+fn constant_stride_i64(present: &[i64]) -> Option<(i64, i64)> {
+    if present.len() < 2 {
+        return None;
+    }
+    let base = present[0];
+    let stride = present[1].wrapping_sub(base);
+    if stride == 0 {
+        return None;
+    }
+    for (index, value) in present.iter().enumerate().skip(2) {
+        let expected = base.wrapping_add((index as i64).wrapping_mul(stride));
+        if *value != expected {
+            return None;
+        }
+    }
+    Some((base, stride))
+}
+
+fn constant_stride_i128(present: &[i128]) -> Option<(i128, i128)> {
+    if present.len() < 2 {
+        return None;
+    }
+    let base = present[0];
+    let stride = present[1].wrapping_sub(base);
+    if stride == 0 {
+        return None;
+    }
+    for (index, value) in present.iter().enumerate().skip(2) {
+        let expected = base.wrapping_add((index as i128).wrapping_mul(stride));
+        if *value != expected {
+            return None;
+        }
+    }
+    Some((base, stride))
+}
+
+fn encode_stride_i64(base: i64, stride: i64) -> Vec<u8> {
+    let mut out = vec![KIND_STRIDE];
+    out.extend_from_slice(&base.to_le_bytes());
+    out.extend_from_slice(&stride.to_le_bytes());
+    out
+}
+
+fn encode_stride_i128(base: i128, stride: i128) -> Vec<u8> {
+    let mut out = vec![KIND_STRIDE];
+    out.extend_from_slice(&base.to_le_bytes());
+    out.extend_from_slice(&stride.to_le_bytes());
+    out
+}
+
+/// Exact-width frame of reference. Deltas are packed least-significant-bit
+/// first. A FastLanes 1024-lane transpose is unnecessary for a correct
+/// round trip; the bit cursor below is the scalar layout the decoder mirrors.
+fn bitpack_len(base_len: usize, bits: u32, count: usize) -> usize {
+    2 + base_len + (count * bits as usize).div_ceil(8)
+}
+
+fn encode_bitpack(base: &[u8], bits: u32, deltas: impl Iterator<Item = u128>) -> Vec<u8> {
+    let mut out = vec![KIND_BITPACK, bits as u8];
+    out.extend_from_slice(base);
+    let mut packer = BitPacker::default();
+    for delta in deltas {
+        packer.push(delta, bits);
+    }
+    out.extend_from_slice(&packer.finish());
+    out
+}
+
+/// Uncompressed size of each column in one block, including its null bitmap.
+pub fn uncompressed_column_sizes(schema: &Schema, rows: &[Row]) -> Result<Vec<(String, usize)>> {
+    let mut sizes = Vec::with_capacity(schema.fields.len());
+    for (index, field) in schema.fields.iter().enumerate() {
+        let mut column = Vec::new();
+        encode_column(&mut column, field.ty, rows, index)?;
+        sizes.push((field.name.clone(), column.len()));
+    }
+    Ok(sizes)
 }
 
 fn encode_f64s(values: &[Option<f64>]) -> Vec<u8> {
@@ -411,6 +549,102 @@ fn write_uint(out: &mut Vec<u8>, value: u128, width: usize) {
     out.extend_from_slice(&bytes[..width]);
 }
 
+/// `ceil(log2(span + 1))`, the bits needed to store every delta in `0..=span`.
+fn bit_width_for_span(span: u128) -> u32 {
+    if span == u128::MAX {
+        return 128;
+    }
+    let distinct = span + 1;
+    u128::BITS - distinct.leading_zeros()
+}
+
+#[derive(Default)]
+struct BitPacker {
+    out: Vec<u8>,
+    acc: u128,
+    acc_bits: u32,
+}
+
+impl BitPacker {
+    fn push(&mut self, value: u128, width: u32) {
+        let value = if width >= 128 {
+            value
+        } else {
+            value & ((1u128 << width) - 1)
+        };
+        let space = 128 - self.acc_bits;
+        if width <= space {
+            self.acc |= value << self.acc_bits;
+            self.acc_bits += width;
+            if self.acc_bits == 128 {
+                self.flush_full();
+            }
+        } else {
+            self.acc |= value << self.acc_bits;
+            let rest = width - space;
+            self.flush_full();
+            self.acc = value >> space;
+            self.acc_bits = rest;
+        }
+    }
+
+    fn flush_full(&mut self) {
+        self.out.extend_from_slice(&self.acc.to_le_bytes());
+        self.acc = 0;
+        self.acc_bits = 0;
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.acc_bits > 0 {
+            let nbytes = (self.acc_bits as usize).div_ceil(8);
+            let bytes = self.acc.to_le_bytes();
+            self.out.extend_from_slice(&bytes[..nbytes]);
+        }
+        self.out
+    }
+}
+
+struct BitUnpacker<'a> {
+    data: &'a [u8],
+    pos: usize,
+    acc: u128,
+    acc_bits: u32,
+}
+
+impl<'a> BitUnpacker<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            acc: 0,
+            acc_bits: 0,
+        }
+    }
+
+    fn pull(&mut self, width: u32) -> Result<u128> {
+        let mut got = 0u32;
+        let mut value = 0u128;
+        while got < width {
+            if self.acc_bits == 0 {
+                let byte = *self
+                    .data
+                    .get(self.pos)
+                    .ok_or_else(|| Error::corrupt("truncated bit-packed integer column"))?;
+                self.pos += 1;
+                self.acc = u128::from(byte);
+                self.acc_bits = 8;
+            }
+            let take = (width - got).min(self.acc_bits);
+            let mask = (1u128 << take) - 1;
+            value |= (self.acc & mask) << got;
+            self.acc >>= take;
+            self.acc_bits -= take;
+            got += take;
+        }
+        Ok(value)
+    }
+}
+
 fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -541,9 +775,7 @@ fn decode_column(
                 .map(Scalar::Str)
                 .collect()
         }
-        FieldType::Json => {
-            decode_json(bytes, cursor, present_count, &present_keep, budget)?
-        }
+        FieldType::Json => decode_json(bytes, cursor, present_count, &present_keep, budget)?,
     };
     if values.len() != present_count {
         return Err(Error::corrupt(
@@ -626,11 +858,22 @@ fn skip_column(ty: FieldType, bytes: &[u8], cursor: &mut usize, nrows: usize) ->
 
 fn skip_i64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
     if count == 0 {
-        return expect_kind(bytes, cursor, 0);
+        return expect_kind(bytes, cursor, KIND_EMPTY);
     }
     let kind = read_u8(bytes, cursor)?;
-    if kind == 1 {
+    if kind == KIND_CONSTANT {
         let _ = read_i64(bytes, cursor)?;
+        return Ok(());
+    }
+    if kind == KIND_STRIDE {
+        let _ = read_i64(bytes, cursor)?;
+        let _ = read_i64(bytes, cursor)?;
+        return Ok(());
+    }
+    if kind == KIND_BITPACK {
+        let bits = read_bit_width(bytes, cursor, 64)?;
+        let _ = read_i64(bytes, cursor)?;
+        skip_packed(bytes, cursor, count, bits, "int")?;
         return Ok(());
     }
     let width = width_for_kind(kind)?;
@@ -647,11 +890,22 @@ fn skip_i64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
 
 fn skip_i128s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
     if count == 0 {
-        return expect_kind(bytes, cursor, 0);
+        return expect_kind(bytes, cursor, KIND_EMPTY);
     }
     let kind = read_u8(bytes, cursor)?;
-    if kind == 1 {
+    if kind == KIND_CONSTANT {
         let _ = read_i128(bytes, cursor)?;
+        return Ok(());
+    }
+    if kind == KIND_STRIDE {
+        let _ = read_i128(bytes, cursor)?;
+        let _ = read_i128(bytes, cursor)?;
+        return Ok(());
+    }
+    if kind == KIND_BITPACK {
+        let bits = read_bit_width(bytes, cursor, 128)?;
+        let _ = read_i128(bytes, cursor)?;
+        skip_packed(bytes, cursor, count, bits, "decimal")?;
         return Ok(());
     }
     let width = width_for_kind(kind)?;
@@ -660,6 +914,28 @@ fn skip_i128s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
         .checked_mul(count)
         .ok_or_else(|| Error::corrupt("decimal column length overflow"))?;
     let _ = read_exact(bytes, cursor, nbytes)?;
+    Ok(())
+}
+
+fn read_bit_width(bytes: &[u8], cursor: &mut usize, max_bits: u32) -> Result<u32> {
+    let bits = u32::from(read_u8(bytes, cursor)?);
+    if bits == 0 || bits > max_bits {
+        return Err(Error::corrupt("integer bit width is invalid"));
+    }
+    Ok(bits)
+}
+
+fn skip_packed(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    bits: u32,
+    what: &str,
+) -> Result<()> {
+    let total_bits = count
+        .checked_mul(bits as usize)
+        .ok_or_else(|| Error::corrupt(format!("{what} column length overflow")))?;
+    let _ = read_exact(bytes, cursor, total_bits.div_ceil(8))?;
     Ok(())
 }
 
@@ -760,13 +1036,34 @@ fn read_present(bytes: &[u8], cursor: &mut usize, nrows: usize) -> Result<Option
 
 fn decode_i64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<i64>> {
     if count == 0 {
-        expect_kind(bytes, cursor, 0)?;
+        expect_kind(bytes, cursor, KIND_EMPTY)?;
         return Ok(Vec::new());
     }
     let kind = read_u8(bytes, cursor)?;
-    if kind == 1 {
+    if kind == KIND_CONSTANT {
         let base = read_i64(bytes, cursor)?;
         return Ok(vec![base; count]);
+    }
+    if kind == KIND_STRIDE {
+        let base = read_i64(bytes, cursor)?;
+        let stride = read_i64(bytes, cursor)?;
+        let mut out = Vec::with_capacity(count);
+        for index in 0..count {
+            out.push(base.wrapping_add((index as i64).wrapping_mul(stride)));
+        }
+        return Ok(out);
+    }
+    if kind == KIND_BITPACK {
+        let bits = read_bit_width(bytes, cursor, 64)?;
+        let base = read_i64(bytes, cursor)?;
+        let packed = read_packed(bytes, cursor, count, bits, "int")?;
+        let mut unpacker = BitUnpacker::new(packed);
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let delta = unpacker.pull(bits)? as u64;
+            out.push((base as u64).wrapping_add(delta) as i64);
+        }
+        return Ok(out);
     }
     let width = width_for_kind(kind)?;
     if width > 8 {
@@ -783,13 +1080,34 @@ fn decode_i64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<i64
 
 fn decode_i128s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<i128>> {
     if count == 0 {
-        expect_kind(bytes, cursor, 0)?;
+        expect_kind(bytes, cursor, KIND_EMPTY)?;
         return Ok(Vec::new());
     }
     let kind = read_u8(bytes, cursor)?;
-    if kind == 1 {
+    if kind == KIND_CONSTANT {
         let base = read_i128(bytes, cursor)?;
         return Ok(vec![base; count]);
+    }
+    if kind == KIND_STRIDE {
+        let base = read_i128(bytes, cursor)?;
+        let stride = read_i128(bytes, cursor)?;
+        let mut out = Vec::with_capacity(count);
+        for index in 0..count {
+            out.push(base.wrapping_add((index as i128).wrapping_mul(stride)));
+        }
+        return Ok(out);
+    }
+    if kind == KIND_BITPACK {
+        let bits = read_bit_width(bytes, cursor, 128)?;
+        let base = read_i128(bytes, cursor)?;
+        let packed = read_packed(bytes, cursor, count, bits, "decimal")?;
+        let mut unpacker = BitUnpacker::new(packed);
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let delta = unpacker.pull(bits)?;
+            out.push((base as u128).wrapping_add(delta) as i128);
+        }
+        return Ok(out);
     }
     let width = width_for_kind(kind)?;
     let base = read_i128(bytes, cursor)?;
@@ -799,6 +1117,19 @@ fn decode_i128s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<i1
         out.push((base as u128).wrapping_add(delta) as i128);
     }
     Ok(out)
+}
+
+fn read_packed<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    count: usize,
+    bits: u32,
+    what: &str,
+) -> Result<&'a [u8]> {
+    let total_bits = count
+        .checked_mul(bits as usize)
+        .ok_or_else(|| Error::corrupt(format!("{what} column length overflow")))?;
+    read_exact(bytes, cursor, total_bits.div_ceil(8))
 }
 
 fn decode_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<f64>> {
@@ -899,9 +1230,10 @@ fn decode_strings(
                 validate_json_column_text(&text)?;
             }
             let copies = keep.iter().filter(|flag| **flag).count();
-            let expanded = text.len().checked_mul(copies).ok_or_else(|| {
-                Error::event("query response size limit exceeded")
-            })?;
+            let expanded = text
+                .len()
+                .checked_mul(copies)
+                .ok_or_else(|| Error::event("query response size limit exceeded"))?;
             charge_string_bytes(budget, expanded)?;
             let mut out = Vec::with_capacity(count);
             for flag in keep {
@@ -959,9 +1291,9 @@ fn decode_strings(
                 let text = dict
                     .get(*code)
                     .ok_or_else(|| Error::corrupt("string dictionary code is out of range"))?;
-                expanded = expanded.checked_add(text.len()).ok_or_else(|| {
-                    Error::event("query response size limit exceeded")
-                })?;
+                expanded = expanded
+                    .checked_add(text.len())
+                    .ok_or_else(|| Error::event("query response size limit exceeded"))?;
             }
             charge_string_bytes(budget, expanded)?;
             let mut out = Vec::with_capacity(count);
@@ -1249,7 +1581,9 @@ mod tests {
             _ => panic!("expected json"),
         };
         let err = decode_rows_in_range(&schema, &encoded.bytes, 1, 4, one * 4 - 1).unwrap_err();
-        assert!(err.to_string().contains("query response size limit exceeded"));
+        assert!(err
+            .to_string()
+            .contains("query response size limit exceeded"));
         let decoded = decode_rows_in_range(&schema, &encoded.bytes, 1, 4, one * 4).unwrap();
         assert_eq!(decoded.len(), 4);
         let partial = decode_rows_in_range(&schema, &encoded.bytes, 4, 4, one).unwrap();
@@ -1259,5 +1593,239 @@ mod tests {
         assert!(too_small
             .to_string()
             .contains("query response size limit exceeded"));
+    }
+
+    #[test]
+    fn constant_stride_with_nulls_in_the_middle_roundtrips() {
+        let mut values = Vec::new();
+        let mut present = Vec::new();
+        for index in 0..20 {
+            if index % 2 == 0 {
+                values.push(None);
+            } else {
+                let value = 100 + (index / 2) * 10;
+                present.push(value);
+                values.push(Some(value));
+            }
+        }
+        let encoded = encode_i64s(&values);
+        assert_eq!(encoded[0], KIND_STRIDE);
+        let mut cursor = 0;
+        let decoded = decode_i64s(&encoded, &mut cursor, present.len()).unwrap();
+        assert_eq!(decoded, present);
+        assert_eq!(cursor, encoded.len());
+
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "user_id", "type": "int"},
+                    {"name": "ts", "type": "timestamp"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for (index, user_id) in values.iter().enumerate() {
+            let mut obj = serde_json::json!({
+                "ts": 1_000 + index as i64 * 10,
+            });
+            if let Some(user_id) = user_id {
+                obj["user_id"] = serde_json::json!(user_id);
+            }
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let block = encode_block(&schema, &rows).unwrap();
+        let decoded = decode_block(&schema, &block.bytes).unwrap();
+        assert_eq!(decoded.len(), rows.len());
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(left.values, right.values);
+        }
+        let ranged = decode_rows_in_range(&schema, &block.bytes, 1_000, 1_020, usize::MAX).unwrap();
+        assert_eq!(ranged.len(), 3);
+        assert!(matches!(ranged[0].values[0], Scalar::Null));
+        assert_eq!(ranged[1].values[0], Scalar::Int(100));
+        assert!(matches!(ranged[2].values[0], Scalar::Null));
+    }
+
+    #[test]
+    fn negative_i64_roundtrips_for_stride_and_bit_width() {
+        let stride: Vec<Option<i64>> = (0..12).map(|i| Some(-80 + i * 7)).collect();
+        let encoded = encode_i64s(&stride);
+        assert_eq!(encoded[0], KIND_STRIDE);
+        let mut cursor = 0;
+        assert_eq!(
+            decode_i64s(&encoded, &mut cursor, stride.len()).unwrap(),
+            stride.into_iter().flatten().collect::<Vec<_>>()
+        );
+
+        let packed: Vec<Option<i64>> = [-1000, -1, 40, -7, 12].into_iter().map(Some).collect();
+        let encoded = encode_i64s(&packed);
+        assert_eq!(encoded[0], KIND_BITPACK);
+        let mut cursor = 0;
+        assert_eq!(
+            decode_i64s(&encoded, &mut cursor, packed.len()).unwrap(),
+            vec![-1000, -1, 40, -7, 12]
+        );
+
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for (index, user_id) in packed.iter().enumerate() {
+            let obj = serde_json::json!({
+                "ts": 50 + index as i64,
+                "user_id": user_id,
+            });
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let block = encode_block(&schema, &rows).unwrap();
+        let decoded = decode_block(&schema, &block.bytes).unwrap();
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(left.values, right.values);
+        }
+    }
+
+    #[test]
+    fn exact_bit_width_packs_span_999() {
+        let values: Vec<Option<i64>> = (0..2048).map(|i| Some(i % 1000)).collect();
+        let encoded = encode_i64s(&values);
+        assert_eq!(encoded[0], KIND_BITPACK);
+        assert_eq!(encoded[1], 10, "999 fits in 10 bits");
+        let mut cursor = 0;
+        let decoded = decode_i64s(&encoded, &mut cursor, values.len()).unwrap();
+        assert_eq!(cursor, encoded.len());
+        for (index, value) in decoded.iter().enumerate() {
+            assert_eq!(*value, (index % 1000) as i64);
+        }
+        let mut skip = 0;
+        skip_i64s(&encoded, &mut skip, values.len()).unwrap();
+        assert_eq!(skip, encoded.len());
+    }
+
+    #[test]
+    fn decimal_i128_stride_and_exact_width_roundtrip() {
+        let stride: Vec<Option<i128>> = (0..32).map(|i| Some(5_000 + i * 25)).collect();
+        let encoded = encode_i128s(&stride);
+        assert_eq!(encoded[0], KIND_STRIDE);
+        let mut cursor = 0;
+        assert_eq!(
+            decode_i128s(&encoded, &mut cursor, stride.len()).unwrap(),
+            stride.into_iter().flatten().collect::<Vec<_>>()
+        );
+
+        let mut packed = vec![Some(0i128), Some(999), Some(1), Some(500)];
+        packed.extend((0..64).map(|i| Some(i128::from((i * 3) % 1000))));
+        let encoded = encode_i128s(&packed);
+        assert_eq!(encoded[0], KIND_BITPACK);
+        assert_eq!(encoded[1], 10);
+        let mut cursor = 0;
+        assert_eq!(
+            decode_i128s(&encoded, &mut cursor, packed.len()).unwrap(),
+            packed.iter().copied().flatten().collect::<Vec<_>>()
+        );
+        let mut skip = 0;
+        skip_i128s(&encoded, &mut skip, packed.len()).unwrap();
+        assert_eq!(skip, encoded.len());
+
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for i in 0..16i64 {
+            let cents = if i % 2 == 0 { i * 25 } else { 999 };
+            let obj = serde_json::json!({
+                "ts": 10_000 + i,
+                "amount": format!("{}.{:02}", cents / 100, cents % 100),
+            });
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let block = encode_block(&schema, &rows).unwrap();
+        let decoded = decode_block(&schema, &block.bytes).unwrap();
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(left.values, right.values);
+        }
+    }
+
+    #[test]
+    fn constant_timestamp_keeps_the_constant_kind() {
+        let values = vec![Some(1_700_000_000_000i64); 32];
+        let encoded = encode_i64s(&values);
+        assert_eq!(encoded[0], KIND_CONSTANT);
+        assert_ne!(encoded[0], KIND_STRIDE);
+
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for i in 0..8i64 {
+            let obj = serde_json::json!({
+                "ts": 1_700_000_000_000i64,
+                "user_id": i,
+            });
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let block = encode_block(&schema, &rows).unwrap();
+        assert_eq!(block.bytes[5], KIND_CONSTANT);
+        let decoded = decode_block(&schema, &block.bytes).unwrap();
+        assert!(decoded.iter().all(|row| row.ts == 1_700_000_000_000));
+    }
+
+    #[test]
+    fn legacy_byte_width_blocks_still_decode() {
+        let mut payload = vec![3u8];
+        payload.extend_from_slice(&10i64.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&5u16.to_le_bytes());
+        let mut cursor = 0;
+        assert_eq!(decode_i64s(&payload, &mut cursor, 2).unwrap(), vec![10, 15]);
+        assert_eq!(cursor, payload.len());
+
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(KIND_CONSTANT);
+        bytes.extend_from_slice(&1000i64.to_le_bytes());
+        bytes.push(0);
+        bytes.push(3);
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        let rows = decode_block(&schema, &bytes).unwrap();
+        assert_eq!(rows[0].ts, 1000);
+        assert_eq!(rows[1].ts, 1000);
+        assert_eq!(rows[0].values[1], Scalar::Int(1));
+        assert_eq!(rows[1].values[1], Scalar::Int(2));
     }
 }
