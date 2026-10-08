@@ -103,6 +103,7 @@ pub(crate) fn decode_rows_in_range_filtered(
     let mut mask = vec![true; nrows];
     let mut columns: Vec<Option<Vec<Scalar>>> = (0..schema.fields.len()).map(|_| None).collect();
     let mut skipped: Vec<(usize, usize, usize)> = Vec::new();
+    let mut deferred: Vec<(usize, bool, Vec<Option<(usize, usize)>>)> = Vec::new();
     let mut budget = max_string_bytes;
 
     for (index, field) in schema.fields.iter().enumerate() {
@@ -118,26 +119,20 @@ pub(crate) fn decode_rows_in_range_filtered(
                 return finish_empty(schema, bytes, &mut cursor, index);
             }
             if let Some(predicate) = predicate {
-                if matches!(field.ty, FieldType::String | FieldType::Text) {
-                    match read_string_filter(
+                if matches!(field.ty, FieldType::String | FieldType::Text | FieldType::Json) {
+                    let spans = read_text_spans(
                         bytes,
                         &mut cursor,
                         nrows,
-                        &mut mask,
-                        &predicate.allowed,
-                        &mut budget,
-                    )? {
-                        StringFilter::Miss => {
-                            return finish_empty(schema, bytes, &mut cursor, index + 1);
-                        }
-                        StringFilter::Values(values) => {
-                            columns[index] = Some(values);
-                            if !mask.iter().any(|keep| *keep) {
-                                return finish_empty(schema, bytes, &mut cursor, index + 1);
-                            }
-                            continue;
-                        }
+                        field.ty == FieldType::Json,
+                    )?;
+                    mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
+                    if !mask.iter().any(|keep| *keep) {
+                        return finish_empty(schema, bytes, &mut cursor, index + 1);
                     }
+                    // Clone only after every later predicate has updated `mask`.
+                    deferred.push((index, field.ty == FieldType::Json, spans));
+                    continue;
                 } else if column_misses(field.ty, bytes, cursor, nrows, &predicate.allowed)? {
                     return finish_empty(schema, bytes, &mut cursor, index);
                 }
@@ -145,12 +140,9 @@ pub(crate) fn decode_rows_in_range_filtered(
             let values = decode_column(field.ty, bytes, &mut cursor, nrows, &mask, &mut budget)?;
             if is_timestamp {
                 for (row, value) in values.iter().enumerate() {
-                    if !mask[row] {
-                        continue;
-                    }
                     match value {
                         Scalar::Timestamp(ts) => {
-                            if *ts < from_ms || *ts > to_ms {
+                            if mask[row] && (*ts < from_ms || *ts > to_ms) {
                                 mask[row] = false;
                             }
                         }
@@ -201,6 +193,11 @@ pub(crate) fn decode_rows_in_range_filtered(
             return Err(Error::corrupt("column skip and decode disagree"));
         }
         columns[index] = Some(values);
+    }
+    for (index, json, spans) in deferred {
+        columns[index] = Some(materialize_text_spans(
+            bytes, &spans, &mask, &mut budget, json,
+        )?);
     }
 
     let mut rows = Vec::new();
@@ -762,7 +759,13 @@ fn skip_column(ty: FieldType, bytes: &[u8], cursor: &mut usize, nrows: usize) ->
         Some(flags) => flags.iter().filter(|flag| **flag).count(),
     };
     match ty {
-        FieldType::Int | FieldType::Timestamp => skip_i64s(bytes, cursor, present_count),
+        FieldType::Int => skip_i64s(bytes, cursor, present_count),
+        FieldType::Timestamp => {
+            if present.as_ref().is_some_and(|flags| flags.iter().any(|flag| !*flag)) {
+                return Err(Error::corrupt("timestamp column is null or the wrong type"));
+            }
+            skip_i64s(bytes, cursor, present_count)
+        }
         FieldType::Float => skip_f64s(bytes, cursor, present_count),
         FieldType::Bool => skip_bools(bytes, cursor, present_count),
         FieldType::Decimal { .. } => skip_i128s(bytes, cursor, present_count),
@@ -1163,11 +1166,6 @@ fn skip_lp_string_value(bytes: &[u8], cursor: &mut usize, validate_json: bool) -
     Ok(())
 }
 
-fn read_lp_str<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str> {
-    let slice = read_lp_bytes(bytes, cursor)?;
-    std::str::from_utf8(slice).map_err(|_| Error::corrupt("string is not utf-8"))
-}
-
 fn read_lp_bytes<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8]> {
     let len = read_varint(bytes, cursor)? as usize;
     let end = cursor
@@ -1282,122 +1280,67 @@ fn apply_eq(mask: &mut [bool], values: &[Scalar], allowed: &[Scalar]) {
     }
 }
 
-enum StringFilter {
-    Miss,
-    Values(Vec<Scalar>),
+fn scalar_text_hit(allowed: &[Scalar], text: &str, json: bool) -> bool {
+    allowed.iter().any(|value| match value {
+        Scalar::Str(expected) if !json => expected == text,
+        Scalar::Json(expected) if json => expected == text,
+        _ => false,
+    })
 }
 
-fn scalar_text_hit(allowed: &[Scalar], text: &str) -> bool {
-    allowed
-        .iter()
-        .any(|value| matches!(value, Scalar::Str(expected) if expected == text))
+fn read_lp_span(bytes: &[u8], cursor: &mut usize, validate_json: bool) -> Result<(usize, usize)> {
+    let len = read_varint(bytes, cursor)? as usize;
+    let start = *cursor;
+    let slice = read_exact(bytes, cursor, len)?;
+    let text = std::str::from_utf8(slice).map_err(|_| Error::corrupt("string is not utf-8"))?;
+    if validate_json {
+        validate_json_column_text(text)?;
+    }
+    Ok((start, start + len))
 }
 
-fn read_string_filter(
+fn row_is_present(present: &Option<Vec<bool>>, row: usize) -> bool {
+    match present {
+        None => true,
+        Some(flags) => flags[row],
+    }
+}
+
+/// Walk a string or JSON column and remember payload spans. No `String` is built.
+fn read_text_spans(
     bytes: &[u8],
     cursor: &mut usize,
     nrows: usize,
-    mask: &mut [bool],
-    allowed: &[Scalar],
-    budget: &mut usize,
-) -> Result<StringFilter> {
+    validate_json: bool,
+) -> Result<Vec<Option<(usize, usize)>>> {
     let present = read_present(bytes, cursor, nrows)?;
-    let (present_count, _) = present_stats(&present, nrows);
-    let null_ok = allowed.iter().any(|value| matches!(value, Scalar::Null));
-    let row_present = |row: usize, present: &Option<Vec<bool>>| match present {
-        None => true,
-        Some(flags) => flags[row],
+    let present_count = match &present {
+        None => nrows,
+        Some(flags) => flags.iter().filter(|flag| **flag).count(),
     };
-    let null_hit = null_ok && (0..nrows).any(|row| mask[row] && !row_present(row, &present));
+    let mut spans = vec![None; nrows];
     if present_count == 0 {
         expect_kind(bytes, cursor, 0)?;
-        if !null_hit {
-            return Ok(StringFilter::Miss);
-        }
-        return Ok(StringFilter::Values(vec![Scalar::Null; nrows]));
+        return Ok(spans);
     }
     let kind = read_u8(bytes, cursor)?;
     match kind {
         3 => {
-            let text = read_lp_str(bytes, cursor)?;
-            let hit = scalar_text_hit(allowed, text);
-            if !hit && !null_hit {
-                return Ok(StringFilter::Miss);
-            }
-            let copies = if hit {
-                mask.iter()
-                    .enumerate()
-                    .filter(|(row, keep)| **keep && row_present(*row, &present))
-                    .count()
-            } else {
-                0
-            };
-            let expanded = text
-                .len()
-                .checked_mul(copies)
-                .ok_or_else(|| Error::event("query response size limit exceeded"))?;
-            charge_string_bytes(budget, expanded)?;
-            let owned = if copies > 0 {
-                Some(text.to_owned())
-            } else {
-                None
-            };
-            let mut column = Vec::with_capacity(nrows);
-            for (row, keep) in mask.iter_mut().enumerate() {
-                if row_present(row, &present) {
-                    if *keep && hit {
-                        let source = owned.as_ref().map(|text| text.as_str()).unwrap_or("");
-                        column.push(Scalar::Str(source.to_owned()));
-                    } else {
-                        *keep = false;
-                        column.push(Scalar::Null);
-                    }
-                } else if *keep && null_ok {
-                    column.push(Scalar::Null);
-                } else {
-                    *keep = false;
-                    column.push(Scalar::Null);
+            let span = read_lp_span(bytes, cursor, validate_json)?;
+            for row in 0..nrows {
+                if row_is_present(&present, row) {
+                    spans[row] = Some(span);
                 }
             }
-            Ok(StringFilter::Values(column))
+            Ok(spans)
         }
         2 => {
-            let mut pending = Vec::new();
-            let mut saw = null_hit;
             for row in 0..nrows {
-                if !row_present(row, &present) {
-                    continue;
-                }
-                let text = read_lp_str(bytes, cursor)?;
-                if mask[row] && scalar_text_hit(allowed, text) {
-                    saw = true;
-                    pending.push((row, text));
+                if row_is_present(&present, row) {
+                    spans[row] = Some(read_lp_span(bytes, cursor, validate_json)?);
                 }
             }
-            if !saw {
-                for row in 0..nrows {
-                    mask[row] = false;
-                }
-                return Ok(StringFilter::Miss);
-            }
-            let mut expanded = 0usize;
-            for (_, text) in &pending {
-                expanded = expanded
-                    .checked_add(text.len())
-                    .ok_or_else(|| Error::event("query response size limit exceeded"))?;
-            }
-            charge_string_bytes(budget, expanded)?;
-            let mut column = vec![Scalar::Null; nrows];
-            for (row, text) in pending {
-                column[row] = Scalar::Str(text.to_owned());
-            }
-            for row in 0..nrows {
-                let null_kept = mask[row] && null_ok && !row_present(row, &present);
-                if !matches!(column[row], Scalar::Str(_)) && !null_kept {
-                    mask[row] = false;
-                }
-            }
-            Ok(StringFilter::Values(column))
+            Ok(spans)
         }
         1 => {
             let dict_len = read_varint(bytes, cursor)? as usize;
@@ -1405,63 +1348,93 @@ fn read_string_filter(
                 return Err(Error::corrupt("string dictionary is empty"));
             }
             let mut dict = Vec::with_capacity(dict_len);
-            let mut entry_hit = false;
             for _ in 0..dict_len {
-                let text = read_lp_str(bytes, cursor)?;
-                entry_hit |= scalar_text_hit(allowed, text);
-                dict.push(text);
+                dict.push(read_lp_span(bytes, cursor, validate_json)?);
             }
             let width = read_u8(bytes, cursor)? as usize;
             if !matches!(width, 1 | 2 | 4) {
                 return Err(Error::corrupt("string dictionary code width is invalid"));
             }
-            let mut codes = Vec::with_capacity(present_count);
-            for _ in 0..present_count {
-                let code = read_uint(bytes, cursor, width)?;
-                if code >= dict_len as u128 {
+            for row in 0..nrows {
+                if !row_is_present(&present, row) {
+                    continue;
+                }
+                let code = read_uint(bytes, cursor, width)? as usize;
+                if code >= dict.len() {
                     return Err(Error::corrupt("string dictionary code is out of range"));
                 }
-                codes.push(code as usize);
+                spans[row] = Some(dict[code]);
             }
-            if !entry_hit && !null_hit {
-                return Ok(StringFilter::Miss);
-            }
-            let mut expanded = 0usize;
-            let mut next = 0;
-            for row in 0..nrows {
-                if !row_present(row, &present) {
-                    continue;
-                }
-                let text = dict[codes[next]];
-                next += 1;
-                if mask[row] && scalar_text_hit(allowed, text) {
-                    expanded = expanded
-                        .checked_add(text.len())
-                        .ok_or_else(|| Error::event("query response size limit exceeded"))?;
-                }
-            }
-            charge_string_bytes(budget, expanded)?;
-            let mut column = vec![Scalar::Null; nrows];
-            let mut next = 0;
-            for row in 0..nrows {
-                if !row_present(row, &present) {
-                    if !(mask[row] && null_ok) {
-                        mask[row] = false;
-                    }
-                    continue;
-                }
-                let text = dict[codes[next]];
-                next += 1;
-                if mask[row] && scalar_text_hit(allowed, text) {
-                    column[row] = Scalar::Str(text.to_owned());
-                } else {
-                    mask[row] = false;
-                }
-            }
-            Ok(StringFilter::Values(column))
+            Ok(spans)
         }
         _ => Err(Error::corrupt(format!("unknown string encoding {kind}"))),
     }
+}
+
+fn mask_text_spans(
+    bytes: &[u8],
+    spans: &[Option<(usize, usize)>],
+    mask: &mut [bool],
+    allowed: &[Scalar],
+) {
+    let json = allowed.iter().any(|value| matches!(value, Scalar::Json(_)));
+    let null_ok = allowed.iter().any(|value| matches!(value, Scalar::Null));
+    for (row, span) in spans.iter().enumerate() {
+        if !mask[row] {
+            continue;
+        }
+        let keep = match span {
+            None => null_ok,
+            Some((start, end)) => {
+                let text = std::str::from_utf8(&bytes[*start..*end]).unwrap_or("");
+                scalar_text_hit(allowed, text, json)
+            }
+        };
+        if !keep {
+            mask[row] = false;
+        }
+    }
+}
+
+fn materialize_text_spans(
+    bytes: &[u8],
+    spans: &[Option<(usize, usize)>],
+    mask: &[bool],
+    budget: &mut usize,
+    json: bool,
+) -> Result<Vec<Scalar>> {
+    let mut expanded = 0usize;
+    for (row, span) in spans.iter().enumerate() {
+        if mask[row] {
+            if let Some((start, end)) = span {
+                expanded = expanded
+                    .checked_add(end - start)
+                    .ok_or_else(|| Error::event("query response size limit exceeded"))?;
+            }
+        }
+    }
+    charge_string_bytes(budget, expanded)?;
+    let mut column = Vec::with_capacity(spans.len());
+    for (row, span) in spans.iter().enumerate() {
+        if !mask[row] {
+            column.push(Scalar::Null);
+            continue;
+        }
+        match span {
+            None => column.push(Scalar::Null),
+            Some((start, end)) => {
+                let text = std::str::from_utf8(&bytes[*start..*end])
+                    .map_err(|_| Error::corrupt("string is not utf-8"))?
+                    .to_owned();
+                column.push(if json {
+                    Scalar::Json(text)
+                } else {
+                    Scalar::Str(text)
+                });
+            }
+        }
+    }
+    Ok(column)
 }
 
 fn present_stats(present: &Option<Vec<bool>>, nrows: usize) -> (usize, bool) {
@@ -2139,5 +2112,145 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.len(), 4);
+    }
+
+    fn null_timestamp_block(action_first: bool) -> (Schema, Vec<u8>) {
+        let schema = if action_first {
+            parse_schema(
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "action", "type": "string"},
+                        {"name": "ts", "type": "timestamp"}
+                    ]
+                }"#,
+            )
+            .unwrap()
+        } else {
+            parse_schema(
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "action", "type": "string"}
+                    ]
+                }"#,
+            )
+            .unwrap()
+        };
+        let (click_ts, view_ts) = if action_first {
+            (
+                vec![Scalar::Str("click".into()), Scalar::Timestamp(1000)],
+                vec![Scalar::Str("view".into()), Scalar::Null],
+            )
+        } else {
+            (
+                vec![Scalar::Timestamp(1000), Scalar::Str("click".into())],
+                vec![Scalar::Null, Scalar::Str("view".into())],
+            )
+        };
+        let rows = vec![
+            Row {
+                values: click_ts,
+                ts: 1000,
+            },
+            Row {
+                values: view_ts,
+                ts: 1000,
+            },
+        ];
+        let encoded = encode_block(&schema, &rows).unwrap();
+        (schema, encoded.bytes)
+    }
+
+    #[test]
+    fn filtered_query_rejects_null_timestamp_on_constant_miss() {
+        let (schema, bytes) = null_timestamp_block(false);
+        let full = decode_block(&schema, &bytes).unwrap_err().to_string();
+        assert!(full.contains("timestamp column is null or the wrong type"));
+        let filter = ColumnPredicate {
+            index: 0,
+            allowed: vec![Scalar::Timestamp(999)],
+        };
+        let filtered = decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[filter])
+            .unwrap_err()
+            .to_string();
+        assert!(filtered.contains("timestamp column is null or the wrong type"));
+    }
+
+    #[test]
+    fn filtered_query_rejects_null_timestamp_on_a_dropped_row() {
+        let (schema, bytes) = null_timestamp_block(true);
+        let full = decode_block(&schema, &bytes).unwrap_err().to_string();
+        assert!(full.contains("timestamp column is null or the wrong type"));
+        let filter = ColumnPredicate {
+            index: 0,
+            allowed: vec![Scalar::Str("click".into())],
+        };
+        let filtered = decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[filter])
+            .unwrap_err()
+            .to_string();
+        assert!(filtered.contains("timestamp column is null or the wrong type"));
+    }
+
+    #[test]
+    fn string_copies_are_charged_after_later_predicates() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "note", "type": "text"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let note = "n".repeat(32);
+        let rows: Vec<_> = (0..4)
+            .map(|id| {
+                parse_event(
+                    &schema,
+                    format!(r#"{{"ts":1000,"note":"{note}","user_id":{id}}}"#).as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let predicates = | | {
+            vec![
+                ColumnPredicate {
+                    index: 1,
+                    allowed: vec![Scalar::Str(note.clone())],
+                },
+                ColumnPredicate {
+                    index: 2,
+                    allowed: vec![Scalar::Int(1)],
+                },
+            ]
+        };
+        let err = decode_rows_in_range_filtered(
+            &schema,
+            &encoded.bytes,
+            i64::MIN,
+            i64::MAX,
+            note.len() - 1,
+            &predicates(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("query response size limit exceeded"));
+        let decoded = decode_rows_in_range_filtered(
+            &schema,
+            &encoded.bytes,
+            i64::MIN,
+            i64::MAX,
+            note.len(),
+            &predicates(),
+        )
+        .unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(matches!(&decoded[0].values[2], Scalar::Int(1)));
+        assert!(matches!(&decoded[0].values[1], Scalar::Str(text) if text == &note));
     }
 }
