@@ -3,6 +3,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::schema::Schema;
+use crate::zone::{self, BlockZone};
 
 pub const BLOCK_MAGIC: &[u8; 4] = b"EVBK";
 /// Block payload is a zstd frame compressed with the segment dictionary.
@@ -46,6 +48,8 @@ pub struct SegmentState {
     pub dict_bytes: u64,
     /// Scan saw at least one `EVBD` frame. A bad sidecar is fatal only then.
     pub uses_dict: bool,
+    /// Equality stats aligned with [`SegmentState::blocks`]. Empty means unknown.
+    pub zones: Vec<BlockZone>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +80,7 @@ impl Catalog {
             index_len: INDEX_HEADER_LEN as u64,
             dict_bytes: 0,
             uses_dict: false,
+            zones: Vec::new(),
         });
         self.index_bytes += INDEX_HEADER_LEN as u64;
     }
@@ -92,7 +97,8 @@ impl Catalog {
         self.data_bytes = self.data_bytes.saturating_add(nbytes);
     }
 
-    pub fn append_blocks(&mut self, metas: &[BlockMeta]) {
+    pub fn append_blocks(&mut self, metas: &[BlockMeta], zones: Vec<BlockZone>, zone_bytes: u64) {
+        let mut zones = zones.into_iter();
         for meta in metas {
             if self.segments.last().map(|segment| segment.id) != Some(meta.segment_id) {
                 self.note_new_segment(meta.segment_id);
@@ -102,11 +108,15 @@ impl Catalog {
             segment.data_len += add;
             segment.index_len += INDEX_ENTRY_LEN as u64;
             segment.blocks.push(meta.clone());
+            segment.zones.push(zones.next().unwrap_or(BlockZone {
+                columns: Vec::new(),
+            }));
             self.rows += u64::from(meta.row_count);
             self.blocks += 1;
             self.data_bytes += add;
             self.index_bytes += INDEX_ENTRY_LEN as u64;
         }
+        self.index_bytes = self.index_bytes.saturating_add(zone_bytes);
     }
 }
 
@@ -146,7 +156,7 @@ pub fn list_segment_ids(dir: &Path) -> Result<Vec<u32>> {
 }
 
 /// Load every segment, drop a torn tail, and rebuild the sparse index when it disagrees.
-pub fn load_catalog(dir: &Path) -> Result<Catalog> {
+pub fn load_catalog(dir: &Path, schema: &Schema) -> Result<Catalog> {
     let mut catalog = Catalog::empty();
     for id in list_segment_ids(dir)? {
         let data = data_path(dir, id);
@@ -174,8 +184,13 @@ pub fn load_catalog(dir: &Path) -> Result<Catalog> {
         if index_on_disk != index_len || !index_matches(&indexed, &blocks) {
             write_index(&index, &blocks)?;
         }
+        let dictionary = stored.as_ref().map(|dict| dict.bytes.as_slice());
+        let zones = zone::load_segment_zones(dir, id, &blocks, dictionary, schema)?;
+        let zone_len = fs::metadata(zone::zone_path(dir, id))
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         catalog.data_bytes += data_len.saturating_add(dict_bytes);
-        catalog.index_bytes += index_len;
+        catalog.index_bytes += index_len.saturating_add(zone_len);
         catalog.rows += blocks
             .iter()
             .map(|block| u64::from(block.row_count))
@@ -188,6 +203,7 @@ pub fn load_catalog(dir: &Path) -> Result<Catalog> {
             index_len,
             dict_bytes,
             uses_dict,
+            zones,
         });
     }
     Ok(catalog)

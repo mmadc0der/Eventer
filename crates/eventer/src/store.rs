@@ -93,7 +93,7 @@ impl Store {
         fs::create_dir_all(&dir)?;
         let schema = schema::load_schema(schema_path.as_ref())?;
         ensure_schema_lock(&dir, &schema)?;
-        let catalog = Arc::new(std::sync::Mutex::new(segment::load_catalog(&dir)?));
+        let catalog = Arc::new(std::sync::Mutex::new(segment::load_catalog(&dir, &schema)?));
         let pipeline = pipeline::spawn(PipelineConfig {
             dir: dir.clone(),
             schema: Arc::new(schema.clone()),
@@ -138,10 +138,11 @@ impl Store {
 
     /// Inclusive time range plus equality predicates.
     ///
-    /// Each predicate is applied while the block is decoded. If a filter column's
-    /// constant or dictionary cannot contain the requested value, the rest of that
-    /// block is not decoded. Unknown fields and values of the wrong column type
-    /// return [`Error::Schema`]. Checks run before [`Store::flush`].
+    /// Blocks whose zone map cannot contain the requested values are not read.
+    /// Each predicate on a block that is read is applied while the block is decoded.
+    /// If a filter column's constant or dictionary cannot contain the requested value,
+    /// the rest of that block is not decoded. Unknown fields and values of the wrong
+    /// column type return [`Error::Schema`]. Checks run before [`Store::flush`].
     pub fn query_with_filter(
         &self,
         from_ms: i64,
@@ -151,15 +152,7 @@ impl Store {
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(Vec::new());
         };
-        let blocks = {
-            let catalog = self.catalog();
-            catalog
-                .segments
-                .iter()
-                .flat_map(|segment| segment.blocks.iter().cloned())
-                .filter(|block| block.max_ts >= from_ms && block.min_ts <= to_ms)
-                .collect::<Vec<_>>()
-        };
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut rows_out = Vec::new();
         let mut response_bytes = 1usize;
         let mut dictionaries = HashMap::new();
@@ -227,15 +220,7 @@ impl Store {
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(b"[]".to_vec());
         };
-        let blocks = {
-            let catalog = self.catalog();
-            catalog
-                .segments
-                .iter()
-                .flat_map(|segment| segment.blocks.iter().cloned())
-                .filter(|block| block.max_ts >= from_ms && block.min_ts <= to_ms)
-                .collect::<Vec<_>>()
-        };
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut out = Vec::from(b"[");
         let mut wrote = false;
         let mut row_count = 0usize;
@@ -343,6 +328,32 @@ impl Store {
             None
         };
         segment::read_block_payload(&data_path, block, dictionary)
+    }
+
+    fn blocks_in_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &[ColumnPredicate],
+    ) -> Vec<segment::BlockMeta> {
+        let catalog = self.catalog();
+        let mut blocks = Vec::new();
+        for segment in &catalog.segments {
+            for (index, block) in segment.blocks.iter().enumerate() {
+                if block.max_ts < from_ms || block.min_ts > to_ms {
+                    continue;
+                }
+                if segment
+                    .zones
+                    .get(index)
+                    .is_some_and(|zone| !crate::zone::may_match(zone, resolved))
+                {
+                    continue;
+                }
+                blocks.push(block.clone());
+            }
+        }
+        blocks
     }
 
     fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
@@ -1018,6 +1029,87 @@ mod tests {
             .unwrap();
         assert_eq!(same.len(), 2);
         store.close().unwrap();
+    }
+
+    #[test]
+    fn equality_zone_skips_blocks_that_cannot_contain_the_value() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        let runs = 40i64;
+        let per_run = 32i64;
+        for run in 0..runs {
+            for seq in 0..per_run {
+                let ts = run * per_run + seq;
+                let action = format!("run-{run}");
+                store
+                    .append_json(&event(ts, Some(run), &action, Some("note"), "1.00"))
+                    .unwrap();
+            }
+        }
+        store.flush().unwrap();
+        assert!(store.stats().blocks >= runs as u64);
+
+        let predicates = [Predicate::Eq("action".into(), "run-7".into())];
+        let resolved = resolve_predicates(store.schema(), &predicates).unwrap();
+        let candidates = store.blocks_in_range(0, 10_000_000, &resolved);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "one run occupies one block and the zone map should keep only that block"
+        );
+        let rows = store.query_with_filter(0, 10_000_000, &predicates).unwrap();
+        assert_eq!(rows.len(), per_run as usize);
+        assert!(rows
+            .iter()
+            .all(|row| row_value(&store, row)["action"] == "run-7"));
+
+        let missing = [Predicate::Eq("action".into(), "run-missing".into())];
+        let resolved = resolve_predicates(store.schema(), &missing).unwrap();
+        assert!(store.blocks_in_range(0, 10_000_000, &resolved).is_empty());
+        assert!(store
+            .query_with_filter(0, 10_000_000, &missing)
+            .unwrap()
+            .is_empty());
+
+        let user = [Predicate::Eq("user_id".into(), Scalar::Int(7))];
+        let resolved = resolve_predicates(store.schema(), &user).unwrap();
+        assert_eq!(store.blocks_in_range(0, 10_000_000, &resolved).len(), 1);
+        assert_eq!(
+            store.query_with_filter(0, 10_000_000, &user).unwrap().len(),
+            per_run as usize
+        );
+        store.close().unwrap();
+
+        let zone_file = crate::zone::zone_path(&data, 1);
+        assert!(zone_file.exists());
+        fs::remove_file(&zone_file).unwrap();
+        let reopened = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        let resolved = resolve_predicates(reopened.schema(), &predicates).unwrap();
+        assert_eq!(reopened.blocks_in_range(0, 10_000_000, &resolved).len(), 1);
+        assert_eq!(
+            reopened
+                .query_with_filter(0, 10_000_000, &predicates)
+                .unwrap()
+                .len(),
+            per_run as usize
+        );
+        assert!(zone_file.exists(), "open rebuilds a missing zone map");
+        reopened.close().unwrap();
+
+        fs::write(&zone_file, b"not a zone map").unwrap();
+        let reopened = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        assert_eq!(
+            reopened
+                .query_with_filter(0, 10_000_000, &predicates)
+                .unwrap()
+                .len(),
+            per_run as usize
+        );
+        let resolved = resolve_predicates(reopened.schema(), &predicates).unwrap();
+        assert_eq!(reopened.blocks_in_range(0, 10_000_000, &resolved).len(), 1);
+        reopened.close().unwrap();
     }
 
     fn block_kinds(path: &Path) -> Vec<([u8; 4], i64, i64)> {
