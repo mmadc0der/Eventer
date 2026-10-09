@@ -1,0 +1,30 @@
+name: Close unsuccessful experiments
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/close-unsuccessful.yml
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close unsuccessful issues and draft pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh issue close 5 --repo mmadc0der/Eventer --reason "not planned" --comment "Opened by mistake. Not an experiment."
+          gh issue close 6 --repo mmadc0der/Eventer --reason "not planned" --comment "Unsuccessful. The per-block presence summary missed the query-time bar. Pull request 9 is already closed."
+          gh issue close 10 --repo mmadc0der/Eventer --reason "not planned" --comment "Unsuccessful. Dictionary encoding for float columns did not shrink the stock bench. Pull request 12 is already closed."
+          gh issue close 14 --repo mmadc0der/Eventer --reason "not planned" --comment "Unsuccessful. ALP decimal encoding stored a median 114590 bytes against 85635 on the text-dictionary tree. Do not reopen."
+          gh issue close 22 --repo mmadc0der/Eventer --reason "not planned" --comment "Unsuccessful. Capping the segment dictionary at 1024 bytes stored a median 14478 bytes against 13665. Do not reopen."
+          gh issue close 23 --repo mmadc0der/Eventer --reason "not planned" --comment "Unsuccessful. Chimp128 for float columns stored 213386 bytes against 13665. Do not reopen."
+          gh pr close 17 --repo mmadc0der/Eventer --comment "Unsuccessful. ALP decimal encoding stored a median 114590 bytes against 85635. Closed so it cannot be merged."
+          gh pr close 24 --repo mmadc0der/Eventer --comment "Unsuccessful. A 1024-byte dictionary cap stored a median 14478 bytes against 13665. Closed so it cannot be merged."
+          gh pr close 25 --repo mmadc0der/Eventer --comment "Unsuccessful. Chimp128 stored 213386 bytes against 13665. Closed so it cannot be merged."
