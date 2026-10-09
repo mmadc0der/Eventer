@@ -1189,23 +1189,125 @@ mod tests {
             .sum()
     }
 
-    fn block_kinds(path: &Path) -> Vec<([u8; 4], i64, i64)> {
-        let data = fs::read(path).unwrap();
-        let mut off = 0usize;
-        let mut out = Vec::new();
-        while off + segment::BLOCK_HEADER_LEN <= data.len() {
-            let magic: [u8; 4] = data[off..off + 4].try_into().unwrap();
-            if magic != *segment::BLOCK_MAGIC && magic != *segment::BLOCK_MAGIC_DICT {
-                break;
-            }
-            let compressed_len =
-                u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
-            let min_ts = i64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
-            let max_ts = i64::from_le_bytes(data[off + 24..off + 32].try_into().unwrap());
-            out.push((magic, min_ts, max_ts));
-            off += segment::BLOCK_HEADER_LEN + compressed_len;
-        }
-        out
+    fn block_kinds(dir: &Path, id: u32) -> Vec<([u8; 4], i64, i64)> {
+        let indexed = segment::read_index(&segment::index_path(dir, id)).unwrap();
+        let data = fs::read(segment::data_path(dir, id)).unwrap();
+        indexed
+            .into_iter()
+            .map(|meta| {
+                let off = meta.offset as usize;
+                let magic = data[off..off + 4].try_into().unwrap();
+                (magic, meta.min_ts, meta.max_ts)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn twelve_twenty_and_thirty_six_byte_frames_round_trip() {
+        let dir = TempDir::new();
+        let schema_path = write_schema(dir.path());
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let encoded = |ts: i64| {
+            let row =
+                crate::value::parse_event(&schema, &event(ts, Some(ts), "click", None, "1.00"))
+                    .unwrap();
+            crate::codec::encode_block(&schema, &[row]).unwrap()
+        };
+        let first = encoded(1_000);
+        let second = encoded(2_000);
+        let third = encoded(3_000);
+        let compressed_first = zstd::bulk::compress(&first.bytes, 1).unwrap();
+        let compressed_second = zstd::bulk::compress(&second.bytes, 1).unwrap();
+        let compressed_third = zstd::bulk::compress(&third.bytes, 1).unwrap();
+        let frame12 = segment::frame_block(&compressed_first, false).unwrap();
+        let frame20 = segment::frame_legacy_block(
+            &compressed_second,
+            second.bytes.len() as u32,
+            second.row_count,
+            second.min_ts,
+            second.max_ts,
+            false,
+            segment::BLOCK_HEADER_LEN_V20,
+        )
+        .unwrap();
+        let frame36 = segment::frame_legacy_block(
+            &compressed_third,
+            third.bytes.len() as u32,
+            third.row_count,
+            third.min_ts,
+            third.max_ts,
+            false,
+            segment::BLOCK_HEADER_LEN_V36,
+        )
+        .unwrap();
+        assert_eq!(frame12.len(), segment::BLOCK_HEADER_LEN + compressed_first.len());
+        assert_eq!(frame20.len(), segment::BLOCK_HEADER_LEN_V20 + compressed_second.len());
+        assert_eq!(frame36.len(), segment::BLOCK_HEADER_LEN_V36 + compressed_third.len());
+
+        let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
+        let mut write = |framed: &[u8],
+                         encoded: &crate::codec::EncodedBlock,
+                         compressed_len: u32,
+                         offset: u64| {
+            let meta = segment::BlockMeta {
+                segment_id: 1,
+                offset,
+                compressed_len,
+                uncompressed_len: encoded.bytes.len() as u32,
+                row_count: encoded.row_count,
+                min_ts: encoded.min_ts,
+                max_ts: encoded.max_ts,
+                header_len: (framed.len() - compressed_len as usize) as u8,
+            };
+            active.write_framed(framed, &meta).unwrap();
+        };
+        write(&frame12, &first, compressed_first.len() as u32, 0);
+        write(
+            &frame20,
+            &second,
+            compressed_second.len() as u32,
+            frame12.len() as u64,
+        );
+        write(
+            &frame36,
+            &third,
+            compressed_third.len() as u32,
+            (frame12.len() + frame20.len()) as u64,
+        );
+        active.flush_os(true).unwrap();
+        drop(active);
+
+        let data_file = segment::data_path(&data, 1);
+        let segment_bytes = fs::read(&data_file).unwrap();
+        let expect = |store: &Store| {
+            let rows = store.query(0, 10_000).unwrap();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(row_value(store, &rows[0])["ts"], 1_000);
+            assert_eq!(row_value(store, &rows[1])["ts"], 2_000);
+            assert_eq!(row_value(store, &rows[2])["ts"], 3_000);
+        };
+        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
+        expect(&store);
+        store.close().unwrap();
+        assert_eq!(fs::read(&data_file).unwrap(), segment_bytes);
+
+        fs::remove_file(segment::index_path(&data, 1)).unwrap();
+        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
+        expect(&store);
+        store.close().unwrap();
+        assert_eq!(
+            fs::read(&data_file).unwrap(),
+            segment_bytes,
+            "rebuilding a missing index must leave the segment bytes unchanged"
+        );
+        let rebuilt = segment::read_index(&segment::index_path(&data, 1)).unwrap();
+        assert_eq!(rebuilt.len(), 3);
+        assert_eq!(rebuilt[0].uncompressed_len, first.bytes.len() as u32);
+        assert_eq!(rebuilt[0].row_count, first.row_count);
+        assert_eq!(rebuilt[1].min_ts, 2_000);
+        assert_eq!(rebuilt[2].max_ts, 3_000);
     }
 
     #[test]
@@ -1223,15 +1325,7 @@ mod tests {
             .collect();
         let encoded = crate::codec::encode_block(&schema, &rows).unwrap();
         let compressed = zstd::bulk::compress(&encoded.bytes, 3).unwrap();
-        let framed = segment::frame_block(
-            &compressed,
-            encoded.bytes.len() as u32,
-            encoded.row_count,
-            encoded.min_ts,
-            encoded.max_ts,
-            false,
-        )
-        .unwrap();
+        let framed = segment::frame_block(&compressed, false).unwrap();
         assert_eq!(&framed[..4], segment::BLOCK_MAGIC);
         let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
         let meta = segment::BlockMeta {
@@ -1242,6 +1336,7 @@ mod tests {
             row_count: encoded.row_count,
             min_ts: encoded.min_ts,
             max_ts: encoded.max_ts,
+            header_len: segment::BLOCK_HEADER_LEN as u8,
         };
         active.write_framed(&framed, &meta).unwrap();
         active.flush_os(true).unwrap();
@@ -1312,7 +1407,7 @@ mod tests {
         let data = dir.path().join("data");
         let data_file = segment::data_path(&data, 1);
         let dict_file = segment::dictionary_path(&data, 1);
-        let kinds = block_kinds(&data_file);
+        let kinds = block_kinds(&data, 1);
         let first_dict = kinds
             .iter()
             .position(|(magic, _, _)| magic == segment::BLOCK_MAGIC_DICT)
@@ -1393,7 +1488,7 @@ mod tests {
         store.close().unwrap();
 
         let data_file = segment::data_path(&data, 1);
-        let kinds = block_kinds(&data_file);
+        let kinds = block_kinds(&data, 1);
         assert!(
             kinds.len() > 1,
             "expected the sample to span more than one block"
@@ -1464,23 +1559,7 @@ mod tests {
     }
 
     fn compressed_payloads(path: &Path) -> Vec<Vec<u8>> {
-        let data = fs::read(path).unwrap();
-        let mut off = 0usize;
-        let mut out = Vec::new();
-        while off + segment::BLOCK_HEADER_LEN <= data.len() {
-            let magic = &data[off..off + 4];
-            if magic != segment::BLOCK_MAGIC && magic != segment::BLOCK_MAGIC_DICT {
-                break;
-            }
-            let compressed_len =
-                u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
-            let start = off + segment::BLOCK_HEADER_LEN;
-            let end = start + compressed_len;
-            assert!(end <= data.len());
-            out.push(data[start..end].to_vec());
-            off = end;
-        }
-        out
+        segment::compressed_payloads(path).unwrap()
     }
 
     fn dir_file_lengths(dir: &Path) -> Vec<(String, u64)> {
@@ -1586,9 +1665,10 @@ mod tests {
 
     #[test]
     fn drop_blocks_before_merges_slices_of_the_same_segment() {
-        // One frame is 90 bytes. Rotating at 100 bytes inside the second flush
-        // leaves four catalog entries for two data files: the first commit's
-        // block, an empty placeholder, then the two frames of that flush.
+        // A one-row frame is smaller than 100 bytes, so the first flush stays
+        // on segment 1. The second flush appends one frame there, then rotates
+        // once that segment is past 100 bytes. That leaves four catalog
+        // entries for two data files.
         let open = |dir: &TempDir| {
             let schema = write_schema(dir.path());
             let data = dir.path().join("data");
@@ -1791,24 +1871,8 @@ mod tests {
             .unwrap()
             .compress(&second.bytes)
             .unwrap();
-        let frame1 = segment::frame_block(
-            &plain,
-            first.bytes.len() as u32,
-            first.row_count,
-            first.min_ts,
-            first.max_ts,
-            false,
-        )
-        .unwrap();
-        let frame2 = segment::frame_block(
-            &compressed,
-            second.bytes.len() as u32,
-            second.row_count,
-            second.min_ts,
-            second.max_ts,
-            true,
-        )
-        .unwrap();
+        let frame1 = segment::frame_block(&plain, false).unwrap();
+        let frame2 = segment::frame_block(&compressed, true).unwrap();
         assert_eq!(&frame2[..4], segment::BLOCK_MAGIC_DICT);
         let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
         let meta1 = segment::BlockMeta {
@@ -1819,6 +1883,7 @@ mod tests {
             row_count: first.row_count,
             min_ts: first.min_ts,
             max_ts: first.max_ts,
+            header_len: segment::BLOCK_HEADER_LEN as u8,
         };
         let meta2 = segment::BlockMeta {
             segment_id: 1,
@@ -1828,6 +1893,7 @@ mod tests {
             row_count: second.row_count,
             min_ts: second.min_ts,
             max_ts: second.max_ts,
+            header_len: segment::BLOCK_HEADER_LEN as u8,
         };
         active.write_framed(&frame1, &meta1).unwrap();
         active.write_framed(&frame2, &meta2).unwrap();

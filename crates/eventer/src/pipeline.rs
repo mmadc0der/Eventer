@@ -955,14 +955,7 @@ fn compress_block(
             acks: block.acks,
             error,
         },
-        Ok((compressed, used_dict)) => match frame_block(
-            &compressed,
-            block.raw.len() as u32,
-            block.row_count,
-            block.min_ts,
-            block.max_ts,
-            used_dict,
-        ) {
+        Ok((compressed, used_dict)) => match frame_block(&compressed, used_dict) {
             Ok(framed) => CompOut::Block(BlockOut {
                 seq: block.seq,
                 compressed_len: compressed.len() as u32,
@@ -1027,12 +1020,12 @@ fn merge_segment_slices(slices: &[&segment::SegmentState]) -> segment::SegmentSt
     let data_len = paired
         .iter()
         .map(|(block, _)| {
-            block.offset + BLOCK_HEADER_LEN as u64 + u64::from(block.compressed_len)
+            block.offset + u64::from(block.header_len) + u64::from(block.compressed_len)
         })
         .max()
         .unwrap_or(0);
-    let index_len = segment::INDEX_HEADER_LEN as u64
-        + paired.len() as u64 * segment::INDEX_ENTRY_LEN as u64;
+    let index_len =
+        segment::INDEX_HEADER_LEN as u64 + paired.len() as u64 * segment::INDEX_ENTRY_LEN as u64;
     let dict_bytes = slices
         .iter()
         .map(|slice| slice.dict_bytes)
@@ -1213,6 +1206,7 @@ impl Disk {
                     row_count: item.row_count,
                     min_ts: item.min_ts,
                     max_ts: item.max_ts,
+                    header_len: BLOCK_HEADER_LEN as u8,
                 };
                 segment.write_framed(&framed, &meta)?;
                 metas.push(meta);
@@ -1350,14 +1344,7 @@ impl Disk {
         if compressed.len() > u32::MAX as usize {
             return Err(Error::event("compressed block does not fit in u32"));
         }
-        let framed = frame_block(
-            &compressed,
-            item.uncompressed_len,
-            item.row_count,
-            item.min_ts,
-            item.max_ts,
-            dict.is_some(),
-        )?;
+        let framed = frame_block(&compressed, dict.is_some())?;
         Ok((framed, compressed.len() as u32))
     }
 

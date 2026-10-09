@@ -11,7 +11,12 @@ pub const BLOCK_MAGIC: &[u8; 4] = b"EVBK";
 pub const BLOCK_MAGIC_DICT: &[u8; 4] = b"EVBD";
 pub const DICT_MAGIC: &[u8; 4] = b"EVZD";
 pub const INDEX_MAGIC: &[u8; 4] = b"EVIX";
-pub const BLOCK_HEADER_LEN: usize = 36;
+/// New frames: magic, `compressed_len`, crc.
+pub const BLOCK_HEADER_LEN: usize = 12;
+/// magic, `uncompressed_len`, `compressed_len`, `row_count`, crc.
+pub const BLOCK_HEADER_LEN_V20: usize = 20;
+/// Older frames also store `min_ts` and `max_ts` ahead of the crc.
+pub const BLOCK_HEADER_LEN_V36: usize = 36;
 pub const INDEX_HEADER_LEN: usize = 8;
 pub const INDEX_ENTRY_LEN: usize = 40;
 pub const DICT_HEADER_LEN: usize = 16;
@@ -40,6 +45,8 @@ pub struct BlockMeta {
     pub row_count: u32,
     pub min_ts: i64,
     pub max_ts: i64,
+    /// On-disk header size. Not stored in the sparse index.
+    pub header_len: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +115,7 @@ impl Catalog {
                 self.note_new_segment(meta.segment_id);
             }
             let segment = self.segments.last_mut().expect("segment just inserted");
-            let add = BLOCK_HEADER_LEN as u64 + u64::from(meta.compressed_len);
+            let add = u64::from(meta.header_len) + u64::from(meta.compressed_len);
             segment.data_len += add;
             segment.index_len += INDEX_ENTRY_LEN as u64;
             segment.blocks.push(meta.clone());
@@ -165,7 +172,7 @@ pub fn load_catalog(dir: &Path, schema: &Schema) -> Result<Catalog> {
     for id in list_segment_ids(dir)? {
         let data = data_path(dir, id);
         let index = index_path(dir, id);
-        let (blocks, data_len, uses_dict) = scan_and_repair(&data, id)?;
+        let (frames, data_len, uses_dict) = scan_and_repair(&data, id)?;
         let stored = match read_dictionary(&dictionary_path(dir, id)) {
             Ok(stored) => stored,
             // A torn sidecar must not hide segments that never used a dictionary.
@@ -183,12 +190,23 @@ pub fn load_catalog(dir: &Path, schema: &Schema) -> Result<Catalog> {
         for block in &mut indexed {
             block.segment_id = id;
         }
-        let index_len = INDEX_HEADER_LEN as u64 + blocks.len() as u64 * INDEX_ENTRY_LEN as u64;
+        let index_len = INDEX_HEADER_LEN as u64 + frames.len() as u64 * INDEX_ENTRY_LEN as u64;
         let index_on_disk = fs::metadata(&index).map(|meta| meta.len()).unwrap_or(0);
-        if index_on_disk != index_len || !index_matches(&indexed, &blocks) {
-            write_index(&index, &blocks)?;
-        }
         let dictionary = stored.as_ref().map(|dict| dict.bytes.as_slice());
+        let blocks = if index_on_disk == index_len && index_supplies(&indexed, &frames) {
+            indexed
+                .into_iter()
+                .zip(frames.iter())
+                .map(|(mut block, frame)| {
+                    block.header_len = frame.header_len;
+                    block
+                })
+                .collect()
+        } else {
+            let blocks = recover_block_stats(&data, id, &frames, dictionary, schema)?;
+            write_index(&index, &blocks)?;
+            blocks
+        };
         let zones = zone::load_segment_zones(dir, id, &blocks, dictionary, schema)?;
         let zone_len = fs::metadata(zone::zone_path(dir, id))
             .map(|meta| meta.len())
@@ -213,22 +231,33 @@ pub fn load_catalog(dir: &Path, schema: &Schema) -> Result<Catalog> {
     Ok(catalog)
 }
 
-fn index_matches(indexed: &[BlockMeta], scanned: &[BlockMeta]) -> bool {
-    indexed.len() == scanned.len()
-        && indexed
-            .iter()
-            .zip(scanned.iter())
-            .all(|(left, right)| left == right)
+struct ScannedFrame {
+    offset: u64,
+    header_len: u8,
+    dictionary: bool,
+    compressed_len: u32,
+    uncompressed_len: Option<u32>,
+    row_count: Option<u32>,
+    min_ts: Option<i64>,
+    max_ts: Option<i64>,
 }
 
-pub fn frame_block(
-    compressed: &[u8],
-    uncompressed_len: u32,
-    row_count: u32,
-    min_ts: i64,
-    max_ts: i64,
-    dictionary: bool,
-) -> Result<Vec<u8>> {
+fn index_supplies(indexed: &[BlockMeta], frames: &[ScannedFrame]) -> bool {
+    indexed.len() == frames.len()
+        && indexed.iter().zip(frames.iter()).all(|(left, frame)| {
+            left.offset == frame.offset
+                && left.compressed_len == frame.compressed_len
+                && frame
+                    .uncompressed_len
+                    .is_none_or(|value| value == left.uncompressed_len)
+                && frame.row_count.is_none_or(|value| value == left.row_count)
+                && frame.min_ts.is_none_or(|value| value == left.min_ts)
+                && frame.max_ts.is_none_or(|value| value == left.max_ts)
+        })
+}
+
+/// New block frame: 4-byte magic, `compressed_len`, crc, then the payload.
+pub fn frame_block(compressed: &[u8], dictionary: bool) -> Result<Vec<u8>> {
     if compressed.len() > u32::MAX as usize {
         return Err(Error::event("compressed block does not fit in u32"));
     }
@@ -238,74 +267,262 @@ pub fn frame_block(
     } else {
         BLOCK_MAGIC
     });
+    out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc32fast::hash(compressed).to_le_bytes());
+    out.extend_from_slice(compressed);
+    debug_assert_eq!(out.len(), BLOCK_HEADER_LEN + compressed.len());
+    Ok(out)
+}
+
+/// A `20`-byte or `36`-byte frame. `min_ts` and `max_ts` are written only for `36`.
+#[cfg(test)]
+pub fn frame_legacy_block(
+    compressed: &[u8],
+    uncompressed_len: u32,
+    row_count: u32,
+    min_ts: i64,
+    max_ts: i64,
+    dictionary: bool,
+    header_len: usize,
+) -> Result<Vec<u8>> {
+    if compressed.len() > u32::MAX as usize {
+        return Err(Error::event("compressed block does not fit in u32"));
+    }
+    if header_len != BLOCK_HEADER_LEN_V20 && header_len != BLOCK_HEADER_LEN_V36 {
+        return Err(Error::corrupt("unsupported legacy block header"));
+    }
+    let mut out = Vec::with_capacity(header_len + compressed.len());
+    out.extend_from_slice(if dictionary {
+        BLOCK_MAGIC_DICT
+    } else {
+        BLOCK_MAGIC
+    });
     out.extend_from_slice(&uncompressed_len.to_le_bytes());
     out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
     out.extend_from_slice(&row_count.to_le_bytes());
-    out.extend_from_slice(&min_ts.to_le_bytes());
-    out.extend_from_slice(&max_ts.to_le_bytes());
-    let crc = crc32fast::hash(compressed);
-    out.extend_from_slice(&crc.to_le_bytes());
+    if header_len == BLOCK_HEADER_LEN_V36 {
+        out.extend_from_slice(&min_ts.to_le_bytes());
+        out.extend_from_slice(&max_ts.to_le_bytes());
+    }
+    out.extend_from_slice(&crc32fast::hash(compressed).to_le_bytes());
+    if out.len() != header_len {
+        return Err(Error::corrupt("legacy block header length mismatch"));
+    }
     out.extend_from_slice(compressed);
     Ok(out)
 }
 
-pub fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<BlockMeta>, u64, bool)> {
+fn scan_and_repair(path: &Path, _segment_id: u32) -> Result<(Vec<ScannedFrame>, u64, bool)> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let file_len = file.seek(SeekFrom::End(0))?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut offset = 0u64;
-    let mut blocks = Vec::new();
-    let mut uses_dict = false;
-    loop {
-        if offset >= file_len || file_len - offset < BLOCK_HEADER_LEN as u64 {
-            break;
-        }
-        let mut header = [0u8; BLOCK_HEADER_LEN];
-        file.seek(SeekFrom::Start(offset))?;
-        if file.read_exact(&mut header).is_err() {
-            break;
-        }
-        let dictionary_frame = if header[0..4] == BLOCK_MAGIC[..] {
-            false
-        } else if header[0..4] == BLOCK_MAGIC_DICT[..] {
-            true
-        } else {
-            break;
-        };
-        let uncompressed_len = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let compressed_len = u32::from_le_bytes(header[8..12].try_into().unwrap());
-        let row_count = u32::from_le_bytes(header[12..16].try_into().unwrap());
-        let min_ts = i64::from_le_bytes(header[16..24].try_into().unwrap());
-        let max_ts = i64::from_le_bytes(header[24..32].try_into().unwrap());
-        let crc = u32::from_le_bytes(header[32..36].try_into().unwrap());
-        let payload_end = offset + BLOCK_HEADER_LEN as u64 + u64::from(compressed_len);
-        if payload_end > file_len {
-            break;
-        }
-        let mut payload = vec![0u8; compressed_len as usize];
-        if file.read_exact(&mut payload).is_err() {
-            break;
-        }
-        if crc32fast::hash(&payload) != crc {
-            break;
-        }
-        blocks.push(BlockMeta {
-            segment_id,
-            offset,
-            compressed_len,
-            uncompressed_len,
-            row_count,
-            min_ts,
-            max_ts,
-        });
-        uses_dict |= dictionary_frame;
-        offset = payload_end;
-    }
+    let (frames, offset, uses_dict) = scan_frames(&mut file, file_len)?;
     if offset < file_len {
         file.set_len(offset)?;
         file.sync_all()?;
     }
-    Ok((blocks, offset, uses_dict))
+    Ok((frames, offset, uses_dict))
+}
+
+fn scan_frames(file: &mut File, file_len: u64) -> Result<(Vec<ScannedFrame>, u64, bool)> {
+    let mut offset = 0u64;
+    let mut frames = Vec::new();
+    let mut uses_dict = false;
+    loop {
+        if offset >= file_len {
+            break;
+        }
+        let Some(frame) = read_frame(file, offset, file_len)? else {
+            break;
+        };
+        let next = offset
+            .saturating_add(u64::from(frame.header_len))
+            .saturating_add(u64::from(frame.compressed_len));
+        uses_dict |= frame.dictionary;
+        frames.push(frame);
+        offset = next;
+    }
+    Ok((frames, offset, uses_dict))
+}
+
+fn read_frame(file: &mut File, offset: u64, file_len: u64) -> Result<Option<ScannedFrame>> {
+    if file_len.saturating_sub(offset) < 4 {
+        return Ok(None);
+    }
+    let mut magic = [0u8; 4];
+    file.seek(SeekFrom::Start(offset))?;
+    if file.read_exact(&mut magic).is_err() {
+        return Ok(None);
+    }
+    let dictionary = if magic == *BLOCK_MAGIC {
+        false
+    } else if magic == *BLOCK_MAGIC_DICT {
+        true
+    } else {
+        return Ok(None);
+    };
+    for header_len in [BLOCK_HEADER_LEN, BLOCK_HEADER_LEN_V20, BLOCK_HEADER_LEN_V36] {
+        if let Some(frame) = try_frame(file, offset, file_len, header_len, dictionary)? {
+            return Ok(Some(frame));
+        }
+    }
+    Ok(None)
+}
+
+fn try_frame(
+    file: &mut File,
+    offset: u64,
+    file_len: u64,
+    header_len: usize,
+    dictionary: bool,
+) -> Result<Option<ScannedFrame>> {
+    if file_len.saturating_sub(offset) < header_len as u64 {
+        return Ok(None);
+    }
+    let mut header = vec![0u8; header_len];
+    file.seek(SeekFrom::Start(offset))?;
+    if file.read_exact(&mut header).is_err() {
+        return Ok(None);
+    }
+    let (compressed_len, crc, uncompressed_len, row_count, min_ts, max_ts) = match header_len {
+        BLOCK_HEADER_LEN => (
+            u32::from_le_bytes(header[4..8].try_into().unwrap()),
+            u32::from_le_bytes(header[8..12].try_into().unwrap()),
+            None,
+            None,
+            None,
+            None,
+        ),
+        BLOCK_HEADER_LEN_V20 => (
+            u32::from_le_bytes(header[8..12].try_into().unwrap()),
+            u32::from_le_bytes(header[16..20].try_into().unwrap()),
+            Some(u32::from_le_bytes(header[4..8].try_into().unwrap())),
+            Some(u32::from_le_bytes(header[12..16].try_into().unwrap())),
+            None,
+            None,
+        ),
+        BLOCK_HEADER_LEN_V36 => (
+            u32::from_le_bytes(header[8..12].try_into().unwrap()),
+            u32::from_le_bytes(header[32..36].try_into().unwrap()),
+            Some(u32::from_le_bytes(header[4..8].try_into().unwrap())),
+            Some(u32::from_le_bytes(header[12..16].try_into().unwrap())),
+            Some(i64::from_le_bytes(header[16..24].try_into().unwrap())),
+            Some(i64::from_le_bytes(header[24..32].try_into().unwrap())),
+        ),
+        _ => return Ok(None),
+    };
+    let payload_end = offset + header_len as u64 + u64::from(compressed_len);
+    if payload_end > file_len {
+        return Ok(None);
+    }
+    let mut payload = vec![0u8; compressed_len as usize];
+    if file.read_exact(&mut payload).is_err() {
+        return Ok(None);
+    }
+    if crc32fast::hash(&payload) != crc {
+        return Ok(None);
+    }
+    let header_len = u8::try_from(header_len)
+        .map_err(|_| Error::corrupt("block header length does not fit in u8"))?;
+    Ok(Some(ScannedFrame {
+        offset,
+        header_len,
+        dictionary,
+        compressed_len,
+        uncompressed_len,
+        row_count,
+        min_ts,
+        max_ts,
+    }))
+}
+
+fn recover_block_stats(
+    path: &Path,
+    segment_id: u32,
+    frames: &[ScannedFrame],
+    dictionary: Option<&[u8]>,
+    schema: &Schema,
+) -> Result<Vec<BlockMeta>> {
+    let mut file = File::open(path)?;
+    let mut blocks = Vec::with_capacity(frames.len());
+    for frame in frames {
+        file.seek(SeekFrom::Start(frame.offset + u64::from(frame.header_len)))?;
+        let mut payload = vec![0u8; frame.compressed_len as usize];
+        file.read_exact(&mut payload)?;
+        let raw = if frame.dictionary {
+            let Some(dictionary) = dictionary else {
+                return Err(Error::corrupt(format!(
+                    "dictionary frame at offset {} in segment {segment_id} has no dictionary",
+                    frame.offset
+                )));
+            };
+            decompress_payload(&payload, Some(dictionary))?
+        } else {
+            decompress_payload(&payload, None)?
+        };
+        let uncompressed_len = u32::try_from(raw.len())
+            .map_err(|_| Error::corrupt("uncompressed block does not fit in u32"))?;
+        let row_count = u32::try_from(crate::codec::block_row_count(&raw)?)
+            .map_err(|_| Error::corrupt("block row count does not fit in u32"))?;
+        let rows = crate::codec::decode_block(schema, &raw)?;
+        if rows.len() != row_count as usize {
+            return Err(Error::corrupt(
+                "decoded block row count does not match its header",
+            ));
+        }
+        let min_ts = rows
+            .iter()
+            .map(|row| row.ts)
+            .min()
+            .ok_or_else(|| Error::corrupt("decoded block has no rows"))?;
+        let max_ts = rows
+            .iter()
+            .map(|row| row.ts)
+            .max()
+            .ok_or_else(|| Error::corrupt("decoded block has no rows"))?;
+        blocks.push(BlockMeta {
+            segment_id,
+            offset: frame.offset,
+            compressed_len: frame.compressed_len,
+            uncompressed_len,
+            row_count,
+            min_ts,
+            max_ts,
+            header_len: frame.header_len,
+        });
+    }
+    Ok(blocks)
+}
+
+#[cfg(test)]
+pub(crate) fn compressed_payloads(path: &Path) -> Result<Vec<Vec<u8>>> {
+    let mut file = File::open(path)?;
+    let file_len = file.seek(SeekFrom::End(0))?;
+    let (frames, _, _) = scan_frames(&mut file, file_len)?;
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        file.seek(SeekFrom::Start(frame.offset + u64::from(frame.header_len)))?;
+        let mut payload = vec![0u8; frame.compressed_len as usize];
+        file.read_exact(&mut payload)?;
+        out.push(payload);
+    }
+    Ok(out)
+}
+
+fn decompress_payload(payload: &[u8], dictionary: Option<&[u8]>) -> Result<Vec<u8>> {
+    if let Some(dictionary) = dictionary {
+        let mut decoder =
+            zstd::stream::read::Decoder::with_dictionary(std::io::Cursor::new(payload), dictionary)
+                .map_err(|err| {
+                    Error::corrupt(format!("zstd dictionary decompress failed: {err}"))
+                })?;
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut out)
+            .map_err(|err| Error::corrupt(format!("zstd dictionary decompress failed: {err}")))?;
+        Ok(out)
+    } else {
+        zstd::stream::decode_all(payload)
+            .map_err(|err| Error::corrupt(format!("zstd decompress failed: {err}")))
+    }
 }
 
 /// Dictionary bytes plus the on-disk sidecar length, which includes the header.
@@ -431,7 +648,7 @@ fn parse_dictionary_file(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(dict.to_vec())
 }
 
-fn read_index(path: &Path) -> Result<Vec<BlockMeta>> {
+pub(crate) fn read_index(path: &Path) -> Result<Vec<BlockMeta>> {
     let mut file = File::open(path)?;
     let mut header = [0u8; INDEX_HEADER_LEN];
     file.read_exact(&mut header)?;
@@ -465,6 +682,7 @@ fn decode_index_entry(entry: &[u8; INDEX_ENTRY_LEN]) -> Result<BlockMeta> {
         row_count: u32::from_le_bytes(entry[16..20].try_into().unwrap()),
         min_ts: i64::from_le_bytes(entry[24..32].try_into().unwrap()),
         max_ts: i64::from_le_bytes(entry[32..40].try_into().unwrap()),
+        header_len: 0,
     })
 }
 
@@ -675,7 +893,15 @@ fn write_kept_frames(
         if !keep_block {
             continue;
         }
-        let frame_len = BLOCK_HEADER_LEN
+        let header_len = block.header_len as usize;
+        if !matches!(
+            header_len,
+            BLOCK_HEADER_LEN | BLOCK_HEADER_LEN_V20 | BLOCK_HEADER_LEN_V36
+        ) {
+            discard_file(tmp);
+            return Err(Error::corrupt("block header length is invalid"));
+        }
+        let frame_len = header_len
             .checked_add(block.compressed_len as usize)
             .ok_or_else(|| Error::corrupt("block frame length overflow"))?;
         src.seek(SeekFrom::Start(block.offset))?;
@@ -689,8 +915,8 @@ fn write_kept_frames(
                 "block magic mismatch while retaining a segment",
             ));
         }
-        let compressed = &frame[BLOCK_HEADER_LEN..];
-        let crc = u32::from_le_bytes(frame[32..36].try_into().unwrap());
+        let compressed = &frame[header_len..];
+        let crc = u32::from_le_bytes(frame[header_len - 4..header_len].try_into().unwrap());
         if crc32fast::hash(compressed) != crc {
             discard_file(tmp);
             return Err(Error::corrupt("crc mismatch while retaining a segment"));
@@ -716,7 +942,14 @@ pub fn read_block_payload(
 ) -> Result<Vec<u8>> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(meta.offset))?;
-    let total = BLOCK_HEADER_LEN + meta.compressed_len as usize;
+    let header_len = meta.header_len as usize;
+    if !matches!(
+        header_len,
+        BLOCK_HEADER_LEN | BLOCK_HEADER_LEN_V20 | BLOCK_HEADER_LEN_V36
+    ) {
+        return Err(Error::corrupt("block header length is invalid"));
+    }
+    let total = header_len + meta.compressed_len as usize;
     let mut buf = vec![0u8; total];
     file.read_exact(&mut buf)?;
     let dictionary_frame = if buf[0..4] == BLOCK_MAGIC[..] {
@@ -726,20 +959,15 @@ pub fn read_block_payload(
     } else {
         return Err(Error::corrupt("block magic mismatch while reading"));
     };
-    let compressed = &buf[BLOCK_HEADER_LEN..];
-    let crc = u32::from_le_bytes(buf[32..36].try_into().unwrap());
+    let compressed = &buf[header_len..];
+    let crc = u32::from_le_bytes(buf[header_len - 4..header_len].try_into().unwrap());
     if crc32fast::hash(compressed) != crc {
         return Err(Error::corrupt(format!(
             "crc mismatch at offset {} in segment {}",
             meta.offset, meta.segment_id
         )));
     }
-    let uncompressed_len = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if uncompressed_len != meta.uncompressed_len {
-        return Err(Error::corrupt(
-            "uncompressed length does not match the index",
-        ));
-    }
+    let uncompressed_len = meta.uncompressed_len;
     if dictionary_frame {
         let Some(dictionary) = dictionary else {
             return Err(Error::corrupt(format!(
