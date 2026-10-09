@@ -709,6 +709,251 @@ fn write_index(path: &Path, blocks: &[BlockMeta]) -> Result<()> {
     Ok(())
 }
 
+/// Drop blocks whose `max_ts` is strictly less than `cutoff_ms`.
+///
+/// `None` means the segment file was removed. `Some` is the segment to keep,
+/// unchanged when no block was eligible. A mixed segment is published by
+/// renaming a finished temp file over the old data file. The index and zone
+/// map are renamed first, so a crash before the data rename still has the old
+/// `.dat`. Open then rebuilds the index from that file.
+pub(crate) fn drop_eligible_blocks(
+    dir: &Path,
+    segment: &SegmentState,
+    schema_crc: u32,
+    field_count: u16,
+    cutoff_ms: i64,
+) -> Result<Option<SegmentState>> {
+    if segment.blocks.is_empty() {
+        return Ok(Some(segment.clone()));
+    }
+    let keep: Vec<bool> = segment
+        .blocks
+        .iter()
+        .map(|block| block.max_ts >= cutoff_ms)
+        .collect();
+    if keep.iter().all(|keep_block| *keep_block) {
+        return Ok(Some(segment.clone()));
+    }
+    if keep.iter().all(|keep_block| !*keep_block) {
+        remove_segment_files(dir, segment.id)?;
+        return Ok(None);
+    }
+    let (blocks, data_len, uses_dict) = publish_retained_segment(
+        dir,
+        segment.id,
+        &segment.blocks,
+        &segment.zones,
+        schema_crc,
+        field_count,
+        &keep,
+    )?;
+    let zones = segment
+        .zones
+        .iter()
+        .zip(keep.iter())
+        .filter(|(_, keep_block)| **keep_block)
+        .map(|(zone, _)| zone.clone())
+        .collect();
+    Ok(Some(SegmentState {
+        id: segment.id,
+        blocks,
+        data_len,
+        index_len: INDEX_HEADER_LEN as u64
+            + keep.iter().filter(|keep_block| **keep_block).count() as u64 * INDEX_ENTRY_LEN as u64,
+        dict_bytes: segment.dict_bytes,
+        uses_dict,
+        zones,
+    }))
+}
+
+impl Catalog {
+    pub(crate) fn recompute_totals(&mut self, dir: &Path) {
+        self.rows = 0;
+        self.blocks = 0;
+        self.data_bytes = 0;
+        self.index_bytes = 0;
+        for segment in &self.segments {
+            self.rows += segment
+                .blocks
+                .iter()
+                .map(|block| u64::from(block.row_count))
+                .sum::<u64>();
+            self.blocks += segment.blocks.len() as u64;
+            self.data_bytes = self
+                .data_bytes
+                .saturating_add(segment.data_len)
+                .saturating_add(segment.dict_bytes);
+            let zone_len = fs::metadata(zone::zone_path(dir, segment.id))
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            self.index_bytes = self
+                .index_bytes
+                .saturating_add(segment.index_len)
+                .saturating_add(zone_len);
+        }
+    }
+}
+
+fn remove_segment_files(dir: &Path, id: u32) -> Result<()> {
+    // Unlink the data file first. After that, open no longer lists the segment,
+    // so a crash cannot resurrect its rows. Removing the dictionary first would
+    // make an `EVBD` segment fail to open if the data file were still present.
+    for path in [
+        data_path(dir, id),
+        index_path(dir, id),
+        zone::zone_path(dir, id),
+        dictionary_path(dir, id),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+fn publish_retained_segment(
+    dir: &Path,
+    id: u32,
+    blocks: &[BlockMeta],
+    zones: &[BlockZone],
+    schema_crc: u32,
+    field_count: u16,
+    keep: &[bool],
+) -> Result<(Vec<BlockMeta>, u64, bool)> {
+    let dat_tmp = dir.join(format!(".seg-{id:06}.dat.partial"));
+    let idx_tmp = dir.join(format!(".seg-{id:06}.idx.partial"));
+    let zon_tmp = dir.join(format!(".seg-{id:06}.zon.partial"));
+    let (kept, data_len, uses_dict) =
+        match write_kept_frames(&dat_tmp, &data_path(dir, id), blocks, keep) {
+            Ok(written) => written,
+            Err(err) => {
+                discard_file(&dat_tmp);
+                return Err(err);
+            }
+        };
+    if let Err(err) = write_index(&idx_tmp, &kept) {
+        discard_file(&dat_tmp);
+        discard_file(&idx_tmp);
+        return Err(err);
+    }
+    if let Err(err) =
+        zone::stage_kept_zones(dir, id, schema_crc, field_count, zones, keep, &zon_tmp)
+    {
+        discard_file(&dat_tmp);
+        discard_file(&idx_tmp);
+        discard_file(&zon_tmp);
+        return Err(err);
+    }
+    if uses_dict && read_dictionary(&dictionary_path(dir, id))?.is_none() {
+        discard_file(&dat_tmp);
+        discard_file(&idx_tmp);
+        discard_file(&zon_tmp);
+        return Err(Error::corrupt(format!(
+            "segment {id} keeps a dictionary frame but the dictionary file is missing"
+        )));
+    }
+    // Rename the index and zone map before the data file. A crash in between
+    // leaves the old `.dat`. The next open scans it and rebuilds a mismatched
+    // index, so the partial temp is never the file `open` treats as the segment.
+    if let Err(err) = fs::rename(&idx_tmp, index_path(dir, id)) {
+        discard_file(&dat_tmp);
+        discard_file(&idx_tmp);
+        discard_file(&zon_tmp);
+        return Err(err.into());
+    }
+    if let Err(err) = fs::rename(&zon_tmp, zone::zone_path(dir, id)) {
+        discard_file(&dat_tmp);
+        discard_file(&zon_tmp);
+        return Err(err.into());
+    }
+    if let Err(err) = fs::rename(&dat_tmp, data_path(dir, id)) {
+        discard_file(&dat_tmp);
+        return Err(err.into());
+    }
+    Ok((kept, data_len, uses_dict))
+}
+
+fn write_kept_frames(
+    tmp: &Path,
+    src_path: &Path,
+    blocks: &[BlockMeta],
+    keep: &[bool],
+) -> Result<(Vec<BlockMeta>, u64, bool)> {
+    let mut src = File::open(src_path)?;
+    let mut out = File::create(tmp)?;
+    let mut kept = Vec::new();
+    let mut offset = 0u64;
+    let mut uses_dict = false;
+    for (block, keep_block) in blocks.iter().zip(keep.iter()) {
+        if !keep_block {
+            continue;
+        }
+        let frame = read_kept_frame(&mut src, block).map_err(|err| {
+            discard_file(tmp);
+            err
+        })?;
+        if frame[0..4] == BLOCK_MAGIC_DICT[..] {
+            uses_dict = true;
+        }
+        out.write_all(&frame)?;
+        let mut meta = block.clone();
+        meta.offset = offset;
+        kept.push(meta);
+        offset += frame.len() as u64;
+    }
+    out.sync_all()?;
+    Ok((kept, offset, uses_dict))
+}
+
+/// Copy one on-disk frame. New frames are 20 bytes; a legacy frame is 36.
+/// The CRC sits at offset 16 or 32 to match that header.
+fn read_kept_frame(src: &mut File, block: &BlockMeta) -> Result<Vec<u8>> {
+    let file_len = src.metadata()?.len();
+    if block.offset >= file_len {
+        return Err(Error::corrupt(
+            "block offset is past the end of the segment while retaining",
+        ));
+    }
+    let available = (file_len - block.offset) as usize;
+    let compressed_len = block.compressed_len as usize;
+    let new_total = BLOCK_HEADER_LEN
+        .checked_add(compressed_len)
+        .ok_or_else(|| Error::corrupt("block frame length overflow"))?;
+    let old_total = BLOCK_HEADER_LEN_V1
+        .checked_add(compressed_len)
+        .ok_or_else(|| Error::corrupt("block frame length overflow"))?;
+    if available < new_total {
+        return Err(Error::corrupt("truncated block while retaining a segment"));
+    }
+    let want = old_total.min(available);
+    src.seek(SeekFrom::Start(block.offset))?;
+    let mut buf = vec![0u8; want];
+    src.read_exact(&mut buf)?;
+    if buf[0..4] != BLOCK_MAGIC[..] && buf[0..4] != BLOCK_MAGIC_DICT[..] {
+        return Err(Error::corrupt(
+            "block magic mismatch while retaining a segment",
+        ));
+    }
+    let Some(parsed) = parse_framed_block(&buf) else {
+        return Err(Error::corrupt("crc mismatch while retaining a segment"));
+    };
+    if parsed.compressed_len != block.compressed_len {
+        return Err(Error::corrupt("crc mismatch while retaining a segment"));
+    }
+    let frame_len = parsed
+        .header_len
+        .checked_add(parsed.compressed_len as usize)
+        .ok_or_else(|| Error::corrupt("block frame length overflow"))?;
+    buf.truncate(frame_len);
+    Ok(buf)
+}
+
+fn discard_file(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
 pub fn read_block_payload(
     path: &Path,
     meta: &BlockMeta,
