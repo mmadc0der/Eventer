@@ -538,6 +538,59 @@ fn parse_zone_file(
     Ok(zones)
 }
 
+/// Write zone records for the blocks that survive retention.
+///
+/// Copies the on-disk record bytes when the sidecar matches the segment.
+/// Otherwise encodes the in-memory stats for those blocks. The caller renames
+/// `tmp` into place.
+pub(crate) fn stage_kept_zones(
+    dir: &Path,
+    segment_id: u32,
+    schema_crc: u32,
+    field_count: u16,
+    zones: &[BlockZone],
+    keep: &[bool],
+    tmp: &Path,
+) -> Result<()> {
+    let path = zone_path(dir, segment_id);
+    let raw = if zones.len() == keep.len() {
+        fs::read(&path)
+            .ok()
+            .and_then(|bytes| plain_zone_bytes(&bytes).ok())
+            .and_then(|plain| split_zone_records(&plain, schema_crc, field_count, zones.len()).ok())
+            .map(|records| {
+                let mut raw = header(schema_crc, field_count).to_vec();
+                for (record, keep_block) in records.iter().zip(keep.iter()) {
+                    if *keep_block {
+                        raw.extend_from_slice(record);
+                    }
+                }
+                raw
+            })
+    } else {
+        None
+    };
+    let raw = match raw {
+        Some(raw) => raw,
+        None => {
+            let mut raw = header(schema_crc, field_count).to_vec();
+            for (zone, keep_block) in zones.iter().zip(keep.iter()) {
+                if *keep_block {
+                    write_record(&mut raw, zone)?;
+                }
+            }
+            raw
+        }
+    };
+    // The caller renames `tmp` onto the zone path, so the bytes here are the
+    // stored form, including a plain zstd frame when that frame is smaller.
+    let stored = compress_zone_if_smaller(&raw);
+    let mut file = File::create(tmp)?;
+    file.write_all(&stored)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn write_zone_file(
     path: &Path,
     schema_crc: u32,
@@ -565,6 +618,60 @@ fn persist_zone_bytes(path: &Path, raw: &[u8], sync: bool) -> Result<u64> {
     }
     fs::rename(&tmp, path)?;
     Ok(stored.len() as u64)
+}
+
+/// Each item is one on-disk record, including its length and checksum prefix.
+fn split_zone_records(
+    bytes: &[u8],
+    expect_crc: u32,
+    field_count: u16,
+    block_count: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if bytes.len() < ZONE_HEADER_LEN {
+        return Err(Error::corrupt("truncated zone map"));
+    }
+    if &bytes[0..4] != ZONE_MAGIC {
+        return Err(Error::corrupt("zone map magic mismatch"));
+    }
+    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+    if version != ZONE_VERSION {
+        return Err(Error::corrupt(format!(
+            "unsupported zone map version {version}"
+        )));
+    }
+    let stored_crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let stored_fields = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
+    if stored_crc != expect_crc || stored_fields != field_count {
+        return Err(Error::corrupt("zone map does not match the schema"));
+    }
+    let mut cursor = ZONE_HEADER_LEN;
+    let mut records = Vec::with_capacity(block_count);
+    while cursor < bytes.len() {
+        if bytes.len() - cursor < 8 {
+            return Err(Error::corrupt("truncated zone map record"));
+        }
+        let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let end = cursor
+            .checked_add(8)
+            .and_then(|start| start.checked_add(len))
+            .ok_or_else(|| Error::corrupt("zone map record length overflow"))?;
+        if end > bytes.len() {
+            return Err(Error::corrupt("truncated zone map record"));
+        }
+        let payload = &bytes[cursor + 8..end];
+        let crc = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
+        if crc32fast::hash(payload) != crc {
+            return Err(Error::corrupt("zone map record checksum mismatch"));
+        }
+        records.push(bytes[cursor..end].to_vec());
+        cursor = end;
+    }
+    if records.len() != block_count {
+        return Err(Error::corrupt(
+            "zone map block count does not match the segment",
+        ));
+    }
+    Ok(records)
 }
 
 fn header(schema_crc: u32, field_count: u16) -> [u8; ZONE_HEADER_LEN] {
