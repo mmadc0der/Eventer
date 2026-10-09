@@ -1403,15 +1403,26 @@ impl Disk {
         // unlink a file that another slice of the same id still needs.
         let merged = union_catalog_segments(&catalog.segments);
         let mut kept = Vec::with_capacity(merged.len());
-        for segment in &merged {
-            if let Some(state) = segment::drop_eligible_blocks(
+        for (index, segment) in merged.iter().enumerate() {
+            match segment::drop_eligible_blocks(
                 &self.dir,
                 segment,
                 self.schema_crc,
                 self.field_count,
                 cutoff_ms,
-            )? {
-                kept.push(state);
+            ) {
+                Ok(Some(state)) => kept.push(state),
+                Ok(None) => {}
+                Err(err) => {
+                    // Files for `kept` are already published, and this segment may
+                    // have lost its data file. Leave it out. Segments not visited
+                    // yet still match the files on disk, so queries must keep
+                    // using those entries instead of the pre-call catalog.
+                    kept.extend(merged[index + 1..].iter().cloned());
+                    catalog.segments = kept;
+                    catalog.recompute_totals(&self.dir);
+                    return Err(err);
+                }
             }
         }
         catalog.segments = kept;
@@ -1436,17 +1447,31 @@ impl Disk {
                 // Reopen even when the segment is already past the rotation limit.
                 // The next append then rotates the same way it did before this call,
                 // including clearing a segment dictionary that belongs to this id.
-                self.active = Some(ActiveSegment::open_existing(&self.dir, &state)?);
-                Ok(())
+                match ActiveSegment::open_existing(&self.dir, &state) {
+                    Ok(segment) => {
+                        self.active = Some(segment);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        // Same as a segment this call fully deleted: the next
+                        // prepare must not frame `EVBD` with the old dictionary.
+                        self.forget_active_segment();
+                        Err(err)
+                    }
+                }
             }
             None => {
-                self.dict = None;
-                self.dict_compressor = None;
-                self.segment_epoch = self.publish.bump_and_clear();
-                self.active = None;
+                self.forget_active_segment();
                 Ok(())
             }
         }
+    }
+
+    fn forget_active_segment(&mut self) {
+        self.dict = None;
+        self.dict_compressor = None;
+        self.segment_epoch = self.publish.bump_and_clear();
+        self.active = None;
     }
 
     fn dictionary_installed(&self) -> bool {

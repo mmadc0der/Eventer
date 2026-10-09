@@ -1610,6 +1610,49 @@ mod tests {
     }
 
     #[test]
+    fn drop_blocks_before_keeps_catalog_when_a_later_segment_fails() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let mut options = test_options(1);
+        options.segment_bytes = 1;
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        for ts in [1_000, 2_000, 3_000] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let present: Vec<u32> = (1..8)
+            .filter(|id| segment::data_path(&data, *id).exists())
+            .collect();
+        assert!(
+            present.len() >= 3,
+            "expected one data file per event, found {present:?}"
+        );
+        let blocked = segment::data_path(&data, present[1]);
+        fs::remove_file(&blocked).unwrap();
+        fs::create_dir(&blocked).unwrap();
+
+        let err = store.drop_blocks_before(i64::MAX).unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::Io(_)),
+            "expected the blocked unlink to fail the drop, got {err:?}"
+        );
+        assert!(
+            !segment::data_path(&data, present[0]).exists(),
+            "the segment published before the error must stay deleted"
+        );
+        // `query` flushes first and observes the poison flag. Stats read the
+        // catalog directly, which is what a query would walk if it ignored poison.
+        assert_eq!(
+            store.stats().rows, 1,
+            "deleted and failed segments must leave the catalog; the unvisited one stays"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
     fn drop_blocks_before_respects_cutoffs_outside_the_store() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
