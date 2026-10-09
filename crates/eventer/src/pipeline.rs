@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -13,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{
     self, frame_block, read_dictionary, ActiveSegment, BlockMeta, Catalog, BLOCK_HEADER_LEN,
-    DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX, DICT_TRAIN_MAX_BYTES,
+    DICT_MAX_BYTES, DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX, DICT_TRAIN_MAX_BYTES,
 };
 use crate::value::{parse_event, Row, Scalar};
 
@@ -83,42 +82,114 @@ struct BlockOut {
     acks: Vec<Option<Ack>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictPhase {
+    /// Still accepting sample blocks. Nothing is trained yet.
+    Open,
+    Training,
+    Ready,
+    /// Training finished without a usable dictionary. Plain frames stay correct.
+    Abandoned,
+}
+
+struct DictState {
+    epoch: u32,
+    phase: DictPhase,
+    current: Option<Arc<Vec<u8>>>,
+}
+
 struct DictPublish {
-    epoch: AtomicU32,
-    current: Mutex<Option<(u32, Arc<Vec<u8>>)>>,
+    state: Mutex<DictState>,
+    cv: Condvar,
 }
 
 impl DictPublish {
     fn new() -> Self {
         Self {
-            epoch: AtomicU32::new(0),
-            current: Mutex::new(None),
+            state: Mutex::new(DictState {
+                epoch: 0,
+                phase: DictPhase::Open,
+                current: None,
+            }),
+            cv: Condvar::new(),
         }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, DictState> {
+        self.state.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
     fn epoch(&self) -> u32 {
-        self.epoch.load(Ordering::Acquire)
+        self.lock().epoch
     }
 
     fn lookup(&self, epoch: u32) -> Option<Arc<Vec<u8>>> {
-        let guard = self.current.lock().unwrap_or_else(|err| err.into_inner());
-        match guard.as_ref() {
-            Some((stored, dict)) if *stored == epoch => Some(Arc::clone(dict)),
-            _ => None,
+        let guard = self.lock();
+        if guard.epoch == epoch && guard.phase == DictPhase::Ready {
+            guard.current.clone()
+        } else {
+            None
         }
     }
 
     fn set(&self, epoch: u32, dict: Arc<Vec<u8>>) {
-        let mut guard = self.current.lock().unwrap_or_else(|err| err.into_inner());
-        if self.epoch.load(Ordering::Acquire) == epoch {
-            *guard = Some((epoch, dict));
+        let mut guard = self.lock();
+        if guard.epoch == epoch {
+            guard.current = Some(dict);
+            guard.phase = DictPhase::Ready;
+            self.cv.notify_all();
+        }
+    }
+
+    fn begin_training(&self, epoch: u32) -> bool {
+        let mut guard = self.lock();
+        if guard.epoch != epoch || guard.phase != DictPhase::Open {
+            return false;
+        }
+        guard.phase = DictPhase::Training;
+        self.cv.notify_all();
+        true
+    }
+
+    fn finish_training(&self, epoch: u32, dict: Option<Arc<Vec<u8>>>) {
+        let mut guard = self.lock();
+        if guard.epoch != epoch || guard.phase != DictPhase::Training {
+            self.cv.notify_all();
+            return;
+        }
+        match dict {
+            Some(dict) if !dict.is_empty() && dict.len() <= DICT_MAX_BYTES => {
+                guard.current = Some(dict);
+                guard.phase = DictPhase::Ready;
+            }
+            _ => {
+                guard.current = None;
+                guard.phase = DictPhase::Abandoned;
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    /// `Ready` or `Abandoned`: the writer can frame held blocks.
+    fn training_decided(&self, epoch: u32) -> bool {
+        let guard = self.lock();
+        guard.epoch == epoch && matches!(guard.phase, DictPhase::Ready | DictPhase::Abandoned)
+    }
+
+    fn wait_while_training(&self, epoch: u32) {
+        let mut guard = self.lock();
+        while guard.epoch == epoch && guard.phase == DictPhase::Training {
+            guard = self.cv.wait(guard).unwrap_or_else(|err| err.into_inner());
         }
     }
 
     fn bump_and_clear(&self) -> u32 {
-        let mut guard = self.current.lock().unwrap_or_else(|err| err.into_inner());
-        *guard = None;
-        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+        let mut guard = self.lock();
+        guard.current = None;
+        guard.phase = DictPhase::Open;
+        guard.epoch = guard.epoch.saturating_add(1);
+        self.cv.notify_all();
+        guard.epoch
     }
 }
 
@@ -195,20 +266,30 @@ impl DictSampler {
             return;
         }
         let epoch = self.epoch;
-        // Training is off the append path. Later blocks pick up the dictionary
-        // once `publish` shows it; blocks already sealed stay plain.
-        let _ = thread::Builder::new()
+        // Training stays off the append path. The writer holds blocks that are
+        // not fsynced yet and frames them with the dictionary when it lands.
+        // A failed train leaves those blocks as plain `EVBK`.
+        if !publish.begin_training(epoch) {
+            return;
+        }
+        let publish_thread = Arc::clone(&publish);
+        let spawned = thread::Builder::new()
             .name("eventer-dict".into())
             .spawn(move || {
-                let Ok(bytes) = zstd::dict::from_continuous(&sample, &sizes, DICT_TRAIN_MAX_BYTES)
-                else {
-                    return;
+                let trained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    zstd::dict::from_continuous(&sample, &sizes, DICT_TRAIN_MAX_BYTES).ok()
+                }));
+                let dict = match trained {
+                    Ok(Some(bytes)) if !bytes.is_empty() && bytes.len() <= DICT_TRAIN_MAX_BYTES => {
+                        Some(Arc::new(bytes))
+                    }
+                    _ => None,
                 };
-                if bytes.is_empty() || bytes.len() > DICT_TRAIN_MAX_BYTES {
-                    return;
-                }
-                publish.set(epoch, Arc::new(bytes));
+                publish_thread.finish_training(epoch, dict);
             });
+        if spawned.is_err() {
+            publish.finish_training(epoch, None);
+        }
     }
 }
 
@@ -997,19 +1078,21 @@ impl Disk {
         }
     }
 
-    /// Plain frames stay plain. A dictionary frame is stored only when it was
-    /// trained for this segment's epoch. The sidecar is fsynced before that frame.
+    /// Frames that are not fsynced yet are rewritten with the segment dictionary
+    /// once training finishes, including the blocks whose bytes were the sample.
+    /// A block already fsynced as `EVBK` is never passed back through here.
+    /// The sidecar is fsynced before the first `EVBD` frame.
     fn frame_for(&mut self, item: &mut BlockOut) -> Result<(Vec<u8>, u32)> {
         if item.raw.len() != item.uncompressed_len as usize {
             return Err(Error::corrupt(
                 "uncompressed block length does not match its frame",
             ));
         }
-        if item.epoch == self.segment_epoch {
-            if let Some(dict) = item.dict.clone() {
-                if self.dict.is_none() {
-                    self.install_dictionary(dict)?;
-                }
+        if self.dict.is_none() && item.epoch == self.segment_epoch {
+            if let Some(dict) = self.publish.lookup(self.segment_epoch) {
+                self.install_dictionary(dict)?;
+            } else if let Some(dict) = item.dict.clone() {
+                self.install_dictionary(dict)?;
             }
         }
         if self.dict.is_some() {
@@ -1104,6 +1187,18 @@ impl Disk {
         }
         Ok(())
     }
+
+    fn dictionary_installed(&self) -> bool {
+        self.dict.is_some()
+    }
+
+    fn wait_while_training(&self) {
+        self.publish.wait_while_training(self.segment_epoch);
+    }
+
+    fn training_decided(&self) -> bool {
+        self.publish.training_decided(self.segment_epoch)
+    }
 }
 
 fn writer_loop(rx: Receiver<CompOut>, mut disk: Disk, linger: Duration) {
@@ -1126,6 +1221,7 @@ fn writer_loop(rx: Receiver<CompOut>, mut disk: Disk, linger: Duration) {
             pending.insert(comp_out_seq(&msg), msg);
         }
         if disconnected && !pending.contains_key(&next) {
+            disk.wait_while_training();
             let _ = disk.commit(&mut batch, true);
             for msg in pending.into_values() {
                 match msg {
@@ -1166,7 +1262,15 @@ fn writer_loop(rx: Receiver<CompOut>, mut disk: Disk, linger: Duration) {
                 .iter()
                 .any(|block| block.acks.iter().any(|ack| ack.is_some()));
             let force = control.is_some();
-            if !batch.is_empty() && (force || durable || batch.len() >= WRITE_BATCH_BLOCKS || idle)
+            // An fsync closes the framing choice: wait out an in-flight train, then
+            // write. Until then, keep unfsynced blocks in memory so the sample can
+            // still be stored as `EVBD`. Blocks already fsynced stay on disk.
+            if force || durable {
+                disk.wait_while_training();
+            }
+            let decided = disk.dictionary_installed() || disk.training_decided();
+            if !batch.is_empty()
+                && (force || durable || (decided && (batch.len() >= WRITE_BATCH_BLOCKS || idle)))
             {
                 let _ = disk.commit(&mut batch, force || durable);
             }
