@@ -122,6 +122,22 @@ impl Store {
         self.pipeline.append(json, true)
     }
 
+    /// Parse every event, queue the batch, and fsync it once.
+    ///
+    /// Each event is checked against the schema before any of them is queued.
+    /// An empty batch is an error and does not touch the pipeline. The writer
+    /// fsyncs when the last event's block is committed, so earlier events in the
+    /// same batch share that sync.
+    pub fn append_json_batch_durable(&self, events: &[impl AsRef<[u8]>]) -> Result<()> {
+        if events.is_empty() {
+            return Err(Error::event("event batch must not be empty"));
+        }
+        for event in events {
+            value::parse_event(&self.schema, event.as_ref())?;
+        }
+        self.pipeline.append_batch_durable(events)
+    }
+
     /// Force a partial block out and fsync it.
     pub fn flush(&self) -> Result<()> {
         self.pipeline.flush()

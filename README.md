@@ -56,7 +56,7 @@ mkdir -p data
 cargo run -p eventer-server -- --data ./data --schema examples/schema.json --bind 127.0.0.1:43123
 ```
 
-`POST /events` takes one JSON object and returns after that event is fsynced.
+`POST /events` takes one JSON object, or a JSON array of objects, and returns after that write is fsynced. An object responds with `{"ok":true}`. An array is validated in full before any row is queued, then stored with one fsync, and responds with `{"ok":true,"count":N}`. An empty array, or an array containing a value that is not an object or does not match the schema, is rejected and leaves the store unchanged.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:43123/events \
@@ -129,7 +129,7 @@ Stored size was identical across the runs (394,005 data bytes, 49 blocks, one se
 
 ## Rust API
 
-`Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced; the HTTP `POST` uses it. `Store::query(from_ms, to_ms)` returns matching [`Row`] values in ingest order; use [`RowSerializable`] or [`row_to_json_bytes`] when you need the original JSON lexemes (including duplicate keys). `Store::query_json` returns the same data as one JSON array for HTTP.
+`Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced. `Store::append_json_batch_durable` parses every event before queueing any of them, then fsyncs the batch once. A one-object HTTP `POST` uses the single-event path. An array `POST` uses the batch path. `Store::query(from_ms, to_ms)` returns matching [`Row`] values in ingest order; use [`RowSerializable`] or [`row_to_json_bytes`] when you need the original JSON lexemes (including duplicate keys). `Store::query_json` returns the same data as one JSON array for HTTP.
 
 `Store::query_with_filter` adds equality predicates. Several predicates are AND-ed. `Predicate::Eq("type".into(), "assistant".into())` keeps one value. `Predicate::In` keeps any listed value. `Scalar::Null` matches null. The zone map skips a block that cannot contain those values. A block that is read, and whose filter column is a constant or dictionary that does not contain the value, is not fully decoded, so later text columns stay unread. The C equivalent is `eventer_query_filtered` for one string or text column.
 

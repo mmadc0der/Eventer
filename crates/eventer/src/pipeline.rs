@@ -453,6 +453,38 @@ impl Pipeline {
         }
     }
 
+    /// Queue `events` back to back and wait until the last one is fsynced.
+    ///
+    /// Only the last event carries an ack, so the writer syncs once for the
+    /// batch instead of once per event. Callers must already have validated
+    /// every event: a parse failure after the send has started cannot unqueue
+    /// the events that landed before it.
+    pub fn append_batch_durable(&self, events: &[impl AsRef<[u8]>]) -> Result<()> {
+        if events.is_empty() {
+            return Err(Error::event("event batch must not be empty"));
+        }
+        let (ack_tx, ack_rx) = mpsc::channel();
+        {
+            let guard = self.tx.lock().unwrap_or_else(|err| err.into_inner());
+            let tx = guard.as_ref().ok_or(Error::Closed)?;
+            let last = events.len() - 1;
+            for (index, event) in events.iter().enumerate() {
+                tx.send(Cmd::Event {
+                    json: event.as_ref().to_vec(),
+                    ack: if index == last {
+                        Some(ack_tx.clone())
+                    } else {
+                        None
+                    },
+                })
+                .map_err(|_| Error::Closed)?;
+            }
+        }
+        drop(ack_tx);
+        ack_rx.recv().map_err(|_| Error::Closed)??;
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.fail_if_poisoned()?;
         let tx = self.sender()?;
