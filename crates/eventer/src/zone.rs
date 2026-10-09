@@ -457,6 +457,43 @@ fn parse_zone_file(
     Ok(zones)
 }
 
+/// Write zone records for the blocks that survive retention.
+///
+/// Copies the on-disk record bytes when the sidecar matches the segment.
+/// Otherwise encodes the in-memory stats for those blocks. The caller renames
+/// `tmp` into place.
+pub(crate) fn stage_kept_zones(
+    dir: &Path,
+    segment_id: u32,
+    schema_crc: u32,
+    field_count: u16,
+    zones: &[BlockZone],
+    keep: &[bool],
+    tmp: &Path,
+) -> Result<()> {
+    let path = zone_path(dir, segment_id);
+    if zones.len() == keep.len() {
+        if let Ok(bytes) = fs::read(&path) {
+            if let Ok(records) = split_zone_records(&bytes, schema_crc, field_count, zones.len()) {
+                let kept: Vec<Vec<u8>> = records
+                    .into_iter()
+                    .zip(keep.iter())
+                    .filter(|(_, keep_block)| **keep_block)
+                    .map(|(record, _)| record)
+                    .collect();
+                return write_raw_zone(tmp, schema_crc, field_count, &kept);
+            }
+        }
+    }
+    let kept_zones: Vec<BlockZone> = zones
+        .iter()
+        .zip(keep.iter())
+        .filter(|(_, keep_block)| **keep_block)
+        .map(|(zone, _)| zone.clone())
+        .collect();
+    write_zone_to(tmp, schema_crc, field_count, &kept_zones)
+}
+
 fn write_zone_file(
     path: &Path,
     schema_crc: u32,
@@ -464,16 +501,93 @@ fn write_zone_file(
     zones: &[BlockZone],
 ) -> Result<()> {
     let tmp = path.with_extension("zon.partial");
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(&header(schema_crc, field_count))?;
-        for zone in zones {
-            write_record(&mut file, zone)?;
-        }
-        file.sync_all()?;
-    }
+    write_zone_to(&tmp, schema_crc, field_count, zones)?;
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+fn write_zone_to(
+    path: &Path,
+    schema_crc: u32,
+    field_count: u16,
+    zones: &[BlockZone],
+) -> Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(&header(schema_crc, field_count))?;
+    for zone in zones {
+        write_record(&mut file, zone)?;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+fn write_raw_zone(
+    path: &Path,
+    schema_crc: u32,
+    field_count: u16,
+    records: &[Vec<u8>],
+) -> Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(&header(schema_crc, field_count))?;
+    for record in records {
+        file.write_all(record)?;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Each item is one on-disk record, including its length and checksum prefix.
+fn split_zone_records(
+    bytes: &[u8],
+    expect_crc: u32,
+    field_count: u16,
+    block_count: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if bytes.len() < ZONE_HEADER_LEN {
+        return Err(Error::corrupt("truncated zone map"));
+    }
+    if &bytes[0..4] != ZONE_MAGIC {
+        return Err(Error::corrupt("zone map magic mismatch"));
+    }
+    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+    if version != ZONE_VERSION {
+        return Err(Error::corrupt(format!(
+            "unsupported zone map version {version}"
+        )));
+    }
+    let stored_crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let stored_fields = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
+    if stored_crc != expect_crc || stored_fields != field_count {
+        return Err(Error::corrupt("zone map does not match the schema"));
+    }
+    let mut cursor = ZONE_HEADER_LEN;
+    let mut records = Vec::with_capacity(block_count);
+    while cursor < bytes.len() {
+        if bytes.len() - cursor < 8 {
+            return Err(Error::corrupt("truncated zone map record"));
+        }
+        let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let end = cursor
+            .checked_add(8)
+            .and_then(|start| start.checked_add(len))
+            .ok_or_else(|| Error::corrupt("zone map record length overflow"))?;
+        if end > bytes.len() {
+            return Err(Error::corrupt("truncated zone map record"));
+        }
+        let payload = &bytes[cursor + 8..end];
+        let crc = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
+        if crc32fast::hash(payload) != crc {
+            return Err(Error::corrupt("zone map record checksum mismatch"));
+        }
+        records.push(bytes[cursor..end].to_vec());
+        cursor = end;
+    }
+    if records.len() != block_count {
+        return Err(Error::corrupt(
+            "zone map block count does not match the segment",
+        ));
+    }
+    Ok(records)
 }
 
 fn header(schema_crc: u32, field_count: u16) -> [u8; ZONE_HEADER_LEN] {
