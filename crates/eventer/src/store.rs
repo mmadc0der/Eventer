@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,8 +93,13 @@ impl Store {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         let schema = schema::load_schema(schema_path.as_ref())?;
-        ensure_schema_lock(&dir, &schema)?;
+        let lock_action = schema_lock_action(&dir, &schema)?;
         let catalog = Arc::new(std::sync::Mutex::new(segment::load_catalog(&dir, &schema)?));
+        if lock_action == SchemaLockAction::Rewrite {
+            // Catalog load already decoded the narrower blocks. Commit the wider
+            // schema only after that succeeds, so a decode failure leaves the lock.
+            write_schema_lock(&dir.join("schema.lock"), &schema.canonical())?;
+        }
         let pipeline = pipeline::spawn(PipelineConfig {
             dir: dir.clone(),
             schema: Arc::new(schema.clone()),
@@ -457,19 +463,44 @@ fn validate_options(options: &StoreOptions) -> Result<()> {
     Ok(())
 }
 
-fn ensure_schema_lock(dir: &Path, schema: &Schema) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaLockAction {
+    /// `schema.lock` already describes this schema, or it was just created.
+    Ready,
+    /// The open schema appends fields. Rewrite the lock after the catalog loads.
+    Rewrite,
+}
+
+fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
     let path = dir.join("schema.lock");
     let canonical = schema.canonical();
-    if path.exists() {
-        let existing = fs::read_to_string(&path)?;
-        if existing != canonical {
-            return Err(Error::schema(
-                "schema.lock does not match the supplied schema; this directory was created with a different schema",
-            ));
-        }
-    } else {
-        fs::write(&path, canonical)?;
+    if !path.exists() {
+        write_schema_lock(&path, &canonical)?;
+        return Ok(SchemaLockAction::Ready);
     }
+    let existing = fs::read_to_string(&path)?;
+    if existing == canonical {
+        return Ok(SchemaLockAction::Ready);
+    }
+    let locked = schema::parse_schema(&existing).map_err(|err| {
+        Error::schema(format!(
+            "schema.lock does not match the supplied schema; this directory was created with a different schema ({err})"
+        ))
+    })?;
+    match schema::schema_evolution(&locked, schema)? {
+        schema::SchemaEvolution::Unchanged => Ok(SchemaLockAction::Ready),
+        schema::SchemaEvolution::Appended { .. } => Ok(SchemaLockAction::Rewrite),
+    }
+}
+
+fn write_schema_lock(path: &Path, canonical: &str) -> Result<()> {
+    let tmp = path.with_file_name("schema.lock.partial");
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(canonical.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -665,6 +696,73 @@ mod tests {
     }
 
     #[test]
+    fn compressed_index_reopens_and_raw_index_still_loads() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        let count = 80i64;
+        for i in 0..count {
+            store
+                .append_json(&event(i, Some(i), "click", Some("n"), "3.25"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.query(0, count).unwrap().len(), count as usize);
+        let index_on_disk = dir_suffix_bytes(&data, ".idx") + dir_suffix_bytes(&data, ".zon");
+        assert_eq!(store.stats().index_bytes, index_on_disk);
+        store.drop_blocks_before(i64::MIN).unwrap();
+        assert_eq!(
+            store.stats().index_bytes, index_on_disk,
+            "a no-op retention pass still counts the compressed index"
+        );
+        store.close().unwrap();
+
+        let index = segment::index_path(&data, 1);
+        let compressed = fs::read(&index).unwrap();
+        assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        let raw = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+        assert!(compressed.len() < raw.len());
+        assert_eq!(&raw[..4], b"EVIX");
+
+        let reopened = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(reopened.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(reopened.stats().index_bytes, index_on_disk);
+        reopened.close().unwrap();
+
+        fs::write(&index, &raw).unwrap();
+        let legacy = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(legacy.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            raw,
+            "a raw EVIX file from an older writer is left in place"
+        );
+        legacy.close().unwrap();
+
+        fs::write(&index, &compressed[..compressed.len() - 1]).unwrap();
+        let rebuilt = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(rebuilt.query(0, count).unwrap().len(), count as usize);
+        let rebuilt_bytes = fs::read(&index).unwrap();
+        assert_ne!(rebuilt_bytes, compressed[..compressed.len() - 1]);
+        rebuilt.close().unwrap();
+        let used = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(used.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            rebuilt_bytes,
+            "the rebuilt index is reused"
+        );
+        used.close().unwrap();
+
+        fs::remove_file(&index).unwrap();
+        let restored = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(restored.query(0, count).unwrap().len(), count as usize);
+        assert!(index.exists());
+        restored.close().unwrap();
+    }
+
+    #[test]
     fn schema_mismatch_is_rejected() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -681,6 +779,205 @@ mod tests {
             Err(err) => assert!(err.to_string().contains("schema.lock"), "{err}"),
             Ok(_store) => panic!("opened a directory with a mismatched schema"),
         }
+    }
+
+    const NARROW_SCHEMA: &str = r#"{
+        "timestamp_field": "ts",
+        "fields": [
+            {"name": "ts", "type": "timestamp"},
+            {"name": "user_id", "type": "int"},
+            {"name": "event_time", "type": "timestamp"},
+            {"name": "amount", "type": "decimal", "scale": 2}
+        ]
+    }"#;
+
+    const WIDE_SCHEMA: &str = r#"{
+        "timestamp_field": "ts",
+        "fields": [
+            {"name": "ts", "type": "timestamp"},
+            {"name": "user_id", "type": "int"},
+            {"name": "event_time", "type": "timestamp"},
+            {"name": "amount", "type": "decimal", "scale": 2},
+            {"name": "region", "type": "string"},
+            {"name": "extra", "type": "int"}
+        ]
+    }"#;
+
+    #[test]
+    fn appended_columns_read_null_on_old_rows_and_roundtrip_on_new_rows() {
+        let dir = TempDir::new();
+        let narrow = dir.path().join("narrow.json");
+        fs::write(&narrow, NARROW_SCHEMA).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &narrow, test_options(2)).unwrap();
+        store
+            .append_json(br#"{"ts":1000,"user_id":7,"amount":"1.50"}"#)
+            .unwrap();
+        store
+            .append_json(br#"{"ts":2000,"user_id":8,"event_time":1500,"amount":"2.00"}"#)
+            .unwrap();
+        store.close().unwrap();
+
+        let segment = segment::data_path(&data, 1);
+        let segment_before = fs::read(&segment).unwrap();
+        let wide = dir.path().join("wide.json");
+        fs::write(&wide, WIDE_SCHEMA).unwrap();
+        let store = Store::open_with(&data, &wide, test_options(2)).unwrap();
+        assert_eq!(
+            fs::read(&segment).unwrap(),
+            segment_before,
+            "opening with appended columns rewrote a segment file"
+        );
+        let locked = fs::read_to_string(data.join("schema.lock")).unwrap();
+        assert_eq!(locked, parse_schema(WIDE_SCHEMA).unwrap().canonical());
+
+        let old = store.query(0, 10_000).unwrap();
+        assert_eq!(old.len(), 2);
+        for (row, user_id, amount) in [(&old[0], 7, "1.50"), (&old[1], 8, "2.00")] {
+            let value = row_value(&store, row);
+            assert_eq!(value["user_id"], user_id);
+            assert_eq!(value["amount"], amount);
+            assert!(value["region"].is_null());
+            assert!(value["extra"].is_null());
+        }
+        assert!(row_value(&store, &old[0])["event_time"].is_null());
+        assert_eq!(row_value(&store, &old[1])["event_time"], 1500);
+
+        let only_null_region = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("region".into(), Scalar::Null)])
+            .unwrap();
+        assert_eq!(only_null_region.len(), 2);
+        let west = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("region".into(), "west".into())])
+            .unwrap();
+        assert!(west.is_empty());
+
+        store
+            .append_json(br#"{"ts":3000,"user_id":9,"amount":"3.25","region":"west","extra":4}"#)
+            .unwrap();
+        store.close().unwrap();
+        let segment_after = fs::read(&segment).unwrap();
+        assert!(
+            segment_after.starts_with(&segment_before),
+            "the new row rewrote blocks stored before the added columns"
+        );
+
+        let store = Store::open_with(&data, &wide, test_options(2)).unwrap();
+        assert_eq!(
+            fs::read_to_string(data.join("schema.lock")).unwrap(),
+            locked
+        );
+        let rows = store.query(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(row_value(&store, &rows[0])["region"].is_null());
+        assert!(row_value(&store, &rows[0])["extra"].is_null());
+        assert_eq!(row_value(&store, &rows[0])["user_id"], 7);
+        assert_eq!(row_value(&store, &rows[2])["region"], "west");
+        assert_eq!(row_value(&store, &rows[2])["extra"], 4);
+        assert_eq!(row_value(&store, &rows[2])["amount"], "3.25");
+        let west = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("region".into(), "west".into())])
+            .unwrap();
+        assert_eq!(west.len(), 1);
+        assert_eq!(row_value(&store, &west[0])["user_id"], 9);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn schema_edits_other_than_append_are_rejected() {
+        let dir = TempDir::new();
+        let narrow = dir.path().join("narrow.json");
+        fs::write(&narrow, NARROW_SCHEMA).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &narrow, test_options(2)).unwrap();
+        store
+            .append_json(br#"{"ts":1000,"user_id":1,"amount":"1.00"}"#)
+            .unwrap();
+        store.close().unwrap();
+        let lock_before = fs::read(data.join("schema.lock")).unwrap();
+
+        let rejected = [
+            (
+                "type",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "user_id", "type": "float"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "amount", "type": "decimal", "scale": 2}
+                    ]
+                }"#,
+            ),
+            (
+                "removed",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "user_id", "type": "int"},
+                        {"name": "event_time", "type": "timestamp"}
+                    ]
+                }"#,
+            ),
+            (
+                "reordered",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "user_id", "type": "int"},
+                        {"name": "amount", "type": "decimal", "scale": 2}
+                    ]
+                }"#,
+            ),
+            (
+                "renamed",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "uid", "type": "int"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "amount", "type": "decimal", "scale": 2}
+                    ]
+                }"#,
+            ),
+            (
+                "scale",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "user_id", "type": "int"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "amount", "type": "decimal", "scale": 4}
+                    ]
+                }"#,
+            ),
+            (
+                "timestamp",
+                r#"{
+                    "timestamp_field": "event_time",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "user_id", "type": "int"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "amount", "type": "decimal", "scale": 2}
+                    ]
+                }"#,
+            ),
+        ];
+        for (reason, text) in rejected {
+            let path = dir.path().join(format!("{reason}.json"));
+            fs::write(&path, text).unwrap();
+            match Store::open_with(&data, &path, test_options(2)) {
+                Err(err) => assert!(err.to_string().contains("schema.lock"), "{reason}: {err}"),
+                Ok(_store) => panic!("opened after a {reason} schema change"),
+            }
+        }
+        assert_eq!(fs::read(data.join("schema.lock")).unwrap(), lock_before);
     }
 
     #[test]

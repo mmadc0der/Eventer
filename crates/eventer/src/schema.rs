@@ -54,7 +54,10 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// Stable text written to `schema.lock` and compared on later opens.
+    /// Stable text written to `schema.lock`.
+    ///
+    /// An open compares this with the locked schema. An identical field list matches.
+    /// Fields appended after that list are accepted and the lock is rewritten.
     pub fn canonical(&self) -> String {
         let fields: Vec<Value> = self
             .fields
@@ -173,6 +176,53 @@ pub fn parse_schema(text: &str) -> Result<Schema> {
         timestamp_index,
         fields,
     })
+}
+
+/// How the schema used to open a directory relates to the one stored in `schema.lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaEvolution {
+    /// Timestamp field, names, types, and decimal scales all match.
+    Unchanged,
+    /// `added` fields were appended after the locked field list.
+    Appended { added: usize },
+}
+
+/// Accept an unchanged schema or one that only appends fields.
+///
+/// A different timestamp field, a type or decimal-scale change, a removed field,
+/// a renamed field, or a reordered field is rejected. Comparison uses parsed
+/// fields, so key order inside a field object does not matter.
+pub fn schema_evolution(locked: &Schema, opened: &Schema) -> Result<SchemaEvolution> {
+    if locked.timestamp_field != opened.timestamp_field
+        || locked.timestamp_index != opened.timestamp_index
+    {
+        return Err(schema_lock_mismatch("timestamp field differs"));
+    }
+    if opened.fields.len() < locked.fields.len() {
+        return Err(schema_lock_mismatch("a field was removed"));
+    }
+    for (locked_field, opened_field) in locked.fields.iter().zip(opened.fields.iter()) {
+        if locked_field.name != opened_field.name {
+            return Err(schema_lock_mismatch("a field was renamed or reordered"));
+        }
+        if locked_field.ty != opened_field.ty {
+            return Err(schema_lock_mismatch(
+                "a field type or decimal scale changed",
+            ));
+        }
+    }
+    let added = opened.fields.len() - locked.fields.len();
+    if added == 0 {
+        Ok(SchemaEvolution::Unchanged)
+    } else {
+        Ok(SchemaEvolution::Appended { added })
+    }
+}
+
+fn schema_lock_mismatch(reason: &str) -> Error {
+    Error::schema(format!(
+        "schema.lock does not match the supplied schema; this directory was created with a different schema ({reason})"
+    ))
 }
 
 /// Unix milliseconds. Accepts an integer, a digit string, or a UTC RFC3339 timestamp.
@@ -414,5 +464,98 @@ mod tests {
         );
         assert!(parse_timestamp_str("2023-02-29T00:00:00Z").is_err());
         assert!(parse_timestamp_str("2024-02-29T00:00:00Z").is_ok());
+    }
+
+    fn two_field_schema() -> Schema {
+        parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn appended_fields_are_compatible_and_other_edits_are_not() {
+        let locked = two_field_schema();
+        let appended = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "region", "type": "string"},
+                    {"name": "extra", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            schema_evolution(&locked, &appended).unwrap(),
+            SchemaEvolution::Appended { added: 2 }
+        );
+        assert_eq!(
+            schema_evolution(&locked, &locked).unwrap(),
+            SchemaEvolution::Unchanged
+        );
+
+        let type_change = parse_schema(
+            r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"timestamp"},{"name":"user_id","type":"float"}]}"#,
+        )
+        .unwrap();
+        let removed =
+            parse_schema(r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"timestamp"}]}"#)
+                .unwrap();
+        let reordered = parse_schema(
+            r#"{"timestamp_field":"ts","fields":[{"name":"user_id","type":"int"},{"name":"ts","type":"timestamp"}]}"#,
+        )
+        .unwrap();
+        let renamed = parse_schema(
+            r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"timestamp"},{"name":"uid","type":"int"}]}"#,
+        )
+        .unwrap();
+        let scale = parse_schema(
+            r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"timestamp"},{"name":"user_id","type":"decimal","scale":2}]}"#,
+        )
+        .unwrap();
+        let other_clock = parse_schema(
+            r#"{
+                "timestamp_field": "event_time",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "event_time", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let locked_two_clocks = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "event_time", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        for (opened, reason) in [
+            (&type_change, "type"),
+            (&removed, "removed"),
+            (&reordered, "reordered"),
+            (&renamed, "renamed"),
+            (&scale, "scale"),
+        ] {
+            let err = schema_evolution(&locked, opened).unwrap_err();
+            assert!(err.to_string().contains("schema.lock"), "{reason}: {err}");
+        }
+        let err = schema_evolution(&locked_two_clocks, &other_clock).unwrap_err();
+        assert!(err.to_string().contains("timestamp"), "{err}");
     }
 }
