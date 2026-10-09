@@ -289,8 +289,9 @@ impl Store {
     /// dictionary stays when any surviving frame is `EVBD`.
     ///
     /// Queued events are flushed before any file is removed. After this returns,
-    /// a query does not return a row whose timestamp is below the cutoff. The same
-    /// is true after the directory is opened again.
+    /// a query no longer returns a row from a block whose maximum timestamp is
+    /// below the cutoff, including after the directory is opened again. Rows that
+    /// shared a kept block stay.
     pub fn drop_blocks_before(&self, cutoff_ms: i64) -> Result<()> {
         self.pipeline.drop_blocks_before(cutoff_ms)
     }
@@ -1506,6 +1507,62 @@ mod tests {
             "a row below the cutoff stays inside a block that is not eligible"
         );
         store.close().unwrap();
+    }
+
+    #[test]
+    fn drop_blocks_before_merges_slices_of_the_same_segment() {
+        // One frame is 90 bytes. Rotating at 100 bytes inside the second flush
+        // leaves four catalog entries for two data files: the first commit's
+        // block, an empty placeholder, then the two frames of that flush.
+        let open = |dir: &TempDir| {
+            let schema = write_schema(dir.path());
+            let data = dir.path().join("data");
+            let mut options = test_options(1);
+            options.segment_bytes = 100;
+            let store = Store::open_with(&data, &schema, options).unwrap();
+            store
+                .append_json(&event(1_000, Some(1), "click", None, "1.00"))
+                .unwrap();
+            store.flush().unwrap();
+            store
+                .append_json(&event(2_000, Some(2), "view", None, "2.00"))
+                .unwrap();
+            store
+                .append_json(&event(3_000, Some(3), "buy", None, "3.00"))
+                .unwrap();
+            store.flush().unwrap();
+            assert_eq!(store.stats().segments, 4, "split catalog entries");
+            assert!(segment::data_path(&data, 1).exists());
+            assert!(segment::data_path(&data, 2).exists());
+            assert!(!segment::data_path(&data, 3).exists());
+            (schema, data, store)
+        };
+
+        let dir = TempDir::new();
+        let (schema, data, store) = open(&dir);
+        store.drop_blocks_before(i64::MIN).unwrap();
+        assert_eq!(store.query(0, 10_000).unwrap().len(), 3);
+        assert_eq!(store.stats().segments, 2);
+        store.close().unwrap();
+        let reopened = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        assert_eq!(reopened.query(0, 10_000).unwrap().len(), 3);
+        reopened.close().unwrap();
+
+        let dir = TempDir::new();
+        let (schema, data, store) = open(&dir);
+        store.drop_blocks_before(1_001).unwrap();
+        assert!(
+            segment::data_path(&data, 1).exists(),
+            "segment 1 still holds the block at ts 2000"
+        );
+        let rows = store.query(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_value(&store, &rows[0])["ts"], 2_000);
+        assert_eq!(row_value(&store, &rows[1])["ts"], 3_000);
+        store.close().unwrap();
+        let reopened = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        assert_eq!(reopened.query(0, 10_000).unwrap().len(), 2);
+        reopened.close().unwrap();
     }
 
     #[test]

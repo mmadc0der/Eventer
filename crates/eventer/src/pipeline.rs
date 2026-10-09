@@ -986,6 +986,71 @@ fn compress_block(
     }
 }
 
+/// Collapse catalog entries that share a segment id.
+///
+/// An empty placeholder contributes no blocks. Offsets name frames in the
+/// one `.dat`, so the merged `data_len` is the end of the last frame rather
+/// than the sum of per-entry lengths.
+fn union_catalog_segments(existing: &[segment::SegmentState]) -> Vec<segment::SegmentState> {
+    let mut grouped: Vec<Vec<&segment::SegmentState>> = Vec::new();
+    for segment in existing {
+        if let Some(slices) = grouped.iter_mut().find(|slices| slices[0].id == segment.id) {
+            slices.push(segment);
+        } else {
+            grouped.push(vec![segment]);
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|slices| merge_segment_slices(&slices))
+        .collect()
+}
+
+fn merge_segment_slices(slices: &[&segment::SegmentState]) -> segment::SegmentState {
+    let id = slices[0].id;
+    let mut paired: Vec<(BlockMeta, BlockZone)> = Vec::new();
+    for slice in slices {
+        for (index, block) in slice.blocks.iter().enumerate() {
+            if paired
+                .iter()
+                .any(|(existing, _)| existing.offset == block.offset)
+            {
+                continue;
+            }
+            let zone = slice.zones.get(index).cloned().unwrap_or(BlockZone {
+                columns: Vec::new(),
+            });
+            paired.push((block.clone(), zone));
+        }
+    }
+    paired.sort_by_key(|(block, _)| block.offset);
+    let data_len = paired
+        .iter()
+        .map(|(block, _)| {
+            block.offset + BLOCK_HEADER_LEN as u64 + u64::from(block.compressed_len)
+        })
+        .max()
+        .unwrap_or(0);
+    let index_len = segment::INDEX_HEADER_LEN as u64
+        + paired.len() as u64 * segment::INDEX_ENTRY_LEN as u64;
+    let dict_bytes = slices
+        .iter()
+        .map(|slice| slice.dict_bytes)
+        .max()
+        .unwrap_or(0);
+    let uses_dict = slices.iter().any(|slice| slice.uses_dict);
+    let (blocks, zones) = paired.into_iter().unzip();
+    segment::SegmentState {
+        id,
+        blocks,
+        data_len,
+        index_len,
+        dict_bytes,
+        uses_dict,
+        zones,
+    }
+}
+
 struct Disk {
     dir: PathBuf,
     rotate_at: u64,
@@ -1310,7 +1375,14 @@ impl Disk {
         let _guard = retention.write().unwrap_or_else(|err| err.into_inner());
         let active_id = self.active.as_ref().map(|segment| segment.id);
         if let Some(mut segment) = self.active.take() {
-            segment.flush_os(true)?;
+            if let Err(err) = segment.flush_os(true) {
+                // Put the handle back before returning. Leaving `active` empty
+                // makes the next prepare mint a new id while `self.dict` still
+                // belongs to this one, so later frames are `EVBD` with no sidecar.
+                self.active = Some(segment);
+                self.poison(err.clone());
+                return Err(err);
+            }
         }
         let outcome = self.rewrite_expired_segments(cutoff_ms);
         let restored = self.restore_active(active_id);
@@ -1323,33 +1395,23 @@ impl Disk {
 
     fn rewrite_expired_segments(&mut self, cutoff_ms: i64) -> Result<()> {
         let mut catalog = self.catalog.lock().unwrap_or_else(|err| err.into_inner());
-        let existing = catalog.segments.clone();
-        let mut kept = Vec::with_capacity(existing.len());
-        for segment in &existing {
-            match segment::drop_eligible_blocks(
+        // One commit can append to the current segment and then rotate. The
+        // catalog then has two entries for that id: blocks already committed,
+        // and the frames written in this commit (plus an empty placeholder for
+        // the new id). Each entry's `data_len` covers only its own frames.
+        // Union by offset before the cutoff so a fully expired slice cannot
+        // unlink a file that another slice of the same id still needs.
+        let merged = union_catalog_segments(&catalog.segments);
+        let mut kept = Vec::with_capacity(merged.len());
+        for segment in &merged {
+            if let Some(state) = segment::drop_eligible_blocks(
                 &self.dir,
                 segment,
                 self.schema_crc,
                 self.field_count,
                 cutoff_ms,
             )? {
-                Some(state) => {
-                    // A rotation inside one commit records the segment twice: an
-                    // empty placeholder, then the entry that received the blocks.
-                    // The later entry is the one the files reflect.
-                    if let Some(pos) = kept
-                        .iter()
-                        .rposition(|segment: &segment::SegmentState| segment.id == state.id)
-                    {
-                        kept[pos] = state;
-                    } else {
-                        kept.push(state);
-                    }
-                }
-                None => {
-                    let dropped_id = segment.id;
-                    kept.retain(|segment| segment.id != dropped_id);
-                }
+                kept.push(state);
             }
         }
         catalog.segments = kept;
