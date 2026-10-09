@@ -15,6 +15,7 @@ use crate::segment::{
     DICT_MAX_BYTES, DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX,
 };
 use crate::value::{parse_event, Row, Scalar};
+use crate::zone::{self, BlockZone};
 
 const WRITE_BATCH_BLOCKS: usize = 8;
 
@@ -58,6 +59,7 @@ struct BlockIn {
     /// Compress with the dictionary published for `epoch`, when one exists.
     use_dict: bool,
     epoch: u32,
+    zone: BlockZone,
 }
 
 enum CompIn {
@@ -80,6 +82,7 @@ struct BlockOut {
     min_ts: i64,
     max_ts: i64,
     acks: Vec<Option<Ack>>,
+    zone: BlockZone,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -355,6 +358,7 @@ pub fn spawn(config: PipelineConfig) -> Result<Pipeline> {
         Arc::clone(&config.catalog),
         Arc::clone(&poison),
         Arc::clone(&dict_publish),
+        &config.schema,
     )?;
     threads.push(named("eventer-writer", {
         let linger = config.linger;
@@ -724,6 +728,7 @@ fn emit_block(
         left -= take;
         match encode_block(schema, &chunk) {
             Ok(encoded) => {
+                let zone = zone::from_rows(schema, &chunk);
                 let use_dict = sampler.observe(publish, &encoded.bytes);
                 let msg = CompIn::Block(BlockIn {
                     seq: *stage_seq,
@@ -734,6 +739,7 @@ fn emit_block(
                     acks: chunk_acks,
                     use_dict,
                     epoch: sampler.epoch,
+                    zone,
                 });
                 if let Err(err) = tx.send(msg) {
                     if let CompIn::Block(block) = err.into_inner() {
@@ -879,6 +885,7 @@ fn compress_block(
                 min_ts: block.min_ts,
                 max_ts: block.max_ts,
                 acks: block.acks,
+                zone: block.zone,
             }),
             Err(err) => CompOut::Skip {
                 seq: block.seq,
@@ -898,6 +905,8 @@ struct Disk {
     catalog: Arc<Mutex<Catalog>>,
     poison: Arc<Mutex<Option<Error>>>,
     publish: Arc<DictPublish>,
+    schema_crc: u32,
+    field_count: u16,
     plain: Option<zstd::bulk::Compressor<'static>>,
     dict_compressor: Option<(Arc<Vec<u8>>, zstd::bulk::Compressor<'static>)>,
     dict: Option<Arc<Vec<u8>>>,
@@ -912,6 +921,7 @@ impl Disk {
         catalog: Arc<Mutex<Catalog>>,
         poison: Arc<Mutex<Option<Error>>>,
         publish: Arc<DictPublish>,
+        schema: &Schema,
     ) -> Result<Self> {
         let last = catalog
             .lock()
@@ -945,6 +955,8 @@ impl Disk {
             dict_compressor: None,
             dict: None,
             segment_epoch: 0,
+            schema_crc: zone::schema_crc(schema),
+            field_count: zone::field_count(schema)?,
         };
         if let Some(segment) = disk.active.as_ref() {
             disk.load_existing_dictionary(segment.id, resume_uses_dict)?;
@@ -1025,6 +1037,7 @@ impl Disk {
             return Ok(());
         }
         let mut metas = Vec::with_capacity(batch.len());
+        let mut zones = Vec::with_capacity(batch.len());
         let mut acks = Vec::new();
         let result = (|| {
             for item in batch.iter_mut() {
@@ -1045,19 +1058,28 @@ impl Disk {
                 };
                 segment.write_framed(&framed, &meta)?;
                 metas.push(meta);
+                zones.push(item.zone.clone());
             }
             self.active
                 .as_mut()
                 .expect("segment prepared")
                 .flush_os(sync)?;
-            Ok(())
+            let zone_bytes = write_zone_batch(
+                &self.dir,
+                self.schema_crc,
+                self.field_count,
+                &metas,
+                &zones,
+                sync,
+            )?;
+            Ok(zone_bytes)
         })();
         match result {
-            Ok(()) => {
+            Ok(zone_bytes) => {
                 self.catalog
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
-                    .append_blocks(&metas);
+                    .append_blocks(&metas, zones, zone_bytes);
                 for item in batch.drain(..) {
                     acks.extend(item.acks);
                 }
@@ -1199,6 +1221,35 @@ impl Disk {
     fn training_decided(&self) -> bool {
         self.publish.training_decided(self.segment_epoch)
     }
+}
+
+fn write_zone_batch(
+    dir: &std::path::Path,
+    schema_crc: u32,
+    field_count: u16,
+    metas: &[BlockMeta],
+    zones: &[BlockZone],
+    sync: bool,
+) -> Result<u64> {
+    let mut written = 0u64;
+    let mut start = 0;
+    while start < metas.len() {
+        let segment_id = metas[start].segment_id;
+        let mut end = start + 1;
+        while end < metas.len() && metas[end].segment_id == segment_id {
+            end += 1;
+        }
+        written += zone::append_zones(
+            dir,
+            segment_id,
+            schema_crc,
+            field_count,
+            &zones[start..end],
+            sync,
+        )?;
+        start = end;
+    }
+    Ok(written)
 }
 
 fn writer_loop(rx: Receiver<CompOut>, mut disk: Disk, linger: Duration) {

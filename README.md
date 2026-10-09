@@ -1,6 +1,6 @@
 # Eventer
 
-Append-only store for JSON events. A typed schema fixes the columns. Rows are packed into columnar blocks, compressed with zstd, and written to segment files. A sparse index records each block's minimum and maximum timestamp so a time-range read can skip blocks that cannot match.
+Append-only store for JSON events. A typed schema fixes the columns. Rows are packed into columnar blocks, compressed with zstd, and written to segment files. A sparse index records each block's minimum and maximum timestamp so a time-range read can skip blocks that cannot match. A zone map next to that index records equality stats for each column, so a filtered read can skip a block whose payload cannot contain the value.
 
 The library is both an rlib and a cdylib (`libeventer.so` / `eventer.dll`) with a small C API. `eventer-server` links the rlib and serves two routes.
 
@@ -64,7 +64,7 @@ curl -sS -X POST http://127.0.0.1:43123/events \
   --data '{"ts":1700000000000,"user_id":7,"score":1.5,"ok":true,"action":"click","note":"demo","amount":"19.99","props":{"plan":"pro","flags":["a",1]}}'
 ```
 
-`GET /events?from=&to=` returns a JSON array. `from` and `to` are inclusive unix milliseconds. Repeat `eq=field=value` to keep rows where that column equals the value. Filters are AND-ed and applied while each block is decoded.
+`GET /events?from=&to=` returns a JSON array. `from` and `to` are inclusive unix milliseconds. Repeat `eq=field=value` to keep rows where that column equals the value. Filters are AND-ed. Blocks the zone map can reject are not read; the rest are filtered while they are decoded.
 
 ```bash
 curl -sS 'http://127.0.0.1:43123/events?from=1700000000000&to=1700000000000'
@@ -131,4 +131,4 @@ Stored size was identical across the runs (394,005 data bytes, 49 blocks, one se
 
 `Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced; the HTTP `POST` uses it. `Store::query(from_ms, to_ms)` returns matching [`Row`] values in ingest order; use [`RowSerializable`] or [`row_to_json_bytes`] when you need the original JSON lexemes (including duplicate keys). `Store::query_json` returns the same data as one JSON array for HTTP.
 
-`Store::query_with_filter` adds equality predicates. Several predicates are AND-ed. `Predicate::Eq("type".into(), "assistant".into())` keeps one value. `Predicate::In` keeps any listed value. `Scalar::Null` matches null. A block whose filter column is a constant or dictionary that does not contain the value is not fully decoded, so later text columns stay unread. The C equivalent is `eventer_query_filtered` for one string or text column.
+`Store::query_with_filter` adds equality predicates. Several predicates are AND-ed. `Predicate::Eq("type".into(), "assistant".into())` keeps one value. `Predicate::In` keeps any listed value. `Scalar::Null` matches null. The zone map skips a block that cannot contain those values. A block that is read, and whose filter column is a constant or dictionary that does not contain the value, is not fully decoded, so later text columns stay unread. The C equivalent is `eventer_query_filtered` for one string or text column.
