@@ -333,10 +333,13 @@ fn write_nulls(out: &mut Vec<u8>, nulls: &[bool]) {
 
 /// Integer kind bytes. Kinds 0–6 are the original empty, constant, and
 /// byte-width frame-of-reference encodings. Kinds 7 and 8 are additive.
+/// Kind 9 is a handful of constant-stride pieces (a wrapped sawtooth).
 const KIND_EMPTY: u8 = 0;
 const KIND_CONSTANT: u8 = 1;
 const KIND_STRIDE: u8 = 7;
 const KIND_BITPACK: u8 = 8;
+const KIND_PIECES: u8 = 9;
+const MAX_STRIDE_PIECES: usize = 8;
 
 fn encode_i64s(values: &[Option<i64>]) -> Vec<u8> {
     let present: Vec<i64> = values.iter().copied().flatten().collect();
@@ -368,7 +371,13 @@ fn encode_i64s(values: &[Option<i64>]) -> Vec<u8> {
     let bits = bit_width_for_span(u128::from(span));
     let packed_len = bitpack_len(8, bits, count);
     if packed_len < best_len {
+        best_len = packed_len;
         choice = IntEncoding::Bitpack { bits };
+    }
+    if let Some(pieces) = stride_pieces_i64(&present) {
+        if stride_pieces_len(8, pieces.len()) < best_len {
+            choice = IntEncoding::Pieces(pieces);
+        }
     }
     match choice {
         IntEncoding::Frame => encode_i64s_frame(min, width, &present),
@@ -380,6 +389,7 @@ fn encode_i64s(values: &[Option<i64>]) -> Vec<u8> {
                 .iter()
                 .map(|value| u128::from((*value as u64).wrapping_sub(min as u64))),
         ),
+        IntEncoding::Pieces(pieces) => encode_stride_pieces(&pieces, 8),
     }
 }
 
@@ -410,7 +420,13 @@ fn encode_i128s(values: &[Option<i128>]) -> Vec<u8> {
     let bits = bit_width_for_span(span);
     let packed_len = bitpack_len(16, bits, count);
     if packed_len < best_len {
+        best_len = packed_len;
         choice = IntEncoding::Bitpack { bits };
+    }
+    if let Some(pieces) = stride_pieces_i128(&present) {
+        if stride_pieces_len(16, pieces.len()) < best_len {
+            choice = IntEncoding::Pieces(pieces);
+        }
     }
     match choice {
         IntEncoding::Frame => encode_i128s_frame(min, width, &present),
@@ -422,6 +438,7 @@ fn encode_i128s(values: &[Option<i128>]) -> Vec<u8> {
                 .iter()
                 .map(|value| (*value as u128).wrapping_sub(min as u128)),
         ),
+        IntEncoding::Pieces(pieces) => encode_stride_pieces(&pieces, 16),
     }
 }
 
@@ -429,6 +446,13 @@ enum IntEncoding {
     Frame,
     Stride { base: i128, stride: i128 },
     Bitpack { bits: u32 },
+    Pieces(Vec<StridePiece>),
+}
+
+struct StridePiece {
+    start: u32,
+    base: i128,
+    stride: i128,
 }
 
 fn frame_len(base_len: usize, width: usize, count: usize) -> usize {
@@ -504,6 +528,101 @@ fn encode_stride_i128(base: i128, stride: i128) -> Vec<u8> {
     let mut out = vec![KIND_STRIDE];
     out.extend_from_slice(&base.to_le_bytes());
     out.extend_from_slice(&stride.to_le_bytes());
+    out
+}
+
+/// Partition present values into at most eight constant-stride runs.
+/// One run is kind 7, and a zero stride is the constant kind, so neither is
+/// returned here. A run of equal values becomes single-value pieces; more
+/// than eight pieces is not this encoding.
+fn stride_pieces_i64(present: &[i64]) -> Option<Vec<StridePiece>> {
+    stride_pieces(present, |value| i128::from(value), |base, offset, stride| {
+        let base = base as i64;
+        let stride = stride as i64;
+        let offset = offset as i64;
+        i128::from(base.wrapping_add(offset.wrapping_mul(stride)))
+    })
+}
+
+fn stride_pieces_i128(present: &[i128]) -> Option<Vec<StridePiece>> {
+    stride_pieces(present, |value| value, |base, offset, stride| {
+        base.wrapping_add(offset.wrapping_mul(stride))
+    })
+}
+
+fn stride_pieces<T: Copy>(
+    present: &[T],
+    widen: impl Fn(T) -> i128,
+    step: impl Fn(i128, i128, i128) -> i128,
+) -> Option<Vec<StridePiece>> {
+    if present.len() < 2 {
+        return None;
+    }
+    let mut pieces = Vec::new();
+    let mut index = 0usize;
+    while index < present.len() {
+        if pieces.len() == MAX_STRIDE_PIECES {
+            return None;
+        }
+        let start = u32::try_from(index).ok()?;
+        let base = widen(present[index]);
+        if index + 1 == present.len() {
+            pieces.push(StridePiece {
+                start,
+                base,
+                stride: 1,
+            });
+            break;
+        }
+        let delta = widen(present[index + 1]).wrapping_sub(base);
+        if delta == 0 {
+            pieces.push(StridePiece {
+                start,
+                base,
+                stride: 1,
+            });
+            index += 1;
+            continue;
+        }
+        index += 2;
+        while index < present.len() {
+            let offset = i128::try_from(index - start as usize).ok()?;
+            if widen(present[index]) != step(base, offset, delta) {
+                break;
+            }
+            index += 1;
+        }
+        pieces.push(StridePiece {
+            start,
+            base,
+            stride: delta,
+        });
+    }
+    if pieces.len() < 2 {
+        None
+    } else {
+        Some(pieces)
+    }
+}
+
+fn stride_pieces_len(value_len: usize, count: usize) -> usize {
+    1 + 2 + count * (4 + value_len * 2)
+}
+
+fn encode_stride_pieces(pieces: &[StridePiece], value_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(stride_pieces_len(value_len, pieces.len()));
+    out.push(KIND_PIECES);
+    out.extend_from_slice(&(pieces.len() as u16).to_le_bytes());
+    for piece in pieces {
+        out.extend_from_slice(&piece.start.to_le_bytes());
+        if value_len == 8 {
+            out.extend_from_slice(&(piece.base as i64).to_le_bytes());
+            out.extend_from_slice(&(piece.stride as i64).to_le_bytes());
+        } else {
+            out.extend_from_slice(&piece.base.to_le_bytes());
+            out.extend_from_slice(&piece.stride.to_le_bytes());
+        }
+    }
     out
 }
 
@@ -1062,6 +1181,10 @@ fn skip_i64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
         skip_packed(bytes, cursor, count, bits, "int")?;
         return Ok(());
     }
+    if kind == KIND_PIECES {
+        let _ = read_stride_pieces(bytes, cursor, count, 8)?;
+        return Ok(());
+    }
     let width = width_for_kind(kind)?;
     if width > 8 {
         return Err(Error::corrupt("int column uses a 16-byte delta"));
@@ -1092,6 +1215,10 @@ fn skip_i128s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
         let bits = read_bit_width(bytes, cursor, 128)?;
         let _ = read_i128(bytes, cursor)?;
         skip_packed(bytes, cursor, count, bits, "decimal")?;
+        return Ok(());
+    }
+    if kind == KIND_PIECES {
+        let _ = read_stride_pieces(bytes, cursor, count, 16)?;
         return Ok(());
     }
     let width = width_for_kind(kind)?;
@@ -1256,6 +1383,10 @@ fn decode_i64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<i64
         }
         return Ok(out);
     }
+    if kind == KIND_PIECES {
+        let pieces = read_stride_pieces(bytes, cursor, count, 8)?;
+        return Ok(materialize_i64_pieces(&pieces, count));
+    }
     let width = width_for_kind(kind)?;
     if width > 8 {
         return Err(Error::corrupt("int column uses a 16-byte delta"));
@@ -1299,6 +1430,10 @@ fn decode_i128s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<i1
             out.push((base as u128).wrapping_add(delta) as i128);
         }
         return Ok(out);
+    }
+    if kind == KIND_PIECES {
+        let pieces = read_stride_pieces(bytes, cursor, count, 16)?;
+        return Ok(materialize_i128_pieces(&pieces, count));
     }
     let width = width_for_kind(kind)?;
     let base = read_i128(bytes, cursor)?;
@@ -1583,6 +1718,91 @@ fn read_exact<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a
         .ok_or_else(|| Error::corrupt("truncated block"))?;
     *cursor = end;
     Ok(slice)
+}
+
+fn read_stride_pieces(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    value_len: usize,
+) -> Result<Vec<StridePiece>> {
+    let raw = read_exact(bytes, cursor, 2)?;
+    let piece_count = u16::from_le_bytes(raw.try_into().unwrap()) as usize;
+    if piece_count == 0 || piece_count > MAX_STRIDE_PIECES {
+        return Err(Error::corrupt("integer stride piece count is invalid"));
+    }
+    let mut pieces = Vec::with_capacity(piece_count);
+    for _ in 0..piece_count {
+        let raw = read_exact(bytes, cursor, 4)?;
+        let start = u32::from_le_bytes(raw.try_into().unwrap());
+        let (base, stride) = if value_len == 8 {
+            (
+                i128::from(read_i64(bytes, cursor)?),
+                i128::from(read_i64(bytes, cursor)?),
+            )
+        } else {
+            (read_i128(bytes, cursor)?, read_i128(bytes, cursor)?)
+        };
+        if stride == 0 {
+            return Err(Error::corrupt("integer stride piece has a zero stride"));
+        }
+        pieces.push(StridePiece {
+            start,
+            base,
+            stride,
+        });
+    }
+    if pieces[0].start != 0 {
+        return Err(Error::corrupt("integer stride pieces do not start at 0"));
+    }
+    for pair in pieces.windows(2) {
+        if pair[1].start <= pair[0].start {
+            return Err(Error::corrupt(
+                "integer stride pieces are not strictly increasing",
+            ));
+        }
+        if pair[1].start as usize >= count {
+            return Err(Error::corrupt("integer stride piece starts past the column"));
+        }
+    }
+    if pieces.last().unwrap().start as usize >= count {
+        return Err(Error::corrupt("integer stride piece starts past the column"));
+    }
+    Ok(pieces)
+}
+
+fn materialize_i64_pieces(pieces: &[StridePiece], count: usize) -> Vec<i64> {
+    let mut out = Vec::with_capacity(count);
+    for (index, piece) in pieces.iter().enumerate() {
+        let end = pieces
+            .get(index + 1)
+            .map(|next| next.start as usize)
+            .unwrap_or(count);
+        let base = piece.base as i64;
+        let stride = piece.stride as i64;
+        for offset in 0..(end - piece.start as usize) {
+            out.push(base.wrapping_add((offset as i64).wrapping_mul(stride)));
+        }
+    }
+    out
+}
+
+fn materialize_i128_pieces(pieces: &[StridePiece], count: usize) -> Vec<i128> {
+    let mut out = Vec::with_capacity(count);
+    for (index, piece) in pieces.iter().enumerate() {
+        let end = pieces
+            .get(index + 1)
+            .map(|next| next.start as usize)
+            .unwrap_or(count);
+        for offset in 0..(end - piece.start as usize) {
+            out.push(
+                piece
+                    .base
+                    .wrapping_add((offset as i128).wrapping_mul(piece.stride)),
+            );
+        }
+    }
+    out
 }
 
 fn read_i64(bytes: &[u8], cursor: &mut usize) -> Result<i64> {
@@ -2244,10 +2464,26 @@ mod tests {
 
     #[test]
     fn exact_bit_width_packs_span_999() {
-        let values: Vec<Option<i64>> = (0..2048).map(|i| Some(i % 1000)).collect();
+        // Three values are not one stride, and two stride pieces are larger than 10-bit packing.
+        let values = [Some(0i64), Some(999), Some(1)];
         let encoded = encode_i64s(&values);
         assert_eq!(encoded[0], KIND_BITPACK);
         assert_eq!(encoded[1], 10, "999 fits in 10 bits");
+        let mut cursor = 0;
+        assert_eq!(
+            decode_i64s(&encoded, &mut cursor, values.len()).unwrap(),
+            vec![0, 999, 1]
+        );
+        assert_eq!(cursor, encoded.len());
+    }
+
+    #[test]
+    fn wrapped_modulo_uses_a_few_stride_pieces() {
+        let values: Vec<Option<i64>> = (0..2048).map(|i| Some(i % 1000)).collect();
+        let encoded = encode_i64s(&values);
+        assert_eq!(encoded[0], KIND_PIECES);
+        assert_eq!(u16::from_le_bytes(encoded[1..3].try_into().unwrap()), 3);
+        assert!(encoded.len() < 100, "three i64 pieces are a few dozen bytes");
         let mut cursor = 0;
         let decoded = decode_i64s(&encoded, &mut cursor, values.len()).unwrap();
         assert_eq!(cursor, encoded.len());
@@ -2257,6 +2493,160 @@ mod tests {
         let mut skip = 0;
         skip_i64s(&encoded, &mut skip, values.len()).unwrap();
         assert_eq!(skip, encoded.len());
+
+        let mut with_nulls = values.clone();
+        with_nulls[10] = None;
+        with_nulls[1500] = None;
+        let encoded = encode_i64s(&with_nulls);
+        assert_eq!(encoded[0], KIND_PIECES);
+        let present: Vec<i64> = with_nulls.iter().copied().flatten().collect();
+        let mut cursor = 0;
+        assert_eq!(
+            decode_i64s(&encoded, &mut cursor, present.len()).unwrap(),
+            present
+        );
+    }
+
+    #[test]
+    fn eight_stride_pieces_roundtrip_and_a_ninth_does_not() {
+        let mut eight = Vec::new();
+        for _ in 0..8 {
+            for value in 0..100i64 {
+                eight.push(Some(value));
+            }
+        }
+        let encoded = encode_i64s(&eight);
+        assert_eq!(encoded[0], KIND_PIECES);
+        assert_eq!(u16::from_le_bytes(encoded[1..3].try_into().unwrap()), 8);
+        let mut cursor = 0;
+        assert_eq!(
+            decode_i64s(&encoded, &mut cursor, eight.len()).unwrap(),
+            eight.iter().copied().flatten().collect::<Vec<_>>()
+        );
+        let mut skip = 0;
+        skip_i64s(&encoded, &mut skip, eight.len()).unwrap();
+        assert_eq!(skip, encoded.len());
+
+        let mut nine = Vec::new();
+        for piece in 0..9 {
+            nine.push(Some(piece * 10));
+            nine.push(Some(piece * 10 + 1));
+        }
+        let encoded = encode_i64s(&nine);
+        assert_ne!(encoded[0], KIND_PIECES);
+        let mut cursor = 0;
+        assert_eq!(
+            decode_i64s(&encoded, &mut cursor, nine.len()).unwrap(),
+            nine.iter().copied().flatten().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wrapped_i64_across_the_sign_boundary_uses_kind_9() {
+        let values = [
+            Some(i64::MAX),
+            Some(i64::MIN),
+            Some(i64::MIN + 1),
+            Some(0),
+            Some(1),
+        ];
+        let encoded = encode_i64s(&values);
+        assert_eq!(encoded[0], KIND_PIECES);
+        let mut cursor = 0;
+        assert_eq!(
+            decode_i64s(&encoded, &mut cursor, values.len()).unwrap(),
+            vec![i64::MAX, i64::MIN, i64::MIN + 1, 0, 1]
+        );
+    }
+
+    #[test]
+    fn wrapped_i128_modulo_uses_kind_9() {
+        let values: Vec<Option<i128>> = (0..2048).map(|i| Some(i128::from(i % 1000))).collect();
+        let encoded = encode_i128s(&values);
+        assert_eq!(encoded[0], KIND_PIECES);
+        assert_eq!(u16::from_le_bytes(encoded[1..3].try_into().unwrap()), 3);
+        let mut cursor = 0;
+        let decoded = decode_i128s(&encoded, &mut cursor, values.len()).unwrap();
+        assert_eq!(cursor, encoded.len());
+        for (index, value) in decoded.iter().enumerate() {
+            assert_eq!(*value, i128::from((index % 1000) as u32));
+        }
+        let mut skip = 0;
+        skip_i128s(&encoded, &mut skip, values.len()).unwrap();
+        assert_eq!(skip, encoded.len());
+    }
+
+    #[test]
+    fn legacy_kind_8_block_still_decodes() {
+        let values = [0i64, 5, 7, 1];
+        let mut payload = vec![KIND_BITPACK, 3];
+        payload.extend_from_slice(&0i64.to_le_bytes());
+        let mut packer = BitPacker::default();
+        for value in values {
+            packer.push(u128::from(value as u64), 3);
+        }
+        payload.extend_from_slice(&packer.finish());
+        let mut cursor = 0;
+        assert_eq!(decode_i64s(&payload, &mut cursor, 4).unwrap(), values);
+        assert_eq!(cursor, payload.len());
+        let mut skip = 0;
+        skip_i64s(&payload, &mut skip, 4).unwrap();
+        assert_eq!(skip, payload.len());
+
+        let mut column = vec![KIND_BITPACK, 3];
+        column.extend_from_slice(&0i64.to_le_bytes());
+        let mut packer = BitPacker::default();
+        packer.push(0, 3);
+        packer.push(5, 3);
+        column.extend_from_slice(&packer.finish());
+
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(KIND_CONSTANT);
+        bytes.extend_from_slice(&1000i64.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&column);
+        let rows = decode_block(&schema, &bytes).unwrap();
+        assert_eq!(rows[0].values[1], Scalar::Int(0));
+        assert_eq!(rows[1].values[1], Scalar::Int(5));
+        assert_eq!(rows[0].ts, 1000);
+        assert_eq!(rows[1].ts, 1000);
+    }
+
+    #[test]
+    fn kind_9_rejects_a_zero_stride_and_a_bad_piece_count() {
+        let mut zero_stride = vec![KIND_PIECES];
+        zero_stride.extend_from_slice(&1u16.to_le_bytes());
+        zero_stride.extend_from_slice(&0u32.to_le_bytes());
+        zero_stride.extend_from_slice(&4i64.to_le_bytes());
+        zero_stride.extend_from_slice(&0i64.to_le_bytes());
+        assert!(decode_i64s(&zero_stride, &mut 0, 2).is_err());
+        assert!(skip_i64s(&zero_stride, &mut 0, 2).is_err());
+
+        let mut too_many = vec![KIND_PIECES];
+        too_many.extend_from_slice(&9u16.to_le_bytes());
+        assert!(decode_i64s(&too_many, &mut 0, 4).is_err());
+
+        let mut not_from_zero = vec![KIND_PIECES];
+        not_from_zero.extend_from_slice(&1u16.to_le_bytes());
+        not_from_zero.extend_from_slice(&1u32.to_le_bytes());
+        not_from_zero.extend_from_slice(&0i64.to_le_bytes());
+        not_from_zero.extend_from_slice(&1i64.to_le_bytes());
+        assert!(decode_i64s(&not_from_zero, &mut 0, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("do not start at 0"));
     }
 
     #[test]
