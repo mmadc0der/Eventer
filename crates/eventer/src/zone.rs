@@ -9,10 +9,19 @@
 //! filter otherwise. A bloom hit can be wrong; a miss is not. Numbers use an
 //! inclusive min/max. Floats and JSON stay unpruned. Segments written before
 //! zone maps existed are summarized once on open and the summary is kept.
+//!
+//! The bytes on disk are still that zone file: `EVZN` header, then each block's
+//! length, checksum, and column records. The whole file is replaced by a plain
+//! zstd frame when the frame is strictly smaller, and left raw otherwise. A
+//! batch append rewrites the segment's zone file instead of appending a frame
+//! onto a raw prefix. Readers decompress a zstd magic with a bounded output
+//! size, then parse the zone file. A raw file still loads. A corrupt or
+//! truncated frame is rebuilt from payloads, the same path a corrupt raw file
+//! already takes.
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::codec::{decode_block, ColumnPredicate};
@@ -24,6 +33,13 @@ use crate::value::{Row, Scalar};
 const ZONE_MAGIC: &[u8; 4] = b"EVZN";
 const ZONE_VERSION: u16 = 1;
 const ZONE_HEADER_LEN: usize = 16;
+/// Plain zstd frame magic. Distinct from [`ZONE_MAGIC`].
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+/// Level 1. The zone file is small and rewritten as a whole at the end of a batch.
+const ZONE_ZSTD_LEVEL: i32 = 1;
+/// Cap for a decompressed zone frame. A larger claim is treated as corrupt and
+/// the segment is summarized again from its payloads.
+const MAX_ZONE_UNCOMPRESSED: usize = 512 * 1024 * 1024;
 /// 2048 bits. A block with a few hundred distinct strings still misses almost
 /// every value that was not inserted.
 const BLOOM_BYTES: usize = 256;
@@ -158,7 +174,10 @@ pub(crate) fn load_segment_zones(
 
 /// Append zone records for blocks just committed to this segment.
 ///
-/// Returns the number of bytes added to the sidecar, including a new header.
+/// The sidecar is rewritten as a whole so a compressed frame is never appended
+/// onto a raw prefix. The returned delta is the change in on-disk size and can
+/// be negative when recompression shrinks the file. Those bytes stay in the
+/// index total.
 pub(crate) fn append_zones(
     dir: &Path,
     segment_id: u32,
@@ -166,30 +185,25 @@ pub(crate) fn append_zones(
     field_count: u16,
     zones: &[BlockZone],
     sync: bool,
-) -> Result<u64> {
+) -> Result<i64> {
     if zones.is_empty() {
         return Ok(0);
     }
     let path = zone_path(dir, segment_id);
-    let existed = path.exists();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(&path)?;
-    let before = file.metadata()?.len();
-    if !existed || before == 0 {
-        file.write_all(&header(schema_crc, field_count))?;
-    }
+    let before = match fs::metadata(&path) {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err.into()),
+    };
+    let mut raw = match existing_plain(&path)? {
+        Some(raw) if header_matches(&raw, schema_crc, field_count) => raw,
+        _ => header(schema_crc, field_count).to_vec(),
+    };
     for zone in zones {
-        write_record(&mut file, zone)?;
+        write_record(&mut raw, zone)?;
     }
-    file.flush()?;
-    if sync {
-        file.sync_all()?;
-    }
-    let after = file.metadata()?.len();
-    Ok(after.saturating_sub(before))
+    let after = persist_zone_bytes(&path, &raw, sync)?;
+    Ok(after as i64 - before as i64)
 }
 
 pub(crate) fn schema_crc(schema: &Schema) -> u32 {
@@ -397,10 +411,77 @@ fn read_zone_file(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    match parse_zone_file(&bytes, schema_crc, field_count, block_count) {
+    let plain = match plain_zone_bytes(&bytes) {
+        Ok(plain) => plain,
+        Err(_) => return Ok(None),
+    };
+    match parse_zone_file(&plain, schema_crc, field_count, block_count) {
         Ok(zones) => Ok(Some(zones)),
         Err(_) => Ok(None),
     }
+}
+
+fn existing_plain(path: &Path) -> Result<Option<Vec<u8>>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        Ok(_) => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    match plain_zone_bytes(&bytes) {
+        Ok(plain) => Ok(Some(plain)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn plain_zone_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    if is_zstd_frame(bytes) {
+        decompress_zone_frame(bytes)
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
+fn is_zstd_frame(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[..4] == ZSTD_MAGIC
+}
+
+fn compress_zone_if_smaller(raw: &[u8]) -> Vec<u8> {
+    match zstd::bulk::compress(raw, ZONE_ZSTD_LEVEL) {
+        Ok(frame) if frame.len() < raw.len() && is_zstd_frame(&frame) => frame,
+        _ => raw.to_vec(),
+    }
+}
+
+fn decompress_zone_frame(frame: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = zstd::stream::Decoder::with_buffer(frame).map_err(Error::io)?;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match decoder.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return Err(Error::corrupt("truncated zone map frame")),
+        };
+        if out.len().saturating_add(n) > MAX_ZONE_UNCOMPRESSED {
+            return Err(Error::corrupt("zone map exceeds the decompress bound"));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
+fn header_matches(bytes: &[u8], schema_crc: u32, field_count: u16) -> bool {
+    if bytes.len() < ZONE_HEADER_LEN || &bytes[0..4] != ZONE_MAGIC {
+        return false;
+    }
+    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+    if version != ZONE_VERSION {
+        return false;
+    }
+    let stored_crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let stored_fields = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
+    stored_crc == schema_crc && stored_fields == field_count
 }
 
 fn parse_zone_file(
@@ -463,17 +544,27 @@ fn write_zone_file(
     field_count: u16,
     zones: &[BlockZone],
 ) -> Result<()> {
+    let mut raw = header(schema_crc, field_count).to_vec();
+    for zone in zones {
+        write_record(&mut raw, zone)?;
+    }
+    persist_zone_bytes(path, &raw, true)?;
+    Ok(())
+}
+
+fn persist_zone_bytes(path: &Path, raw: &[u8], sync: bool) -> Result<u64> {
+    let stored = compress_zone_if_smaller(raw);
     let tmp = path.with_extension("zon.partial");
     {
         let mut file = File::create(&tmp)?;
-        file.write_all(&header(schema_crc, field_count))?;
-        for zone in zones {
-            write_record(&mut file, zone)?;
+        file.write_all(&stored)?;
+        file.flush()?;
+        if sync {
+            file.sync_all()?;
         }
-        file.sync_all()?;
     }
     fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(stored.len() as u64)
 }
 
 fn header(schema_crc: u32, field_count: u16) -> [u8; ZONE_HEADER_LEN] {
@@ -485,12 +576,12 @@ fn header(schema_crc: u32, field_count: u16) -> [u8; ZONE_HEADER_LEN] {
     out
 }
 
-fn write_record(file: &mut File, zone: &BlockZone) -> Result<()> {
+fn write_record(out: &mut impl Write, zone: &BlockZone) -> Result<()> {
     let payload = encode_zone(zone);
     let crc = crc32fast::hash(&payload);
-    file.write_all(&(payload.len() as u32).to_le_bytes())?;
-    file.write_all(&crc.to_le_bytes())?;
-    file.write_all(&payload)?;
+    out.write_all(&(payload.len() as u32).to_le_bytes())?;
+    out.write_all(&crc.to_le_bytes())?;
+    out.write_all(&payload)?;
     Ok(())
 }
 
@@ -825,5 +916,81 @@ mod tests {
             false_positives < 80,
             "bloom accepted {false_positives} absent values"
         );
+    }
+
+    #[test]
+    fn plain_zstd_frame_round_trips_and_raw_file_still_loads() {
+        let schema = schema();
+        let crc = schema_crc(&schema);
+        let fields = field_count(&schema).unwrap();
+        let zone = from_rows(
+            &schema,
+            &[row(
+                &schema,
+                r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":1.5}"#,
+            )],
+        );
+        let zones: Vec<BlockZone> = (0..48).map(|_| zone.clone()).collect();
+        let dir = std::env::temp_dir().join(format!(
+            "eventer-zone-zstd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = zone_path(&dir, 1);
+        let first = append_zones(&dir, 1, crc, fields, &zones[..16], true).unwrap();
+        let second = append_zones(&dir, 1, crc, fields, &zones[16..], true).unwrap();
+        let stored = fs::read(&path).unwrap();
+        assert!(is_zstd_frame(&stored), "repeated zone records compress");
+        assert_eq!(first + second, stored.len() as i64);
+        let loaded = read_zone_file(&path, crc, fields, zones.len())
+            .unwrap()
+            .expect("compressed zone file");
+        assert_eq!(loaded, zones);
+
+        let raw = decompress_zone_frame(&stored).unwrap();
+        assert!(stored.len() < raw.len());
+        fs::write(&path, &raw).unwrap();
+        let from_raw = read_zone_file(&path, crc, fields, zones.len())
+            .unwrap()
+            .expect("raw zone file");
+        assert_eq!(from_raw, zones);
+
+        fs::write(&path, &stored[..8]).unwrap();
+        assert!(read_zone_file(&path, crc, fields, zones.len())
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zone_file_stays_raw_when_the_frame_is_not_smaller() {
+        let schema = schema();
+        let zone = from_rows(
+            &schema,
+            &[row(
+                &schema,
+                r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":1.5}"#,
+            )],
+        );
+        let mut raw = header(schema_crc(&schema), field_count(&schema).unwrap()).to_vec();
+        write_record(&mut raw, &zone).unwrap();
+        let stored = compress_zone_if_smaller(&raw);
+        assert!(stored.len() <= raw.len());
+        if stored.len() == raw.len() {
+            assert_eq!(stored, raw);
+            assert!(!is_zstd_frame(&stored));
+        }
+        let tiny = b"not-repetitive-zone";
+        let stored_tiny = compress_zone_if_smaller(tiny);
+        assert!(stored_tiny.len() <= tiny.len());
+        if stored_tiny.len() < tiny.len() {
+            assert!(is_zstd_frame(&stored_tiny));
+        } else {
+            assert_eq!(stored_tiny, tiny);
+        }
     }
 }

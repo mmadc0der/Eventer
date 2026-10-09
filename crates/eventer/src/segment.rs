@@ -101,7 +101,7 @@ impl Catalog {
         self.data_bytes = self.data_bytes.saturating_add(nbytes);
     }
 
-    pub fn append_blocks(&mut self, metas: &[BlockMeta], zones: Vec<BlockZone>, zone_bytes: u64) {
+    pub fn append_blocks(&mut self, metas: &[BlockMeta], zones: Vec<BlockZone>, zone_bytes: i64) {
         let mut zones = zones.into_iter();
         for meta in metas {
             if self.segments.last().map(|segment| segment.id) != Some(meta.segment_id) {
@@ -120,7 +120,7 @@ impl Catalog {
             self.data_bytes += add;
             self.index_bytes += INDEX_ENTRY_LEN as u64;
         }
-        self.index_bytes = self.index_bytes.saturating_add(zone_bytes);
+        self.index_bytes = self.index_bytes.saturating_add_signed(zone_bytes);
     }
 }
 

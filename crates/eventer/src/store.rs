@@ -1080,10 +1080,57 @@ mod tests {
             store.query_with_filter(0, 10_000_000, &user).unwrap().len(),
             per_run as usize
         );
+        let index_on_disk = dir_suffix_bytes(&data, ".idx") + dir_suffix_bytes(&data, ".zon");
+        assert_eq!(
+            store.stats().index_bytes,
+            index_on_disk,
+            "zone bytes stay in the index total"
+        );
+        assert_eq!(
+            store.stats().data_bytes,
+            dir_suffix_bytes(&data, ".dat") + dir_suffix_bytes(&data, ".dict"),
+            "zone bytes are not counted as data"
+        );
         store.close().unwrap();
 
         let zone_file = crate::zone::zone_path(&data, 1);
         assert!(zone_file.exists());
+        let compressed = fs::read(&zone_file).unwrap();
+        assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        let raw = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+        assert!(compressed.len() < raw.len());
+        assert_eq!(&raw[..4], b"EVZN");
+        fs::write(&zone_file, &raw).unwrap();
+        let reopened = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        let resolved = resolve_predicates(reopened.schema(), &predicates).unwrap();
+        assert_eq!(reopened.blocks_in_range(0, 10_000_000, &resolved).len(), 1);
+        assert_eq!(
+            reopened
+                .query_with_filter(0, 10_000_000, &predicates)
+                .unwrap()
+                .len(),
+            per_run as usize
+        );
+        assert_eq!(
+            fs::read(&zone_file).unwrap(),
+            raw,
+            "a raw zone file from an older writer is left in place"
+        );
+        reopened.close().unwrap();
+
+        fs::write(&zone_file, &compressed[..8]).unwrap();
+        let reopened = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        let resolved = resolve_predicates(reopened.schema(), &predicates).unwrap();
+        assert_eq!(reopened.blocks_in_range(0, 10_000_000, &resolved).len(), 1);
+        assert_eq!(
+            reopened
+                .query_with_filter(0, 10_000_000, &predicates)
+                .unwrap()
+                .len(),
+            per_run as usize
+        );
+        reopened.close().unwrap();
+
         fs::remove_file(&zone_file).unwrap();
         let reopened = Store::open_with(&data, &schema, test_options(32)).unwrap();
         let resolved = resolve_predicates(reopened.schema(), &predicates).unwrap();
@@ -1110,6 +1157,15 @@ mod tests {
         let resolved = resolve_predicates(reopened.schema(), &predicates).unwrap();
         assert_eq!(reopened.blocks_in_range(0, 10_000_000, &resolved).len(), 1);
         reopened.close().unwrap();
+    }
+
+    fn dir_suffix_bytes(dir: &Path, suffix: &str) -> u64 {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(suffix))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum()
     }
 
     fn block_kinds(path: &Path) -> Vec<([u8; 4], i64, i64)> {
