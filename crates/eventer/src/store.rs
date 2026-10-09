@@ -152,6 +152,7 @@ impl Store {
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(Vec::new());
         };
+        let _retention = self.pipeline.lock_for_read();
         let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut rows_out = Vec::new();
         let mut response_bytes = 1usize;
@@ -220,6 +221,7 @@ impl Store {
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(b"[]".to_vec());
         };
+        let _retention = self.pipeline.lock_for_read();
         let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut out = Vec::from(b"[");
         let mut wrote = false;
@@ -273,6 +275,25 @@ impl Store {
         }
         out.push(b']');
         Ok(out)
+    }
+
+    /// Delete every block whose maximum timestamp is strictly less than `cutoff_ms`.
+    ///
+    /// The cutoff is the caller's. It is not taken from the newest timestamp in the
+    /// store, so one future event cannot expire the rest of the table. A block is
+    /// kept or dropped as a whole: a row older than `cutoff_ms` stays when it shares
+    /// a block with a row at or after the cutoff. A segment is removed, including
+    /// its `.dat`, `.idx`, `.zon`, and `.dict`, only when every block in it is
+    /// eligible. A mixed segment is rewritten by copying the surviving compressed
+    /// frames unchanged and publishing that file with rename. The segment
+    /// dictionary stays when any surviving frame is `EVBD`.
+    ///
+    /// Queued events are flushed before any file is removed. After this returns,
+    /// a query no longer returns a row from a block whose maximum timestamp is
+    /// below the cutoff, including after the directory is opened again. Rows that
+    /// shared a kept block stay.
+    pub fn drop_blocks_before(&self, cutoff_ms: i64) -> Result<()> {
+        self.pipeline.drop_blocks_before(cutoff_ms)
     }
 
     /// File sizes from the last committed batch. Call [`Store::flush`] first for a stable view.
@@ -1440,5 +1461,409 @@ mod tests {
             ),
             Ok(_) => panic!("missing dictionary opened"),
         }
+    }
+
+    fn compressed_payloads(path: &Path) -> Vec<Vec<u8>> {
+        let data = fs::read(path).unwrap();
+        let mut off = 0usize;
+        let mut out = Vec::new();
+        while off + segment::BLOCK_HEADER_LEN <= data.len() {
+            let magic = &data[off..off + 4];
+            if magic != segment::BLOCK_MAGIC && magic != segment::BLOCK_MAGIC_DICT {
+                break;
+            }
+            let compressed_len =
+                u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+            let start = off + segment::BLOCK_HEADER_LEN;
+            let end = start + compressed_len;
+            assert!(end <= data.len());
+            out.push(data[start..end].to_vec());
+            off = end;
+        }
+        out
+    }
+
+    fn dir_file_lengths(dir: &Path) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            out.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.metadata().unwrap().len(),
+            ));
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn drop_blocks_before_removes_old_blocks_and_keeps_the_rest() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        for ts in [1_000, 2_000, 3_000] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let data_file = segment::data_path(&data, 1);
+        let before = compressed_payloads(&data_file);
+        assert_eq!(before.len(), 3);
+        let kept = before[1..].to_vec();
+
+        // max_ts of the first block is 1000. A cutoff equal to that max keeps it.
+        let unchanged = dir_file_lengths(&data);
+        store.drop_blocks_before(1_000).unwrap();
+        assert_eq!(dir_file_lengths(&data), unchanged);
+        assert_eq!(store.query(0, 10_000).unwrap().len(), 3);
+
+        store.drop_blocks_before(1_001).unwrap();
+        let rows = store.query(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_value(&store, &rows[0])["ts"], 2_000);
+        assert_eq!(row_value(&store, &rows[1])["ts"], 3_000);
+        assert_eq!(compressed_payloads(&data_file), kept);
+        assert_eq!(store.stats().blocks, 2);
+        assert_eq!(store.stats().rows, 2);
+        store.close().unwrap();
+
+        let reopened = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        let rows = reopened.query(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_value(&reopened, &rows[0])["ts"], 2_000);
+        assert_eq!(row_value(&reopened, &rows[1])["ts"], 3_000);
+        assert_eq!(compressed_payloads(&data_file), kept);
+        assert!(
+            fs::read_dir(&data).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("partial")
+            }),
+            "a partial temp must not remain as a segment"
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn row_older_than_cutoff_stays_when_its_block_is_kept() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for ts in [10, 30, 40, 50] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        // First block max is 30, second is 50. Cutoff 35 drops only the first block.
+        store.drop_blocks_before(35).unwrap();
+        let rows = store.query(0, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_value(&store, &rows[0])["ts"], 40);
+        assert_eq!(row_value(&store, &rows[1])["ts"], 50);
+
+        // 10 is below the cutoff and shares a block with 30, whose max is not eligible.
+        store
+            .append_json(&event(10, Some(1), "view", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(30, Some(2), "view", None, "1.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.drop_blocks_before(20).unwrap();
+        let kept = store.query(0, 20).unwrap();
+        assert!(
+            kept.iter().any(|row| row_value(&store, row)["ts"] == 10),
+            "a row below the cutoff stays inside a block that is not eligible"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn drop_blocks_before_merges_slices_of_the_same_segment() {
+        // One frame is 90 bytes. Rotating at 100 bytes inside the second flush
+        // leaves four catalog entries for two data files: the first commit's
+        // block, an empty placeholder, then the two frames of that flush.
+        let open = |dir: &TempDir| {
+            let schema = write_schema(dir.path());
+            let data = dir.path().join("data");
+            let mut options = test_options(1);
+            options.segment_bytes = 100;
+            let store = Store::open_with(&data, &schema, options).unwrap();
+            store
+                .append_json(&event(1_000, Some(1), "click", None, "1.00"))
+                .unwrap();
+            store.flush().unwrap();
+            store
+                .append_json(&event(2_000, Some(2), "view", None, "2.00"))
+                .unwrap();
+            store
+                .append_json(&event(3_000, Some(3), "buy", None, "3.00"))
+                .unwrap();
+            store.flush().unwrap();
+            assert_eq!(store.stats().segments, 4, "split catalog entries");
+            assert!(segment::data_path(&data, 1).exists());
+            assert!(segment::data_path(&data, 2).exists());
+            assert!(!segment::data_path(&data, 3).exists());
+            (schema, data, store)
+        };
+
+        let dir = TempDir::new();
+        let (schema, data, store) = open(&dir);
+        store.drop_blocks_before(i64::MIN).unwrap();
+        assert_eq!(store.query(0, 10_000).unwrap().len(), 3);
+        assert_eq!(store.stats().segments, 2);
+        store.close().unwrap();
+        let reopened = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        assert_eq!(reopened.query(0, 10_000).unwrap().len(), 3);
+        reopened.close().unwrap();
+
+        let dir = TempDir::new();
+        let (schema, data, store) = open(&dir);
+        store.drop_blocks_before(1_001).unwrap();
+        assert!(
+            segment::data_path(&data, 1).exists(),
+            "segment 1 still holds the block at ts 2000"
+        );
+        let rows = store.query(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_value(&store, &rows[0])["ts"], 2_000);
+        assert_eq!(row_value(&store, &rows[1])["ts"], 3_000);
+        store.close().unwrap();
+        let reopened = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        assert_eq!(reopened.query(0, 10_000).unwrap().len(), 2);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn drop_blocks_before_deletes_a_fully_expired_segment() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let mut options = test_options(1);
+        options.segment_bytes = 1;
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        store
+            .append_json(&event(1_000, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2_000, Some(2), "view", None, "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        assert!(store.stats().segments >= 2);
+        assert!(segment::data_path(&data, 1).exists());
+        assert!(segment::data_path(&data, 2).exists());
+
+        store.drop_blocks_before(1_001).unwrap();
+        for path in [
+            segment::data_path(&data, 1),
+            segment::index_path(&data, 1),
+            crate::zone::zone_path(&data, 1),
+            segment::dictionary_path(&data, 1),
+        ] {
+            assert!(
+                !path.exists(),
+                "expired segment file still present: {path:?}"
+            );
+        }
+        assert!(segment::data_path(&data, 2).exists());
+        assert_eq!(store.query(0, 10_000).unwrap().len(), 1);
+
+        store
+            .append_json(&event(3_000, Some(3), "buy", None, "3.00"))
+            .unwrap();
+        let rows = store.query(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_value(&store, &rows[0])["ts"], 2_000);
+        assert_eq!(row_value(&store, &rows[1])["ts"], 3_000);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn drop_blocks_before_keeps_catalog_when_a_later_segment_fails() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let mut options = test_options(1);
+        options.segment_bytes = 1;
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        for ts in [1_000, 2_000, 3_000] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let present: Vec<u32> = (1..8)
+            .filter(|id| segment::data_path(&data, *id).exists())
+            .collect();
+        assert!(
+            present.len() >= 3,
+            "expected one data file per event, found {present:?}"
+        );
+        let blocked = segment::data_path(&data, present[1]);
+        fs::remove_file(&blocked).unwrap();
+        fs::create_dir(&blocked).unwrap();
+
+        let err = store.drop_blocks_before(i64::MAX).unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::Io(_)),
+            "expected the blocked unlink to fail the drop, got {err:?}"
+        );
+        assert!(
+            !segment::data_path(&data, present[0]).exists(),
+            "the segment published before the error must stay deleted"
+        );
+        // `query` flushes first and observes the poison flag. Stats read the
+        // catalog directly, which is what a query would walk if it ignored poison.
+        assert_eq!(
+            store.stats().rows, 1,
+            "deleted and failed segments must leave the catalog; the unvisited one stays"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn drop_blocks_before_respects_cutoffs_outside_the_store() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        for ts in [1_000, 2_000, 3_000] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let before = dir_file_lengths(&data);
+        store.drop_blocks_before(i64::MIN).unwrap();
+        assert_eq!(
+            dir_file_lengths(&data),
+            before,
+            "a cutoff older than every block changes no file lengths"
+        );
+        assert_eq!(store.query(0, 10_000).unwrap().len(), 3);
+
+        store.drop_blocks_before(i64::MAX).unwrap();
+        assert!(store.query(0, 10_000).unwrap().is_empty());
+        assert_eq!(store.stats().rows, 0);
+        assert_eq!(store.stats().segments, 0);
+        let names: Vec<_> = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.starts_with("seg-")),
+            "expired store still has segment files: {names:?}"
+        );
+        store
+            .append_json(&event(4_000, Some(4), "click", None, "1.00"))
+            .unwrap();
+        assert_eq!(store.query(0, 10_000).unwrap().len(), 1);
+        store.close().unwrap();
+
+        let reopened = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        let rows = reopened.query(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_value(&reopened, &rows[0])["ts"], 4_000);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn open_ignores_a_retention_partial_and_keeps_dictionary_frames() {
+        let dir = TempDir::new();
+        let schema_path = write_schema(dir.path());
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let row = |ts: i64| {
+            crate::value::parse_event(&schema, &event(ts, Some(ts), "click", None, "1.00")).unwrap()
+        };
+        let first = crate::codec::encode_block(&schema, &[row(1_000)]).unwrap();
+        let second = crate::codec::encode_block(&schema, &[row(2_000)]).unwrap();
+        let plain = zstd::bulk::compress(&first.bytes, 1).unwrap();
+        let dict = vec![9u8; 128];
+        let compressed = zstd::bulk::Compressor::with_dictionary(1, &dict)
+            .unwrap()
+            .compress(&second.bytes)
+            .unwrap();
+        let frame1 = segment::frame_block(
+            &plain,
+            first.bytes.len() as u32,
+            first.row_count,
+            first.min_ts,
+            first.max_ts,
+            false,
+        )
+        .unwrap();
+        let frame2 = segment::frame_block(
+            &compressed,
+            second.bytes.len() as u32,
+            second.row_count,
+            second.min_ts,
+            second.max_ts,
+            true,
+        )
+        .unwrap();
+        assert_eq!(&frame2[..4], segment::BLOCK_MAGIC_DICT);
+        let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
+        let meta1 = segment::BlockMeta {
+            segment_id: 1,
+            offset: 0,
+            compressed_len: plain.len() as u32,
+            uncompressed_len: first.bytes.len() as u32,
+            row_count: first.row_count,
+            min_ts: first.min_ts,
+            max_ts: first.max_ts,
+        };
+        let meta2 = segment::BlockMeta {
+            segment_id: 1,
+            offset: frame1.len() as u64,
+            compressed_len: compressed.len() as u32,
+            uncompressed_len: second.bytes.len() as u32,
+            row_count: second.row_count,
+            min_ts: second.min_ts,
+            max_ts: second.max_ts,
+        };
+        active.write_framed(&frame1, &meta1).unwrap();
+        active.write_framed(&frame2, &meta2).unwrap();
+        active.flush_os(true).unwrap();
+        drop(active);
+        segment::write_dictionary(&data, 1, &dict).unwrap();
+        fs::write(data.join(".seg-000001.dat.partial"), b"torn").unwrap();
+        fs::write(data.join("seg-000001.dat.partial"), b"torn").unwrap();
+
+        let store = Store::open_with(&data, &schema_path, test_options(1)).unwrap();
+        assert_eq!(store.query(0, 10_000).unwrap().len(), 2);
+        let survivor = compressed_payloads(&segment::data_path(&data, 1))[1].clone();
+        store.drop_blocks_before(1_001).unwrap();
+        assert_eq!(
+            compressed_payloads(&segment::data_path(&data, 1)),
+            vec![survivor]
+        );
+        assert!(segment::dictionary_path(&data, 1).exists());
+        let rows = store.query(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_value(&store, &rows[0])["ts"], 2_000);
+        assert!(
+            !data.join(".seg-000001.dat.partial").exists(),
+            "rename publishes the segment; the temp file is not left behind"
+        );
+        assert!(
+            data.join("seg-000001.dat.partial").exists(),
+            "a name open does not list can sit beside the segment"
+        );
+        store.close().unwrap();
+
+        let reopened = Store::open_with(&data, &schema_path, test_options(1)).unwrap();
+        assert_eq!(reopened.query(0, 10_000).unwrap().len(), 1);
+        reopened.drop_blocks_before(i64::MAX).unwrap();
+        assert!(!segment::dictionary_path(&data, 1).exists());
+        assert!(!segment::data_path(&data, 1).exists());
+        reopened.close().unwrap();
     }
 }

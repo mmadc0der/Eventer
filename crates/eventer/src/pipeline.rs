@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ type Ack = mpsc::Sender<Result<()>>;
 enum Cmd {
     Event { json: Vec<u8>, ack: Option<Ack> },
     Flush { ack: Ack },
+    DropBefore { cutoff_ms: i64, ack: Ack },
     Shutdown { ack: mpsc::Sender<()> },
 }
 
@@ -41,6 +42,11 @@ enum EncoderMsg {
     },
     Flush {
         target: u64,
+        ack: Ack,
+    },
+    DropBefore {
+        target: u64,
+        cutoff_ms: i64,
         ack: Ack,
     },
     Shutdown {
@@ -65,6 +71,7 @@ struct BlockIn {
 enum CompIn {
     Block(BlockIn),
     Flush { seq: u64, ack: Ack },
+    DropBefore { seq: u64, cutoff_ms: i64, ack: Ack },
     Shutdown { seq: u64, ack: mpsc::Sender<()> },
 }
 
@@ -302,6 +309,11 @@ enum CompOut {
         seq: u64,
         ack: Ack,
     },
+    DropBefore {
+        seq: u64,
+        cutoff_ms: i64,
+        ack: Ack,
+    },
     Shutdown {
         seq: u64,
         ack: mpsc::Sender<()>,
@@ -316,9 +328,10 @@ enum CompOut {
 fn comp_out_seq(msg: &CompOut) -> u64 {
     match msg {
         CompOut::Block(block) => block.seq,
-        CompOut::Flush { seq, .. } | CompOut::Shutdown { seq, .. } | CompOut::Skip { seq, .. } => {
-            *seq
-        }
+        CompOut::Flush { seq, .. }
+        | CompOut::DropBefore { seq, .. }
+        | CompOut::Shutdown { seq, .. }
+        | CompOut::Skip { seq, .. } => *seq,
     }
 }
 
@@ -327,6 +340,8 @@ pub struct Pipeline {
     threads: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) catalog: Arc<Mutex<Catalog>>,
     poison: Arc<Mutex<Option<Error>>>,
+    /// Held for writing while segment files are replaced. Queries hold it for reading.
+    retention: Arc<RwLock<()>>,
 }
 
 pub struct PipelineConfig {
@@ -343,6 +358,7 @@ pub struct PipelineConfig {
 
 pub fn spawn(config: PipelineConfig) -> Result<Pipeline> {
     let poison = Arc::new(Mutex::new(None));
+    let retention = Arc::new(RwLock::new(()));
     let dict_publish = Arc::new(DictPublish::new());
     let (cmd_tx, cmd_rx) = bounded::<Cmd>(4096);
     let (parse_tx, parse_rx) = bounded::<Job>(4096);
@@ -357,6 +373,7 @@ pub fn spawn(config: PipelineConfig) -> Result<Pipeline> {
         config.zstd_level,
         Arc::clone(&config.catalog),
         Arc::clone(&poison),
+        Arc::clone(&retention),
         Arc::clone(&dict_publish),
         &config.schema,
     )?;
@@ -403,6 +420,7 @@ pub fn spawn(config: PipelineConfig) -> Result<Pipeline> {
         threads: Mutex::new(threads),
         catalog: config.catalog,
         poison,
+        retention,
     })
 }
 
@@ -443,6 +461,23 @@ impl Pipeline {
             .map_err(|_| Error::Closed)?;
         ack_rx.recv().map_err(|_| Error::Closed)??;
         self.fail_if_poisoned()
+    }
+
+    pub fn drop_blocks_before(&self, cutoff_ms: i64) -> Result<()> {
+        self.fail_if_poisoned()?;
+        let tx = self.sender()?;
+        let (ack_tx, ack_rx) = mpsc::channel();
+        tx.send(Cmd::DropBefore {
+            cutoff_ms,
+            ack: ack_tx,
+        })
+        .map_err(|_| Error::Closed)?;
+        ack_rx.recv().map_err(|_| Error::Closed)??;
+        self.fail_if_poisoned()
+    }
+
+    pub(crate) fn lock_for_read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.retention.read().unwrap_or_else(|err| err.into_inner())
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -500,6 +535,18 @@ fn dispatch_loop(rx: Receiver<Cmd>, parse_tx: Sender<Job>, enc_tx: Sender<Encode
                     break;
                 }
             }
+            Cmd::DropBefore { cutoff_ms, ack } => {
+                if enc_tx
+                    .send(EncoderMsg::DropBefore {
+                        target: seq,
+                        cutoff_ms,
+                        ack,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Cmd::Shutdown { ack } => {
                 let _ = enc_tx.send(EncoderMsg::Shutdown { target: seq, ack });
                 break;
@@ -536,7 +583,7 @@ fn encode_loop(
     let mut pending: BTreeMap<u64, (Result<Row>, Option<Ack>)> = BTreeMap::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut acks: Vec<Option<Ack>> = Vec::new();
-    let mut flushes: VecDeque<(u64, Ack)> = VecDeque::new();
+    let mut controls: VecDeque<PendingControl> = VecDeque::new();
     let mut shutdown: Option<(u64, mpsc::Sender<()>)> = None;
     let mut stage_seq = 1u64;
     let mut disconnected = false;
@@ -545,13 +592,13 @@ fn encode_loop(
     loop {
         let mut idle = false;
         match rx.recv_timeout(linger) {
-            Ok(msg) => accept_encoder_msg(msg, &mut pending, &mut flushes, &mut shutdown),
+            Ok(msg) => accept_encoder_msg(msg, &mut pending, &mut controls, &mut shutdown),
             Err(RecvTimeoutError::Timeout) => idle = true,
             Err(RecvTimeoutError::Disconnected) => disconnected = true,
         }
         while let Ok(msg) = rx.try_recv() {
             idle = false;
-            accept_encoder_msg(msg, &mut pending, &mut flushes, &mut shutdown);
+            accept_encoder_msg(msg, &mut pending, &mut controls, &mut shutdown);
         }
         drain_parsed(&mut pending, &mut next, &mut rows, &mut acks);
         if disconnected && !pending.contains_key(&next) {
@@ -568,8 +615,8 @@ fn encode_loop(
                     &publish,
                 );
             }
-            while let Some((_, ack)) = flushes.pop_front() {
-                let _ = ack.send(Err(Error::Closed));
+            while let Some(control) = controls.pop_front() {
+                fail_control(control);
             }
             if let Some((_, ack)) = shutdown.take() {
                 let _ = tx.send(CompIn::Shutdown {
@@ -593,9 +640,9 @@ fn encode_loop(
             );
         }
 
-        while flushes
+        while controls
             .front()
-            .map(|(target, _)| next == *target + 1)
+            .map(|control| next == control.target + 1)
             .unwrap_or(false)
         {
             if !rows.is_empty() {
@@ -611,14 +658,19 @@ fn encode_loop(
                     &publish,
                 );
             }
-            let (_, ack) = flushes.pop_front().unwrap();
-            if tx
-                .send(CompIn::Flush {
+            let control = controls.pop_front().unwrap();
+            let msg = match control.kind {
+                ControlKind::Flush(ack) => CompIn::Flush {
                     seq: stage_seq,
                     ack,
-                })
-                .is_err()
-            {
+                },
+                ControlKind::DropBefore { cutoff_ms, ack } => CompIn::DropBefore {
+                    seq: stage_seq,
+                    cutoff_ms,
+                    ack,
+                },
+            };
+            if tx.send(msg).is_err() {
                 return;
             }
             stage_seq += 1;
@@ -627,7 +679,7 @@ fn encode_loop(
         if idle
             && !rows.is_empty()
             && pending.is_empty()
-            && flushes.is_empty()
+            && controls.is_empty()
             && shutdown.is_none()
         {
             let n = rows.len();
@@ -644,7 +696,7 @@ fn encode_loop(
         }
 
         if let Some((target, _)) = &shutdown {
-            if flushes.is_empty() && pending.is_empty() && next == *target + 1 {
+            if controls.is_empty() && pending.is_empty() && next == *target + 1 {
                 if !rows.is_empty() {
                     let n = rows.len();
                     emit_block(
@@ -669,17 +721,46 @@ fn encode_loop(
     }
 }
 
+enum ControlKind {
+    Flush(Ack),
+    DropBefore { cutoff_ms: i64, ack: Ack },
+}
+
+struct PendingControl {
+    target: u64,
+    kind: ControlKind,
+}
+
+fn fail_control(control: PendingControl) {
+    match control.kind {
+        ControlKind::Flush(ack) | ControlKind::DropBefore { ack, .. } => {
+            let _ = ack.send(Err(Error::Closed));
+        }
+    }
+}
+
 fn accept_encoder_msg(
     msg: EncoderMsg,
     pending: &mut BTreeMap<u64, (Result<Row>, Option<Ack>)>,
-    flushes: &mut VecDeque<(u64, Ack)>,
+    controls: &mut VecDeque<PendingControl>,
     shutdown: &mut Option<(u64, mpsc::Sender<()>)>,
 ) {
     match msg {
         EncoderMsg::Parsed { seq, row, ack } => {
             pending.insert(seq, (row, ack));
         }
-        EncoderMsg::Flush { target, ack } => flushes.push_back((target, ack)),
+        EncoderMsg::Flush { target, ack } => controls.push_back(PendingControl {
+            target,
+            kind: ControlKind::Flush(ack),
+        }),
+        EncoderMsg::DropBefore {
+            target,
+            cutoff_ms,
+            ack,
+        } => controls.push_back(PendingControl {
+            target,
+            kind: ControlKind::DropBefore { cutoff_ms, ack },
+        }),
         EncoderMsg::Shutdown { target, ack } => {
             if shutdown.is_none() {
                 *shutdown = Some((target, ack));
@@ -807,6 +888,15 @@ fn compress_loop(rx: Receiver<CompIn>, tx: Sender<CompOut>, level: i32, publish:
     while let Ok(msg) = rx.recv() {
         let out = match msg {
             CompIn::Flush { seq, ack } => CompOut::Flush { seq, ack },
+            CompIn::DropBefore {
+                seq,
+                cutoff_ms,
+                ack,
+            } => CompOut::DropBefore {
+                seq,
+                cutoff_ms,
+                ack,
+            },
             CompIn::Shutdown { seq, ack } => CompOut::Shutdown { seq, ack },
             CompIn::Block(block) => {
                 compress_block(&mut plain, &mut with_dict, &publish, level, block)
@@ -896,6 +986,71 @@ fn compress_block(
     }
 }
 
+/// Collapse catalog entries that share a segment id.
+///
+/// An empty placeholder contributes no blocks. Offsets name frames in the
+/// one `.dat`, so the merged `data_len` is the end of the last frame rather
+/// than the sum of per-entry lengths.
+fn union_catalog_segments(existing: &[segment::SegmentState]) -> Vec<segment::SegmentState> {
+    let mut grouped: Vec<Vec<&segment::SegmentState>> = Vec::new();
+    for segment in existing {
+        if let Some(slices) = grouped.iter_mut().find(|slices| slices[0].id == segment.id) {
+            slices.push(segment);
+        } else {
+            grouped.push(vec![segment]);
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|slices| merge_segment_slices(&slices))
+        .collect()
+}
+
+fn merge_segment_slices(slices: &[&segment::SegmentState]) -> segment::SegmentState {
+    let id = slices[0].id;
+    let mut paired: Vec<(BlockMeta, BlockZone)> = Vec::new();
+    for slice in slices {
+        for (index, block) in slice.blocks.iter().enumerate() {
+            if paired
+                .iter()
+                .any(|(existing, _)| existing.offset == block.offset)
+            {
+                continue;
+            }
+            let zone = slice.zones.get(index).cloned().unwrap_or(BlockZone {
+                columns: Vec::new(),
+            });
+            paired.push((block.clone(), zone));
+        }
+    }
+    paired.sort_by_key(|(block, _)| block.offset);
+    let data_len = paired
+        .iter()
+        .map(|(block, _)| {
+            block.offset + BLOCK_HEADER_LEN as u64 + u64::from(block.compressed_len)
+        })
+        .max()
+        .unwrap_or(0);
+    let index_len = segment::INDEX_HEADER_LEN as u64
+        + paired.len() as u64 * segment::INDEX_ENTRY_LEN as u64;
+    let dict_bytes = slices
+        .iter()
+        .map(|slice| slice.dict_bytes)
+        .max()
+        .unwrap_or(0);
+    let uses_dict = slices.iter().any(|slice| slice.uses_dict);
+    let (blocks, zones) = paired.into_iter().unzip();
+    segment::SegmentState {
+        id,
+        blocks,
+        data_len,
+        index_len,
+        dict_bytes,
+        uses_dict,
+        zones,
+    }
+}
+
 struct Disk {
     dir: PathBuf,
     rotate_at: u64,
@@ -904,6 +1059,7 @@ struct Disk {
     next_id: u32,
     catalog: Arc<Mutex<Catalog>>,
     poison: Arc<Mutex<Option<Error>>>,
+    retention: Arc<RwLock<()>>,
     publish: Arc<DictPublish>,
     schema_crc: u32,
     field_count: u16,
@@ -920,6 +1076,7 @@ impl Disk {
         level: i32,
         catalog: Arc<Mutex<Catalog>>,
         poison: Arc<Mutex<Option<Error>>>,
+        retention: Arc<RwLock<()>>,
         publish: Arc<DictPublish>,
         schema: &Schema,
     ) -> Result<Self> {
@@ -950,6 +1107,7 @@ impl Disk {
             next_id,
             catalog,
             poison,
+            retention,
             publish,
             plain: zstd::bulk::Compressor::new(level).ok(),
             dict_compressor: None,
@@ -1210,6 +1368,112 @@ impl Disk {
         Ok(())
     }
 
+    /// Delete blocks with `max_ts < cutoff_ms` and the segment files that held only those blocks.
+    fn drop_blocks_before(&mut self, cutoff_ms: i64) -> Result<()> {
+        self.health()?;
+        let retention = Arc::clone(&self.retention);
+        let _guard = retention.write().unwrap_or_else(|err| err.into_inner());
+        let active_id = self.active.as_ref().map(|segment| segment.id);
+        if let Some(mut segment) = self.active.take() {
+            if let Err(err) = segment.flush_os(true) {
+                // Put the handle back before returning. Leaving `active` empty
+                // makes the next prepare mint a new id while `self.dict` still
+                // belongs to this one, so later frames are `EVBD` with no sidecar.
+                self.active = Some(segment);
+                self.poison(err.clone());
+                return Err(err);
+            }
+        }
+        let outcome = self.rewrite_expired_segments(cutoff_ms);
+        let restored = self.restore_active(active_id);
+        if let Err(err) = outcome.and(restored) {
+            self.poison(err.clone());
+            return Err(err);
+        }
+        self.health()
+    }
+
+    fn rewrite_expired_segments(&mut self, cutoff_ms: i64) -> Result<()> {
+        let mut catalog = self.catalog.lock().unwrap_or_else(|err| err.into_inner());
+        // One commit can append to the current segment and then rotate. The
+        // catalog then has two entries for that id: blocks already committed,
+        // and the frames written in this commit (plus an empty placeholder for
+        // the new id). Each entry's `data_len` covers only its own frames.
+        // Union by offset before the cutoff so a fully expired slice cannot
+        // unlink a file that another slice of the same id still needs.
+        let merged = union_catalog_segments(&catalog.segments);
+        let mut kept = Vec::with_capacity(merged.len());
+        for (index, segment) in merged.iter().enumerate() {
+            match segment::drop_eligible_blocks(
+                &self.dir,
+                segment,
+                self.schema_crc,
+                self.field_count,
+                cutoff_ms,
+            ) {
+                Ok(Some(state)) => kept.push(state),
+                Ok(None) => {}
+                Err(err) => {
+                    // Files for `kept` are already published, and this segment may
+                    // have lost its data file. Leave it out. Segments not visited
+                    // yet still match the files on disk, so queries must keep
+                    // using those entries instead of the pre-call catalog.
+                    kept.extend(merged[index + 1..].iter().cloned());
+                    catalog.segments = kept;
+                    catalog.recompute_totals(&self.dir);
+                    return Err(err);
+                }
+            }
+        }
+        catalog.segments = kept;
+        catalog.recompute_totals(&self.dir);
+        Ok(())
+    }
+
+    fn restore_active(&mut self, active_id: Option<u32>) -> Result<()> {
+        let Some(id) = active_id else {
+            return Ok(());
+        };
+        let state = self
+            .catalog
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .segments
+            .iter()
+            .find(|segment| segment.id == id)
+            .cloned();
+        match state {
+            Some(state) => {
+                // Reopen even when the segment is already past the rotation limit.
+                // The next append then rotates the same way it did before this call,
+                // including clearing a segment dictionary that belongs to this id.
+                match ActiveSegment::open_existing(&self.dir, &state) {
+                    Ok(segment) => {
+                        self.active = Some(segment);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        // Same as a segment this call fully deleted: the next
+                        // prepare must not frame `EVBD` with the old dictionary.
+                        self.forget_active_segment();
+                        Err(err)
+                    }
+                }
+            }
+            None => {
+                self.forget_active_segment();
+                Ok(())
+            }
+        }
+    }
+
+    fn forget_active_segment(&mut self) {
+        self.dict = None;
+        self.dict_compressor = None;
+        self.segment_epoch = self.publish.bump_and_clear();
+        self.active = None;
+    }
+
     fn dictionary_installed(&self) -> bool {
         self.dict.is_some()
     }
@@ -1276,7 +1540,7 @@ fn writer_loop(rx: Receiver<CompOut>, mut disk: Disk, linger: Duration) {
             let _ = disk.commit(&mut batch, true);
             for msg in pending.into_values() {
                 match msg {
-                    CompOut::Flush { ack, .. } => {
+                    CompOut::Flush { ack, .. } | CompOut::DropBefore { ack, .. } => {
                         let _ = ack.send(Err(Error::Closed));
                     }
                     CompOut::Shutdown { ack, .. } => {
@@ -1328,6 +1592,11 @@ fn writer_loop(rx: Receiver<CompOut>, mut disk: Disk, linger: Duration) {
             match control {
                 Some(CompOut::Flush { ack, .. }) => {
                     let health = disk.sync_only().and_then(|_| disk.health());
+                    let _ = ack.send(health);
+                    next += 1;
+                }
+                Some(CompOut::DropBefore { cutoff_ms, ack, .. }) => {
+                    let health = disk.drop_blocks_before(cutoff_ms);
                     let _ = ack.send(health);
                     next += 1;
                 }
