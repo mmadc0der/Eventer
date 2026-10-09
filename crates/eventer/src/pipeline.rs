@@ -1230,8 +1230,8 @@ fn write_zone_batch(
     metas: &[BlockMeta],
     zones: &[BlockZone],
     sync: bool,
-) -> Result<u64> {
-    let mut written = 0u64;
+) -> Result<i64> {
+    let mut written = 0i64;
     let mut start = 0;
     while start < metas.len() {
         let segment_id = metas[start].segment_id;
