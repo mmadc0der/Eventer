@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,8 +93,13 @@ impl Store {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         let schema = schema::load_schema(schema_path.as_ref())?;
-        ensure_schema_lock(&dir, &schema)?;
+        let lock_action = schema_lock_action(&dir, &schema)?;
         let catalog = Arc::new(std::sync::Mutex::new(segment::load_catalog(&dir, &schema)?));
+        if lock_action == SchemaLockAction::Rewrite {
+            // Catalog load already decoded the narrower blocks. Commit the wider
+            // schema only after that succeeds, so a decode failure leaves the lock.
+            write_schema_lock(&dir.join("schema.lock"), &schema.canonical())?;
+        }
         let pipeline = pipeline::spawn(PipelineConfig {
             dir: dir.clone(),
             schema: Arc::new(schema.clone()),
@@ -457,19 +463,44 @@ fn validate_options(options: &StoreOptions) -> Result<()> {
     Ok(())
 }
 
-fn ensure_schema_lock(dir: &Path, schema: &Schema) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaLockAction {
+    /// `schema.lock` already describes this schema, or it was just created.
+    Ready,
+    /// The open schema appends fields. Rewrite the lock after the catalog loads.
+    Rewrite,
+}
+
+fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
     let path = dir.join("schema.lock");
     let canonical = schema.canonical();
-    if path.exists() {
-        let existing = fs::read_to_string(&path)?;
-        if existing != canonical {
-            return Err(Error::schema(
-                "schema.lock does not match the supplied schema; this directory was created with a different schema",
-            ));
-        }
-    } else {
-        fs::write(&path, canonical)?;
+    if !path.exists() {
+        write_schema_lock(&path, &canonical)?;
+        return Ok(SchemaLockAction::Ready);
     }
+    let existing = fs::read_to_string(&path)?;
+    if existing == canonical {
+        return Ok(SchemaLockAction::Ready);
+    }
+    let locked = schema::parse_schema(&existing).map_err(|err| {
+        Error::schema(format!(
+            "schema.lock does not match the supplied schema; this directory was created with a different schema ({err})"
+        ))
+    })?;
+    match schema::schema_evolution(&locked, schema)? {
+        schema::SchemaEvolution::Unchanged => Ok(SchemaLockAction::Ready),
+        schema::SchemaEvolution::Appended { .. } => Ok(SchemaLockAction::Rewrite),
+    }
+}
+
+fn write_schema_lock(path: &Path, canonical: &str) -> Result<()> {
+    let tmp = path.with_file_name("schema.lock.partial");
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(canonical.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -628,6 +659,21 @@ mod tests {
         }
         store.close().unwrap();
 
+        let data_file = segment::data_path(&data, 1);
+        let segment_bytes = fs::read(&data_file).unwrap();
+        let frames = segment::frames_in(&segment_bytes);
+        assert!(
+            frames.len() >= 2,
+            "expected more than one block, got {}",
+            frames.len()
+        );
+        assert!(
+            frames.iter().all(|frame| {
+                frame.header_len == segment::BLOCK_HEADER_LEN && frame.min_ts.is_none()
+            }),
+            "new frames must omit min_ts and max_ts"
+        );
+
         let index = segment::index_path(&data, 1);
         fs::write(&index, b"EVIX").unwrap();
         let schema_text = parse_schema(SCHEMA_JSON).unwrap();
@@ -637,8 +683,83 @@ mod tests {
         let rows = store.query(0, 10_000).unwrap();
         assert_eq!(rows.len(), 10);
         assert_eq!(row_value(&store, &rows[9])["user_id"], 9);
-        assert!(segment::index_path(&data, 1).exists());
+        assert_eq!(
+            fs::read(&data_file).unwrap(),
+            segment_bytes,
+            "rebuilding the index must not write timestamps back into the segment"
+        );
+        let indexed = segment::read_index(&segment::index_path(&data, 1)).unwrap();
+        assert_eq!(indexed.len(), frames.len());
+        assert_eq!(indexed[0].min_ts, 1_000);
+        assert_eq!(indexed.last().unwrap().max_ts, 1_009);
         store.close().unwrap();
+    }
+
+    #[test]
+    fn compressed_index_reopens_and_raw_index_still_loads() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        let count = 80i64;
+        for i in 0..count {
+            store
+                .append_json(&event(i, Some(i), "click", Some("n"), "3.25"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.query(0, count).unwrap().len(), count as usize);
+        let index_on_disk = dir_suffix_bytes(&data, ".idx") + dir_suffix_bytes(&data, ".zon");
+        assert_eq!(store.stats().index_bytes, index_on_disk);
+        store.drop_blocks_before(i64::MIN).unwrap();
+        assert_eq!(
+            store.stats().index_bytes, index_on_disk,
+            "a no-op retention pass still counts the compressed index"
+        );
+        store.close().unwrap();
+
+        let index = segment::index_path(&data, 1);
+        let compressed = fs::read(&index).unwrap();
+        assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        let raw = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+        assert!(compressed.len() < raw.len());
+        assert_eq!(&raw[..4], b"EVIX");
+
+        let reopened = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(reopened.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(reopened.stats().index_bytes, index_on_disk);
+        reopened.close().unwrap();
+
+        fs::write(&index, &raw).unwrap();
+        let legacy = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(legacy.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            raw,
+            "a raw EVIX file from an older writer is left in place"
+        );
+        legacy.close().unwrap();
+
+        fs::write(&index, &compressed[..compressed.len() - 1]).unwrap();
+        let rebuilt = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(rebuilt.query(0, count).unwrap().len(), count as usize);
+        let rebuilt_bytes = fs::read(&index).unwrap();
+        assert_ne!(rebuilt_bytes, compressed[..compressed.len() - 1]);
+        rebuilt.close().unwrap();
+        let used = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(used.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            rebuilt_bytes,
+            "the rebuilt index is reused"
+        );
+        used.close().unwrap();
+
+        fs::remove_file(&index).unwrap();
+        let restored = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(restored.query(0, count).unwrap().len(), count as usize);
+        assert!(index.exists());
+        restored.close().unwrap();
     }
 
     #[test]
@@ -658,6 +779,205 @@ mod tests {
             Err(err) => assert!(err.to_string().contains("schema.lock"), "{err}"),
             Ok(_store) => panic!("opened a directory with a mismatched schema"),
         }
+    }
+
+    const NARROW_SCHEMA: &str = r#"{
+        "timestamp_field": "ts",
+        "fields": [
+            {"name": "ts", "type": "timestamp"},
+            {"name": "user_id", "type": "int"},
+            {"name": "event_time", "type": "timestamp"},
+            {"name": "amount", "type": "decimal", "scale": 2}
+        ]
+    }"#;
+
+    const WIDE_SCHEMA: &str = r#"{
+        "timestamp_field": "ts",
+        "fields": [
+            {"name": "ts", "type": "timestamp"},
+            {"name": "user_id", "type": "int"},
+            {"name": "event_time", "type": "timestamp"},
+            {"name": "amount", "type": "decimal", "scale": 2},
+            {"name": "region", "type": "string"},
+            {"name": "extra", "type": "int"}
+        ]
+    }"#;
+
+    #[test]
+    fn appended_columns_read_null_on_old_rows_and_roundtrip_on_new_rows() {
+        let dir = TempDir::new();
+        let narrow = dir.path().join("narrow.json");
+        fs::write(&narrow, NARROW_SCHEMA).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &narrow, test_options(2)).unwrap();
+        store
+            .append_json(br#"{"ts":1000,"user_id":7,"amount":"1.50"}"#)
+            .unwrap();
+        store
+            .append_json(br#"{"ts":2000,"user_id":8,"event_time":1500,"amount":"2.00"}"#)
+            .unwrap();
+        store.close().unwrap();
+
+        let segment = segment::data_path(&data, 1);
+        let segment_before = fs::read(&segment).unwrap();
+        let wide = dir.path().join("wide.json");
+        fs::write(&wide, WIDE_SCHEMA).unwrap();
+        let store = Store::open_with(&data, &wide, test_options(2)).unwrap();
+        assert_eq!(
+            fs::read(&segment).unwrap(),
+            segment_before,
+            "opening with appended columns rewrote a segment file"
+        );
+        let locked = fs::read_to_string(data.join("schema.lock")).unwrap();
+        assert_eq!(locked, parse_schema(WIDE_SCHEMA).unwrap().canonical());
+
+        let old = store.query(0, 10_000).unwrap();
+        assert_eq!(old.len(), 2);
+        for (row, user_id, amount) in [(&old[0], 7, "1.50"), (&old[1], 8, "2.00")] {
+            let value = row_value(&store, row);
+            assert_eq!(value["user_id"], user_id);
+            assert_eq!(value["amount"], amount);
+            assert!(value["region"].is_null());
+            assert!(value["extra"].is_null());
+        }
+        assert!(row_value(&store, &old[0])["event_time"].is_null());
+        assert_eq!(row_value(&store, &old[1])["event_time"], 1500);
+
+        let only_null_region = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("region".into(), Scalar::Null)])
+            .unwrap();
+        assert_eq!(only_null_region.len(), 2);
+        let west = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("region".into(), "west".into())])
+            .unwrap();
+        assert!(west.is_empty());
+
+        store
+            .append_json(br#"{"ts":3000,"user_id":9,"amount":"3.25","region":"west","extra":4}"#)
+            .unwrap();
+        store.close().unwrap();
+        let segment_after = fs::read(&segment).unwrap();
+        assert!(
+            segment_after.starts_with(&segment_before),
+            "the new row rewrote blocks stored before the added columns"
+        );
+
+        let store = Store::open_with(&data, &wide, test_options(2)).unwrap();
+        assert_eq!(
+            fs::read_to_string(data.join("schema.lock")).unwrap(),
+            locked
+        );
+        let rows = store.query(0, 10_000).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(row_value(&store, &rows[0])["region"].is_null());
+        assert!(row_value(&store, &rows[0])["extra"].is_null());
+        assert_eq!(row_value(&store, &rows[0])["user_id"], 7);
+        assert_eq!(row_value(&store, &rows[2])["region"], "west");
+        assert_eq!(row_value(&store, &rows[2])["extra"], 4);
+        assert_eq!(row_value(&store, &rows[2])["amount"], "3.25");
+        let west = store
+            .query_with_filter(0, 10_000, &[Predicate::Eq("region".into(), "west".into())])
+            .unwrap();
+        assert_eq!(west.len(), 1);
+        assert_eq!(row_value(&store, &west[0])["user_id"], 9);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn schema_edits_other_than_append_are_rejected() {
+        let dir = TempDir::new();
+        let narrow = dir.path().join("narrow.json");
+        fs::write(&narrow, NARROW_SCHEMA).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &narrow, test_options(2)).unwrap();
+        store
+            .append_json(br#"{"ts":1000,"user_id":1,"amount":"1.00"}"#)
+            .unwrap();
+        store.close().unwrap();
+        let lock_before = fs::read(data.join("schema.lock")).unwrap();
+
+        let rejected = [
+            (
+                "type",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "user_id", "type": "float"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "amount", "type": "decimal", "scale": 2}
+                    ]
+                }"#,
+            ),
+            (
+                "removed",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "user_id", "type": "int"},
+                        {"name": "event_time", "type": "timestamp"}
+                    ]
+                }"#,
+            ),
+            (
+                "reordered",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "user_id", "type": "int"},
+                        {"name": "amount", "type": "decimal", "scale": 2}
+                    ]
+                }"#,
+            ),
+            (
+                "renamed",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "uid", "type": "int"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "amount", "type": "decimal", "scale": 2}
+                    ]
+                }"#,
+            ),
+            (
+                "scale",
+                r#"{
+                    "timestamp_field": "ts",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "user_id", "type": "int"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "amount", "type": "decimal", "scale": 4}
+                    ]
+                }"#,
+            ),
+            (
+                "timestamp",
+                r#"{
+                    "timestamp_field": "event_time",
+                    "fields": [
+                        {"name": "ts", "type": "timestamp"},
+                        {"name": "user_id", "type": "int"},
+                        {"name": "event_time", "type": "timestamp"},
+                        {"name": "amount", "type": "decimal", "scale": 2}
+                    ]
+                }"#,
+            ),
+        ];
+        for (reason, text) in rejected {
+            let path = dir.path().join(format!("{reason}.json"));
+            fs::write(&path, text).unwrap();
+            match Store::open_with(&data, &path, test_options(2)) {
+                Err(err) => assert!(err.to_string().contains("schema.lock"), "{reason}: {err}"),
+                Ok(_store) => panic!("opened after a {reason} schema change"),
+            }
+        }
+        assert_eq!(fs::read(data.join("schema.lock")).unwrap(), lock_before);
     }
 
     #[test]
@@ -1189,125 +1509,16 @@ mod tests {
             .sum()
     }
 
-    fn block_kinds(dir: &Path, id: u32) -> Vec<([u8; 4], i64, i64)> {
-        let indexed = segment::read_index(&segment::index_path(dir, id)).unwrap();
-        let data = fs::read(segment::data_path(dir, id)).unwrap();
-        indexed
+    fn block_kinds(path: &Path) -> Vec<([u8; 4], i64, i64)> {
+        let data = fs::read(path).unwrap();
+        let frames = segment::frames_in(&data);
+        let indexed = segment::read_index(&path.with_extension("idx")).unwrap();
+        assert_eq!(frames.len(), indexed.len());
+        frames
             .into_iter()
-            .map(|meta| {
-                let off = meta.offset as usize;
-                let magic = data[off..off + 4].try_into().unwrap();
-                (magic, meta.min_ts, meta.max_ts)
-            })
+            .zip(indexed)
+            .map(|(frame, meta)| (frame.magic, meta.min_ts, meta.max_ts))
             .collect()
-    }
-
-    #[test]
-    fn twelve_twenty_and_thirty_six_byte_frames_round_trip() {
-        let dir = TempDir::new();
-        let schema_path = write_schema(dir.path());
-        let data = dir.path().join("data");
-        fs::create_dir_all(&data).unwrap();
-        let schema = parse_schema(SCHEMA_JSON).unwrap();
-        let encoded = |ts: i64| {
-            let row =
-                crate::value::parse_event(&schema, &event(ts, Some(ts), "click", None, "1.00"))
-                    .unwrap();
-            crate::codec::encode_block(&schema, &[row]).unwrap()
-        };
-        let first = encoded(1_000);
-        let second = encoded(2_000);
-        let third = encoded(3_000);
-        let compressed_first = zstd::bulk::compress(&first.bytes, 1).unwrap();
-        let compressed_second = zstd::bulk::compress(&second.bytes, 1).unwrap();
-        let compressed_third = zstd::bulk::compress(&third.bytes, 1).unwrap();
-        let frame12 = segment::frame_block(&compressed_first, false).unwrap();
-        let frame20 = segment::frame_legacy_block(
-            &compressed_second,
-            second.bytes.len() as u32,
-            second.row_count,
-            second.min_ts,
-            second.max_ts,
-            false,
-            segment::BLOCK_HEADER_LEN_V20,
-        )
-        .unwrap();
-        let frame36 = segment::frame_legacy_block(
-            &compressed_third,
-            third.bytes.len() as u32,
-            third.row_count,
-            third.min_ts,
-            third.max_ts,
-            false,
-            segment::BLOCK_HEADER_LEN_V36,
-        )
-        .unwrap();
-        assert_eq!(frame12.len(), segment::BLOCK_HEADER_LEN + compressed_first.len());
-        assert_eq!(frame20.len(), segment::BLOCK_HEADER_LEN_V20 + compressed_second.len());
-        assert_eq!(frame36.len(), segment::BLOCK_HEADER_LEN_V36 + compressed_third.len());
-
-        let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
-        let mut write = |framed: &[u8],
-                         encoded: &crate::codec::EncodedBlock,
-                         compressed_len: u32,
-                         offset: u64| {
-            let meta = segment::BlockMeta {
-                segment_id: 1,
-                offset,
-                compressed_len,
-                uncompressed_len: encoded.bytes.len() as u32,
-                row_count: encoded.row_count,
-                min_ts: encoded.min_ts,
-                max_ts: encoded.max_ts,
-                header_len: (framed.len() - compressed_len as usize) as u8,
-            };
-            active.write_framed(framed, &meta).unwrap();
-        };
-        write(&frame12, &first, compressed_first.len() as u32, 0);
-        write(
-            &frame20,
-            &second,
-            compressed_second.len() as u32,
-            frame12.len() as u64,
-        );
-        write(
-            &frame36,
-            &third,
-            compressed_third.len() as u32,
-            (frame12.len() + frame20.len()) as u64,
-        );
-        active.flush_os(true).unwrap();
-        drop(active);
-
-        let data_file = segment::data_path(&data, 1);
-        let segment_bytes = fs::read(&data_file).unwrap();
-        let expect = |store: &Store| {
-            let rows = store.query(0, 10_000).unwrap();
-            assert_eq!(rows.len(), 3);
-            assert_eq!(row_value(store, &rows[0])["ts"], 1_000);
-            assert_eq!(row_value(store, &rows[1])["ts"], 2_000);
-            assert_eq!(row_value(store, &rows[2])["ts"], 3_000);
-        };
-        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
-        expect(&store);
-        store.close().unwrap();
-        assert_eq!(fs::read(&data_file).unwrap(), segment_bytes);
-
-        fs::remove_file(segment::index_path(&data, 1)).unwrap();
-        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
-        expect(&store);
-        store.close().unwrap();
-        assert_eq!(
-            fs::read(&data_file).unwrap(),
-            segment_bytes,
-            "rebuilding a missing index must leave the segment bytes unchanged"
-        );
-        let rebuilt = segment::read_index(&segment::index_path(&data, 1)).unwrap();
-        assert_eq!(rebuilt.len(), 3);
-        assert_eq!(rebuilt[0].uncompressed_len, first.bytes.len() as u32);
-        assert_eq!(rebuilt[0].row_count, first.row_count);
-        assert_eq!(rebuilt[1].min_ts, 2_000);
-        assert_eq!(rebuilt[2].max_ts, 3_000);
     }
 
     #[test]
@@ -1325,7 +1536,19 @@ mod tests {
             .collect();
         let encoded = crate::codec::encode_block(&schema, &rows).unwrap();
         let compressed = zstd::bulk::compress(&encoded.bytes, 3).unwrap();
-        let framed = segment::frame_block(&compressed, false).unwrap();
+        let framed = segment::frame_block_v1(
+            &compressed,
+            encoded.bytes.len() as u32,
+            encoded.row_count,
+            encoded.min_ts,
+            encoded.max_ts,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            framed.len(),
+            segment::BLOCK_HEADER_LEN_V1 + compressed.len()
+        );
         assert_eq!(&framed[..4], segment::BLOCK_MAGIC);
         let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
         let meta = segment::BlockMeta {
@@ -1336,7 +1559,6 @@ mod tests {
             row_count: encoded.row_count,
             min_ts: encoded.min_ts,
             max_ts: encoded.max_ts,
-            header_len: segment::BLOCK_HEADER_LEN as u8,
         };
         active.write_framed(&framed, &meta).unwrap();
         active.flush_os(true).unwrap();
@@ -1354,6 +1576,24 @@ mod tests {
         assert_eq!(row_value(&store, &got[4])["action"], "click");
         assert_eq!(row_value(&store, &got[4])["amount"], "1.00");
         assert!(!segment::dictionary_path(&data, 1).exists());
+        let segment_bytes = fs::read(segment::data_path(&data, 1)).unwrap();
+        let frames = segment::frames_in(&segment_bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].header_len, segment::BLOCK_HEADER_LEN_V1);
+        assert_eq!(frames[0].min_ts, Some(encoded.min_ts));
+        assert_eq!(frames[0].max_ts, Some(encoded.max_ts));
+        store.close().unwrap();
+
+        fs::remove_file(segment::index_path(&data, 1)).unwrap();
+        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
+        assert_eq!(store.query(0, 10).unwrap().len(), 5);
+        assert_eq!(
+            fs::read(segment::data_path(&data, 1)).unwrap(),
+            segment_bytes
+        );
+        let indexed = segment::read_index(&segment::index_path(&data, 1)).unwrap();
+        assert_eq!(indexed[0].min_ts, encoded.min_ts);
+        assert_eq!(indexed[0].max_ts, encoded.max_ts);
         store.close().unwrap();
 
         let dict_path = segment::dictionary_path(&data, 1);
@@ -1366,6 +1606,69 @@ mod tests {
         fs::write(&dict_path, &oversized).unwrap();
         let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
         assert_eq!(store.query(0, 10).unwrap().len(), 5);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn legacy_dictionary_header_round_trips_after_the_index_is_removed() {
+        let dir = TempDir::new();
+        let schema_path = write_schema(dir.path());
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let rows: Vec<Row> = (0..4)
+            .map(|ts| {
+                crate::value::parse_event(&schema, &event(10 + ts, Some(ts), "view", None, "2.00"))
+                    .unwrap()
+            })
+            .collect();
+        let encoded = crate::codec::encode_block(&schema, &rows).unwrap();
+        let dict = vec![0x11u8; 128];
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(1, &dict).unwrap();
+        let compressed = compressor.compress(&encoded.bytes).unwrap();
+        let framed = segment::frame_block_v1(
+            &compressed,
+            encoded.bytes.len() as u32,
+            encoded.row_count,
+            encoded.min_ts,
+            encoded.max_ts,
+            true,
+        )
+        .unwrap();
+        assert_eq!(&framed[..4], segment::BLOCK_MAGIC_DICT);
+        segment::write_dictionary(&data, 1, &dict).unwrap();
+        let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
+        let meta = segment::BlockMeta {
+            segment_id: 1,
+            offset: 0,
+            compressed_len: compressed.len() as u32,
+            uncompressed_len: encoded.bytes.len() as u32,
+            row_count: encoded.row_count,
+            min_ts: encoded.min_ts,
+            max_ts: encoded.max_ts,
+        };
+        active.write_framed(&framed, &meta).unwrap();
+        active.flush_os(true).unwrap();
+        drop(active);
+
+        let segment_bytes = fs::read(segment::data_path(&data, 1)).unwrap();
+        let frames = segment::frames_in(&segment_bytes);
+        assert_eq!(frames[0].header_len, segment::BLOCK_HEADER_LEN_V1);
+        assert_eq!(frames[0].magic, *segment::BLOCK_MAGIC_DICT);
+
+        fs::remove_file(segment::index_path(&data, 1)).unwrap();
+        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
+        let got = store.query(0, 100).unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(row_value(&store, &got[0])["ts"], 10);
+        assert_eq!(row_value(&store, &got[3])["user_id"], 3);
+        assert_eq!(
+            fs::read(segment::data_path(&data, 1)).unwrap(),
+            segment_bytes
+        );
+        let indexed = segment::read_index(&segment::index_path(&data, 1)).unwrap();
+        assert_eq!(indexed[0].min_ts, encoded.min_ts);
+        assert_eq!(indexed[0].max_ts, encoded.max_ts);
         store.close().unwrap();
     }
 
@@ -1407,7 +1710,7 @@ mod tests {
         let data = dir.path().join("data");
         let data_file = segment::data_path(&data, 1);
         let dict_file = segment::dictionary_path(&data, 1);
-        let kinds = block_kinds(&data, 1);
+        let kinds = block_kinds(&data_file);
         let first_dict = kinds
             .iter()
             .position(|(magic, _, _)| magic == segment::BLOCK_MAGIC_DICT)
@@ -1488,7 +1791,7 @@ mod tests {
         store.close().unwrap();
 
         let data_file = segment::data_path(&data, 1);
-        let kinds = block_kinds(&data, 1);
+        let kinds = block_kinds(&data_file);
         assert!(
             kinds.len() > 1,
             "expected the sample to span more than one block"
@@ -1559,7 +1862,25 @@ mod tests {
     }
 
     fn compressed_payloads(path: &Path) -> Vec<Vec<u8>> {
-        segment::compressed_payloads(path).unwrap()
+        let data = fs::read(path).unwrap();
+        let mut off = 0usize;
+        let mut out = Vec::new();
+        for frame in segment::frames_in(&data) {
+            let compressed_at = if frame.header_len == segment::BLOCK_HEADER_LEN {
+                off + 4
+            } else {
+                off + 8
+            };
+            let compressed_len =
+                u32::from_le_bytes(data[compressed_at..compressed_at + 4].try_into().unwrap())
+                    as usize;
+            let start = off + frame.header_len;
+            let end = start + compressed_len;
+            assert!(end <= data.len());
+            out.push(data[start..end].to_vec());
+            off = end;
+        }
+        out
     }
 
     fn dir_file_lengths(dir: &Path) -> Vec<(String, u64)> {
@@ -1665,10 +1986,9 @@ mod tests {
 
     #[test]
     fn drop_blocks_before_merges_slices_of_the_same_segment() {
-        // A one-row frame is smaller than 100 bytes, so the first flush stays
-        // on segment 1. The second flush appends one frame there, then rotates
-        // once that segment is past 100 bytes. That leaves four catalog
-        // entries for two data files.
+        // One frame is 90 bytes. Rotating at 100 bytes inside the second flush
+        // leaves four catalog entries for two data files: the first commit's
+        // block, an empty placeholder, then the two frames of that flush.
         let open = |dir: &TempDir| {
             let schema = write_schema(dir.path());
             let data = dir.path().join("data");
@@ -1801,7 +2121,8 @@ mod tests {
         // `query` flushes first and observes the poison flag. Stats read the
         // catalog directly, which is what a query would walk if it ignored poison.
         assert_eq!(
-            store.stats().rows, 1,
+            store.stats().rows,
+            1,
             "deleted and failed segments must leave the catalog; the unvisited one stays"
         );
         store.close().unwrap();
@@ -1871,8 +2192,24 @@ mod tests {
             .unwrap()
             .compress(&second.bytes)
             .unwrap();
-        let frame1 = segment::frame_block(&plain, false).unwrap();
-        let frame2 = segment::frame_block(&compressed, true).unwrap();
+        let frame1 = segment::frame_block_v1(
+            &plain,
+            first.bytes.len() as u32,
+            first.row_count,
+            first.min_ts,
+            first.max_ts,
+            false,
+        )
+        .unwrap();
+        let frame2 = segment::frame_block_v1(
+            &compressed,
+            second.bytes.len() as u32,
+            second.row_count,
+            second.min_ts,
+            second.max_ts,
+            true,
+        )
+        .unwrap();
         assert_eq!(&frame2[..4], segment::BLOCK_MAGIC_DICT);
         let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
         let meta1 = segment::BlockMeta {
@@ -1883,7 +2220,6 @@ mod tests {
             row_count: first.row_count,
             min_ts: first.min_ts,
             max_ts: first.max_ts,
-            header_len: segment::BLOCK_HEADER_LEN as u8,
         };
         let meta2 = segment::BlockMeta {
             segment_id: 1,
@@ -1893,7 +2229,6 @@ mod tests {
             row_count: second.row_count,
             min_ts: second.min_ts,
             max_ts: second.max_ts,
-            header_len: segment::BLOCK_HEADER_LEN as u8,
         };
         active.write_framed(&frame1, &meta1).unwrap();
         active.write_framed(&frame2, &meta2).unwrap();

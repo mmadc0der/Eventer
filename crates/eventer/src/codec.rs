@@ -107,6 +107,19 @@ pub(crate) fn decode_rows_in_range_filtered(
     let mut budget = max_string_bytes;
 
     for (index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            if index <= schema.timestamp_index {
+                return Err(Error::corrupt("timestamp column is missing"));
+            }
+            for rest in index..schema.fields.len() {
+                let nulls = vec![Scalar::Null; nrows];
+                if let Some(predicate) = predicates.iter().find(|pred| pred.index == rest) {
+                    apply_eq(&mut mask, &nulls, &predicate.allowed);
+                }
+                columns[rest] = Some(nulls);
+            }
+            break;
+        }
         let predicate = predicates.iter().find(|pred| pred.index == index);
         let is_timestamp = index == schema.timestamp_index;
         let is_filter = is_timestamp || predicate.is_some();
@@ -245,7 +258,16 @@ fn decode_rows(
     let mut budget = max_string_bytes;
     let mut cursor = 4;
     let mut columns = Vec::with_capacity(schema.fields.len());
-    for field in &schema.fields {
+    for (index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            // Columns appended after this block was written are null.
+            // The timestamp is part of every locked schema, so it is never absent.
+            if index <= schema.timestamp_index {
+                return Err(Error::corrupt("timestamp column is missing"));
+            }
+            columns.push(vec![Scalar::Null; nrows]);
+            continue;
+        }
         columns.push(decode_column(
             field.ty,
             bytes,
@@ -1286,6 +1308,11 @@ fn read_timestamp_column(schema: &Schema, bytes: &[u8]) -> Result<Vec<i64>> {
     Err(Error::corrupt("timestamp column is missing"))
 }
 
+/// True when `cursor` is at the end of a block, so this column was not stored.
+fn column_was_not_stored(bytes: &[u8], cursor: usize) -> bool {
+    cursor == bytes.len()
+}
+
 fn skip_column(
     ty: FieldType,
     bytes: &[u8],
@@ -1293,6 +1320,12 @@ fn skip_column(
     nrows: usize,
     reject_null_timestamp: bool,
 ) -> Result<()> {
+    if column_was_not_stored(bytes, *cursor) {
+        if reject_null_timestamp {
+            return Err(Error::corrupt("timestamp column is missing"));
+        }
+        return Ok(());
+    }
     let present = read_present(bytes, cursor, nrows)?;
     let present_count = match &present {
         None => nrows,
@@ -2509,6 +2542,77 @@ mod tests {
         write_nulls(&mut bytes, &nulls);
         bytes.extend_from_slice(&encode_strings(&values, false));
         bytes
+    }
+
+    #[test]
+    fn appended_columns_decode_as_null_and_a_torn_tail_does_not() {
+        let narrow = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let wide = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "region", "type": "string"},
+                    {"name": "extra", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let row = parse_event(&narrow, br#"{"ts":10,"user_id":7}"#).unwrap();
+        let encoded = encode_block(&narrow, &[row]).unwrap();
+        let decoded = decode_block(&wide, &encoded.bytes).unwrap();
+        assert_eq!(decoded[0].values[1], Scalar::Int(7));
+        assert_eq!(decoded[0].values[2], Scalar::Null);
+        assert_eq!(decoded[0].values[3], Scalar::Null);
+        assert_eq!(decoded[0].ts, 10);
+
+        let null_region = decode_rows_in_range_filtered(
+            &wide,
+            &encoded.bytes,
+            0,
+            100,
+            usize::MAX,
+            &[ColumnPredicate {
+                index: 2,
+                allowed: vec![Scalar::Null],
+            }],
+        )
+        .unwrap();
+        assert_eq!(null_region.len(), 1);
+        let west = decode_rows_in_range_filtered(
+            &wide,
+            &encoded.bytes,
+            0,
+            100,
+            usize::MAX,
+            &[ColumnPredicate {
+                index: 2,
+                allowed: vec![Scalar::Str("west".into())],
+            }],
+        )
+        .unwrap();
+        assert!(west.is_empty());
+
+        let wide_row =
+            parse_event(&wide, br#"{"ts":11,"user_id":8,"region":"west","extra":3}"#).unwrap();
+        let wide_block = encode_block(&wide, &[wide_row]).unwrap();
+        let decoded = decode_block(&wide, &wide_block.bytes).unwrap();
+        assert_eq!(decoded[0].values[2], Scalar::Str("west".into()));
+        assert_eq!(decoded[0].values[3], Scalar::Int(3));
+
+        let mut torn = encoded.bytes.clone();
+        torn.push(0xff);
+        assert!(decode_block(&wide, &torn).is_err());
     }
 
     #[test]
@@ -4088,4 +4192,5 @@ mod tests {
             .to_string()
             .contains("period"));
         assert!(skip_f64s(&bad_period, &mut 0, 6).is_err());
-    }}
+    }
+}

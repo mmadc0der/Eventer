@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{
     self, frame_block, read_dictionary, ActiveSegment, BlockMeta, Catalog, BLOCK_HEADER_LEN,
-    DICT_MAX_BYTES, DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX,
+    BLOCK_HEADER_LEN_V1, BLOCK_HEADER_LEN_V20, DICT_MAX_BYTES, DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX,
 };
 use crate::value::{parse_event, Row, Scalar};
 use crate::zone::{self, BlockZone};
@@ -999,6 +999,24 @@ fn union_catalog_segments(existing: &[segment::SegmentState]) -> Vec<segment::Se
         .collect()
 }
 
+/// Header size implied by the next byte after this frame: 36 for a legacy
+/// frame, 20 otherwise. `end` is the next block's offset or the slice `data_len`.
+fn frame_header_len(block: &BlockMeta, end: Option<u64>) -> u64 {
+    let Some(end) = end else {
+        return BLOCK_HEADER_LEN as u64;
+    };
+    let header = end
+        .saturating_sub(block.offset)
+        .saturating_sub(u64::from(block.compressed_len));
+    if header == BLOCK_HEADER_LEN_V1 as u64 {
+        BLOCK_HEADER_LEN_V1 as u64
+    } else if header == BLOCK_HEADER_LEN_V20 as u64 {
+        BLOCK_HEADER_LEN_V20 as u64
+    } else {
+        BLOCK_HEADER_LEN as u64
+    }
+}
+
 fn merge_segment_slices(slices: &[&segment::SegmentState]) -> segment::SegmentState {
     let id = slices[0].id;
     let mut paired: Vec<(BlockMeta, BlockZone)> = Vec::new();
@@ -1019,8 +1037,18 @@ fn merge_segment_slices(slices: &[&segment::SegmentState]) -> segment::SegmentSt
     paired.sort_by_key(|(block, _)| block.offset);
     let data_len = paired
         .iter()
-        .map(|(block, _)| {
-            block.offset + u64::from(block.header_len) + u64::from(block.compressed_len)
+        .enumerate()
+        .map(|(index, (block, _))| {
+            let next_offset = paired.get(index + 1).map(|(next, _)| next.offset);
+            let slice_end = slices.iter().find_map(|slice| {
+                slice
+                    .blocks
+                    .iter()
+                    .any(|existing| existing.offset == block.offset)
+                    .then_some(slice.data_len)
+            });
+            let header = frame_header_len(block, next_offset.or(slice_end));
+            block.offset + header + u64::from(block.compressed_len)
         })
         .max()
         .unwrap_or(0);
@@ -1152,15 +1180,16 @@ impl Disk {
         }
     }
 
-    fn prepare(&mut self) -> Result<()> {
+    fn prepare(&mut self) -> Result<i64> {
         let rotate = self
             .active
             .as_ref()
             .map(|segment| segment.data_len >= self.rotate_at)
             .unwrap_or(false);
+        let mut index_delta = 0i64;
         if rotate {
             if let Some(mut segment) = self.active.take() {
-                segment.flush_os(true)?;
+                index_delta = segment.flush_os(true)?;
             }
         }
         if self.active.is_none() {
@@ -1177,7 +1206,7 @@ impl Disk {
                 self.segment_epoch = self.publish.bump_and_clear();
             }
         }
-        Ok(())
+        Ok(index_delta)
     }
 
     fn commit(&mut self, batch: &mut Vec<BlockOut>, sync: bool) -> Result<()> {
@@ -1191,8 +1220,9 @@ impl Disk {
         let mut zones = Vec::with_capacity(batch.len());
         let mut acks = Vec::new();
         let result = (|| {
+            let mut index_delta = 0i64;
             for item in batch.iter_mut() {
-                self.prepare()?;
+                index_delta = index_delta.saturating_add(self.prepare()?);
                 let (framed, compressed_len) = self.frame_for(item)?;
                 let segment = self.active.as_mut().expect("segment prepared");
                 if framed.len() != BLOCK_HEADER_LEN + compressed_len as usize {
@@ -1206,16 +1236,17 @@ impl Disk {
                     row_count: item.row_count,
                     min_ts: item.min_ts,
                     max_ts: item.max_ts,
-                    header_len: BLOCK_HEADER_LEN as u8,
                 };
                 segment.write_framed(&framed, &meta)?;
                 metas.push(meta);
                 zones.push(item.zone.clone());
             }
-            self.active
-                .as_mut()
-                .expect("segment prepared")
-                .flush_os(sync)?;
+            index_delta = index_delta.saturating_add(
+                self.active
+                    .as_mut()
+                    .expect("segment prepared")
+                    .flush_os(sync)?,
+            );
             let zone_bytes = write_zone_batch(
                 &self.dir,
                 self.schema_crc,
@@ -1224,7 +1255,7 @@ impl Disk {
                 &zones,
                 sync,
             )?;
-            Ok(zone_bytes)
+            Ok(zone_bytes.saturating_add(index_delta))
         })();
         match result {
             Ok(zone_bytes) => {

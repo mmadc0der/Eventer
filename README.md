@@ -37,7 +37,7 @@ Types: `int` (i64), `float` (f64), `bool`, `string` (dictionary-encoded when tha
 }
 ```
 
-The first open writes `schema.lock` into the data directory. A later open with a different schema is rejected.
+The first open writes `schema.lock` into the data directory. A later open may append fields at the end of that locked list. The lock file is rewritten to the new canonical schema, and rows stored before the append read null for the new columns. Old segment files stay as they were written. A different timestamp field, a type or decimal-scale change, a removed field, a renamed field, or a reordered field is rejected.
 
 ## Build
 
@@ -103,7 +103,7 @@ Return codes: `0` ok, `-1` bad argument, `-2` I/O, `-3` event or schema, `-4` qu
 3. Compress threads run zstd (default level 3).
 4. One writer thread batches blocks, appends them to the current segment, then appends sparse-index entries. It fsyncs on flush, close, and durable appends.
 
-Segments rotate after 64 MiB (`seg-000001.dat` plus `seg-000001.idx`). Each block stores its own min/max timestamp. A crash can leave a torn tail; the next open scans complete blocks, truncates the tear, and rebuilds the index if it disagrees.
+Segments rotate after 64 MiB (`seg-000001.dat` plus `seg-000001.idx`). The sparse index stores each block's min/max timestamp. New block frames do not repeat those two fields. A crash can leave a torn tail; the next open scans complete blocks, truncates the tear, and rebuilds the index if it disagrees. Rebuilding a frame that has no timestamps decodes the payload and rewrites only the index. Older 36-byte `EVBK` and `EVBD` headers that still contain the timestamps still scan and decode.
 
 Inside a block, integers, timestamps, and decimals use a constant, a constant stride, up to eight constant-stride pieces, an exact-width bit packing of the delta from the minimum, or a byte-width frame of reference, whichever is smaller. Kinds already written by older blocks still decode. Bools are bit-packed. Repeated strings use a dictionary when that encoding is smaller. JSON columns use that same string encoding on the preserved field text. Nulls are a bitmap.
 
