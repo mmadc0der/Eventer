@@ -621,6 +621,68 @@ mod tests {
     }
 
     #[test]
+    fn compressed_index_reopens_and_raw_index_still_loads() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        let count = 80i64;
+        for i in 0..count {
+            store
+                .append_json(&event(i, Some(i), "click", Some("n"), "3.25"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.query(0, count).unwrap().len(), count as usize);
+        let index_on_disk = dir_suffix_bytes(&data, ".idx") + dir_suffix_bytes(&data, ".zon");
+        assert_eq!(store.stats().index_bytes, index_on_disk);
+        store.close().unwrap();
+
+        let index = segment::index_path(&data, 1);
+        let compressed = fs::read(&index).unwrap();
+        assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        let raw = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+        assert!(compressed.len() < raw.len());
+        assert_eq!(&raw[..4], b"EVIX");
+
+        let reopened = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(reopened.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(reopened.stats().index_bytes, index_on_disk);
+        reopened.close().unwrap();
+
+        fs::write(&index, &raw).unwrap();
+        let legacy = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(legacy.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            raw,
+            "a raw EVIX file from an older writer is left in place"
+        );
+        legacy.close().unwrap();
+
+        fs::write(&index, &compressed[..compressed.len() - 1]).unwrap();
+        let rebuilt = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(rebuilt.query(0, count).unwrap().len(), count as usize);
+        let rebuilt_bytes = fs::read(&index).unwrap();
+        assert_ne!(rebuilt_bytes, compressed[..compressed.len() - 1]);
+        rebuilt.close().unwrap();
+        let used = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(used.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            rebuilt_bytes,
+            "the rebuilt index is reused"
+        );
+        used.close().unwrap();
+
+        fs::remove_file(&index).unwrap();
+        let restored = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(restored.query(0, count).unwrap().len(), count as usize);
+        assert!(index.exists());
+        restored.close().unwrap();
+    }
+
+    #[test]
     fn schema_mismatch_is_rejected() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());

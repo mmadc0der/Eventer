@@ -21,6 +21,11 @@ pub const DICT_VERSION: u16 = 1;
 pub const DICT_MAX_BYTES: usize = 4 * 1024;
 /// Plain zstd level for the on-disk sidecar. Block frames keep the store level.
 const DICT_SIDECAR_ZSTD_LEVEL: i32 = 3;
+/// Plain zstd level for the sparse index. The segment dictionary is not used.
+const INDEX_ZSTD_LEVEL: i32 = 1;
+/// Cap for a decompressed index frame. A larger claim is corrupt and the index
+/// is rebuilt from the segment.
+const MAX_INDEX_UNCOMPRESSED: usize = 512 * 1024 * 1024;
 /// Little-endian zstd frame magic (`0xFD2FB528`).
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Uncompressed sealed-block sample kept before training one dictionary.
@@ -101,7 +106,16 @@ impl Catalog {
         self.data_bytes = self.data_bytes.saturating_add(nbytes);
     }
 
-    pub fn append_blocks(&mut self, metas: &[BlockMeta], zones: Vec<BlockZone>, zone_bytes: i64) {
+    /// `on_disk_delta` is applied after each new index entry is counted at its
+    /// raw size. Zone files contribute their whole size change. A rewritten
+    /// index contributes the rest, so `index_bytes` matches the files on disk.
+    /// The delta can be negative.
+    pub fn append_blocks(
+        &mut self,
+        metas: &[BlockMeta],
+        zones: Vec<BlockZone>,
+        on_disk_delta: i64,
+    ) {
         let mut zones = zones.into_iter();
         for meta in metas {
             if self.segments.last().map(|segment| segment.id) != Some(meta.segment_id) {
@@ -120,7 +134,7 @@ impl Catalog {
             self.data_bytes += add;
             self.index_bytes += INDEX_ENTRY_LEN as u64;
         }
-        self.index_bytes = self.index_bytes.saturating_add_signed(zone_bytes);
+        self.index_bytes = self.index_bytes.saturating_add_signed(on_disk_delta);
     }
 }
 
@@ -179,14 +193,20 @@ pub fn load_catalog(dir: &Path, schema: &Schema) -> Result<Catalog> {
             )));
         }
         let dict_bytes = stored.as_ref().map(|dict| dict.file_len).unwrap_or(0);
-        let mut indexed = read_index(&index).unwrap_or_default();
+        let (mut indexed, index_ok) = match read_index(&index) {
+            Ok(blocks) => (blocks, true),
+            Err(_) => (Vec::new(), false),
+        };
         for block in &mut indexed {
             block.segment_id = id;
         }
         let index_len = INDEX_HEADER_LEN as u64 + blocks.len() as u64 * INDEX_ENTRY_LEN as u64;
-        let index_on_disk = fs::metadata(&index).map(|meta| meta.len()).unwrap_or(0);
-        if index_on_disk != index_len || !index_matches(&indexed, &blocks) {
+        let mut index_on_disk = fs::metadata(&index).map(|meta| meta.len()).unwrap_or(0);
+        // A shorter zstd frame is valid. Rebuild only when the file is missing,
+        // truncated, or its entries disagree with the segment.
+        if !index_ok || !index_matches(&indexed, &blocks) {
             write_index(&index, &blocks)?;
+            index_on_disk = fs::metadata(&index).map(|meta| meta.len()).unwrap_or(0);
         }
         let dictionary = stored.as_ref().map(|dict| dict.bytes.as_slice());
         let zones = zone::load_segment_zones(dir, id, &blocks, dictionary, schema)?;
@@ -194,7 +214,7 @@ pub fn load_catalog(dir: &Path, schema: &Schema) -> Result<Catalog> {
             .map(|meta| meta.len())
             .unwrap_or(0);
         catalog.data_bytes += data_len.saturating_add(dict_bytes);
-        catalog.index_bytes += index_len.saturating_add(zone_len);
+        catalog.index_bytes += index_on_disk.saturating_add(zone_len);
         catalog.rows += blocks
             .iter()
             .map(|block| u64::from(block.row_count))
@@ -432,26 +452,68 @@ fn parse_dictionary_file(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn read_index(path: &Path) -> Result<Vec<BlockMeta>> {
-    let mut file = File::open(path)?;
-    let mut header = [0u8; INDEX_HEADER_LEN];
-    file.read_exact(&mut header)?;
-    if &header[0..4] != INDEX_MAGIC {
+    let bytes = fs::read(path)?;
+    let plain = plain_index_bytes(&bytes)?;
+    parse_index(&plain)
+}
+
+fn plain_index_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    if is_zstd_frame(bytes) {
+        decompress_index_frame(bytes, MAX_INDEX_UNCOMPRESSED)
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
+fn is_zstd_frame(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[..4] == ZSTD_FRAME_MAGIC
+}
+
+/// Compress `raw` EVIX bytes with plain zstd level 1. The frame is used only
+/// when it is strictly smaller than `raw`.
+fn compress_index_if_smaller(raw: &[u8]) -> Vec<u8> {
+    match zstd::bulk::compress(raw, INDEX_ZSTD_LEVEL) {
+        Ok(frame) if frame.len() < raw.len() && is_zstd_frame(&frame) => frame,
+        _ => raw.to_vec(),
+    }
+}
+
+fn decompress_index_frame(frame: &[u8], cap: usize) -> Result<Vec<u8>> {
+    let mut decoder = zstd::stream::Decoder::with_buffer(frame).map_err(Error::io)?;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match decoder.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return Err(Error::corrupt("truncated index frame")),
+        };
+        if out.len().saturating_add(n) > cap {
+            return Err(Error::corrupt("index exceeds the decompress bound"));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
+fn parse_index(plain: &[u8]) -> Result<Vec<BlockMeta>> {
+    if plain.len() < INDEX_HEADER_LEN || &plain[0..4] != INDEX_MAGIC {
         return Err(Error::corrupt("index magic mismatch"));
     }
-    let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
+    let version = u16::from_le_bytes(plain[4..6].try_into().unwrap());
     if version != INDEX_VERSION {
         return Err(Error::corrupt(format!(
             "unsupported index version {version}"
         )));
     }
-    let mut blocks = Vec::new();
-    loop {
-        let mut entry = [0u8; INDEX_ENTRY_LEN];
-        match file.read_exact(&mut entry) {
-            Ok(()) => blocks.push(decode_index_entry(&entry)?),
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(err) => return Err(err.into()),
-        }
+    let body = &plain[INDEX_HEADER_LEN..];
+    if body.len() % INDEX_ENTRY_LEN != 0 {
+        return Err(Error::corrupt("truncated index"));
+    }
+    let mut blocks = Vec::with_capacity(body.len() / INDEX_ENTRY_LEN);
+    for chunk in body.chunks_exact(INDEX_ENTRY_LEN) {
+        let entry: [u8; INDEX_ENTRY_LEN] = chunk.try_into().unwrap();
+        blocks.push(decode_index_entry(&entry)?);
     }
     Ok(blocks)
 }
@@ -479,18 +541,39 @@ pub fn index_entry_bytes(meta: &BlockMeta) -> [u8; INDEX_ENTRY_LEN] {
     entry
 }
 
-fn write_index(path: &Path, blocks: &[BlockMeta]) -> Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(INDEX_MAGIC)?;
-    file.write_all(&INDEX_VERSION.to_le_bytes())?;
-    file.write_all(&0u16.to_le_bytes())?;
+fn encode_index(blocks: &[BlockMeta]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(INDEX_HEADER_LEN + blocks.len() * INDEX_ENTRY_LEN);
+    raw.extend_from_slice(INDEX_MAGIC);
+    raw.extend_from_slice(&INDEX_VERSION.to_le_bytes());
+    raw.extend_from_slice(&0u16.to_le_bytes());
     for block in blocks {
         // Segment id is not stored in the entry; stamp it so equality checks work.
         let mut owned = block.clone();
         owned.segment_id = 0;
-        file.write_all(&index_entry_bytes(&owned))?;
+        raw.extend_from_slice(&index_entry_bytes(&owned));
     }
-    file.sync_all()?;
+    raw
+}
+
+fn write_index(path: &Path, blocks: &[BlockMeta]) -> Result<()> {
+    let raw = encode_index(blocks);
+    let stored = compress_index_if_smaller(&raw);
+    write_index_file(path, &stored, true)
+}
+
+/// Replace the index file as a whole so a zstd frame is never appended onto a
+/// raw prefix.
+fn write_index_file(path: &Path, stored: &[u8], sync: bool) -> Result<()> {
+    let tmp = path.with_extension("idx.partial");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(stored)?;
+        file.flush()?;
+        if sync {
+            file.sync_all()?;
+        }
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -554,10 +637,15 @@ pub fn read_block_payload(
 }
 
 /// Append-only writer for the current segment.
+///
+/// Index entries are buffered and the whole index file is replaced at the end
+/// of a batch. A plain zstd frame is written only when it is strictly smaller
+/// than the raw `EVIX` bytes.
 pub struct ActiveSegment {
     pub id: u32,
     data: std::io::BufWriter<File>,
-    index: std::io::BufWriter<File>,
+    dir: PathBuf,
+    pending_index: Vec<u8>,
     pub data_len: u64,
     pub index_len: u64,
 }
@@ -575,7 +663,8 @@ impl ActiveSegment {
         Ok(Self {
             id,
             data: std::io::BufWriter::new(data),
-            index: std::io::BufWriter::new(index),
+            dir: dir.to_path_buf(),
+            pending_index: Vec::new(),
             data_len: 0,
             index_len: INDEX_HEADER_LEN as u64,
         })
@@ -586,16 +675,12 @@ impl ActiveSegment {
             .read(true)
             .write(true)
             .open(data_path(dir, state.id))?;
-        let mut index = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(index_path(dir, state.id))?;
         data.seek(SeekFrom::Start(state.data_len))?;
-        index.seek(SeekFrom::Start(state.index_len))?;
         Ok(Self {
             id: state.id,
             data: std::io::BufWriter::new(data),
-            index: std::io::BufWriter::new(index),
+            dir: dir.to_path_buf(),
+            pending_index: Vec::new(),
             data_len: state.data_len,
             index_len: state.index_len,
         })
@@ -603,22 +688,47 @@ impl ActiveSegment {
 
     pub fn write_framed(&mut self, framed: &[u8], meta: &BlockMeta) -> Result<()> {
         self.data.write_all(framed)?;
-        self.index.write_all(&index_entry_bytes(meta))?;
+        self.pending_index
+            .extend_from_slice(&index_entry_bytes(meta));
         self.data_len += framed.len() as u64;
         self.index_len += INDEX_ENTRY_LEN as u64;
         Ok(())
     }
 
-    pub fn flush_os(&mut self, sync: bool) -> Result<()> {
+    /// Flush the data file and, when index entries are buffered, rewrite the
+    /// index. The returned delta is `new_index_len - previous_index_len -
+    /// raw_entries_just_appended`, so catalog `index_bytes` can stay equal to
+    /// the file on disk after it has already counted those raw entries.
+    pub fn flush_os(&mut self, sync: bool) -> Result<i64> {
         self.data.flush()?;
         if sync {
             self.data.get_ref().sync_data()?;
         }
-        self.index.flush()?;
-        if sync {
-            self.index.get_ref().sync_data()?;
+        if self.pending_index.is_empty() {
+            if sync {
+                if let Ok(file) = File::open(index_path(&self.dir, self.id)) {
+                    file.sync_all()?;
+                }
+            }
+            return Ok(0);
         }
-        Ok(())
+        self.persist_pending_index(sync)
+    }
+
+    fn persist_pending_index(&mut self, sync: bool) -> Result<i64> {
+        let path = index_path(&self.dir, self.id);
+        let before = fs::metadata(&path)?.len();
+        let existing = fs::read(&path)?;
+        let mut raw = plain_index_bytes(&existing)?;
+        let added = self.pending_index.len() as u64;
+        if raw.len() as u64 + added != self.index_len {
+            return Err(Error::corrupt("index length does not match the segment"));
+        }
+        raw.extend_from_slice(&self.pending_index);
+        let stored = compress_index_if_smaller(&raw);
+        write_index_file(&path, &stored, sync)?;
+        self.pending_index.clear();
+        Ok(stored.len() as i64 - before as i64 - added as i64)
     }
 }
 
@@ -710,6 +820,117 @@ mod tests {
         fs::write(&path, &frame).unwrap();
         let err = read_dictionary(&path).unwrap_err();
         assert!(err.to_string().contains("corrupt"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn sample_meta(index: u32) -> BlockMeta {
+        BlockMeta {
+            segment_id: 1,
+            offset: u64::from(index) * 128,
+            compressed_len: 64,
+            uncompressed_len: 256,
+            row_count: 32,
+            min_ts: i64::from(index) * 1_000,
+            max_ts: i64::from(index) * 1_000 + 999,
+        }
+    }
+
+    #[test]
+    fn plain_zstd_index_round_trips_and_raw_evix_still_loads() {
+        let dir = scratch_dir();
+        let mut active = ActiveSegment::create_new(&dir, 1).unwrap();
+        let metas: Vec<BlockMeta> = (0..40).map(sample_meta).collect();
+        for meta in &metas {
+            active.write_framed(&[0u8; 4], meta).unwrap();
+        }
+        let delta = active.flush_os(true).unwrap();
+        let path = index_path(&dir, 1);
+        let on_disk = fs::read(&path).unwrap();
+        let raw = encode_index(&metas);
+        assert!(is_zstd_frame(&on_disk), "repeated index entries compress");
+        assert!(on_disk.len() < raw.len());
+        assert_eq!(
+            delta,
+            on_disk.len() as i64 - raw.len() as i64,
+            "delta is the savings versus the raw entries already counted"
+        );
+        let loaded = read_index(&path).unwrap();
+        assert_eq!(loaded.len(), metas.len());
+        for (got, expect) in loaded.iter().zip(&metas) {
+            let mut expect = expect.clone();
+            expect.segment_id = 0;
+            assert_eq!(got, &expect);
+        }
+
+        fs::write(&path, &raw).unwrap();
+        let loaded = read_index(&path).unwrap();
+        assert_eq!(loaded.len(), metas.len());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            raw,
+            "a raw EVIX file is left in place"
+        );
+
+        let mut again = ActiveSegment::open_existing(
+            &dir,
+            &SegmentState {
+                id: 1,
+                blocks: Vec::new(),
+                data_len: active.data_len,
+                index_len: active.index_len,
+                dict_bytes: 0,
+                uses_dict: false,
+                zones: Vec::new(),
+            },
+        )
+        .unwrap();
+        let extra = sample_meta(40);
+        again.write_framed(&[1u8; 4], &extra).unwrap();
+        again.flush_os(true).unwrap();
+        let rewritten = fs::read(&path).unwrap();
+        assert!(
+            is_zstd_frame(&rewritten),
+            "a later batch rewrites the whole file"
+        );
+        assert_ne!(&rewritten[..4], INDEX_MAGIC);
+        let loaded = read_index(&path).unwrap();
+        assert_eq!(loaded.len(), metas.len() + 1);
+        assert_eq!(loaded.last().unwrap().offset, extra.offset);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incompressible_index_stays_raw_evix() {
+        let header = encode_index(&[]);
+        assert_eq!(compress_index_if_smaller(&header), header);
+        let already = zstd::bulk::compress(&vec![1u8; 256], 1).unwrap();
+        assert!(
+            already.len() >= 4 && already[..4] == ZSTD_FRAME_MAGIC,
+            "fixture should already be a zstd frame"
+        );
+        assert_eq!(
+            compress_index_if_smaller(&already),
+            already,
+            "plain zstd grew or tied; the original bytes must be kept"
+        );
+    }
+
+    #[test]
+    fn truncated_zstd_index_is_corrupt_and_oversize_frame_is_rejected() {
+        let dir = scratch_dir();
+        let metas: Vec<BlockMeta> = (0..40).map(sample_meta).collect();
+        let frame = compress_index_if_smaller(&encode_index(&metas));
+        assert!(is_zstd_frame(&frame));
+        let path = index_path(&dir, 1);
+        fs::write(&path, &frame[..frame.len() - 1]).unwrap();
+        let err = read_index(&path).unwrap_err();
+        assert!(err.to_string().contains("truncated index"), "{err}");
+
+        let big = vec![7u8; 4096];
+        let big_frame = zstd::bulk::compress(&big, 1).unwrap();
+        let err = decompress_index_frame(&big_frame, 64).unwrap_err();
+        assert!(err.to_string().contains("decompress bound"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 }
