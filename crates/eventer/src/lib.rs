@@ -8,6 +8,10 @@
 //! equality stats (exact sets or a bloom filter for strings, min/max for numbers)
 //! so a filtered query can skip the payload as well. Equality predicates that still
 //! need the block are applied while it is decoded.
+//! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
+//! are entirely older than a caller-supplied cutoff and removes a segment file only
+//! when every block in it is gone. A row older than the cutoff stays when it shares
+//! a block with a row that is still inside the window.
 
 mod c_api;
 mod codec;
