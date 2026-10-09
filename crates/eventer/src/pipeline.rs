@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{
     self, frame_block, read_dictionary, ActiveSegment, BlockMeta, Catalog, BLOCK_HEADER_LEN,
-    DICT_MAX_BYTES, DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX,
+    BLOCK_HEADER_LEN_V1, DICT_MAX_BYTES, DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX,
 };
 use crate::value::{parse_event, Row, Scalar};
 use crate::zone::{self, BlockZone};
@@ -959,8 +959,6 @@ fn compress_block(
             &compressed,
             block.raw.len() as u32,
             block.row_count,
-            block.min_ts,
-            block.max_ts,
             used_dict,
         ) {
             Ok(framed) => CompOut::Block(BlockOut {
@@ -1006,6 +1004,22 @@ fn union_catalog_segments(existing: &[segment::SegmentState]) -> Vec<segment::Se
         .collect()
 }
 
+/// Header size implied by the next byte after this frame: 36 for a legacy
+/// frame, 20 otherwise. `end` is the next block's offset or the slice `data_len`.
+fn frame_header_len(block: &BlockMeta, end: Option<u64>) -> u64 {
+    let Some(end) = end else {
+        return BLOCK_HEADER_LEN as u64;
+    };
+    let header = end
+        .saturating_sub(block.offset)
+        .saturating_sub(u64::from(block.compressed_len));
+    if header == BLOCK_HEADER_LEN_V1 as u64 {
+        BLOCK_HEADER_LEN_V1 as u64
+    } else {
+        BLOCK_HEADER_LEN as u64
+    }
+}
+
 fn merge_segment_slices(slices: &[&segment::SegmentState]) -> segment::SegmentState {
     let id = slices[0].id;
     let mut paired: Vec<(BlockMeta, BlockZone)> = Vec::new();
@@ -1026,13 +1040,23 @@ fn merge_segment_slices(slices: &[&segment::SegmentState]) -> segment::SegmentSt
     paired.sort_by_key(|(block, _)| block.offset);
     let data_len = paired
         .iter()
-        .map(|(block, _)| {
-            block.offset + BLOCK_HEADER_LEN as u64 + u64::from(block.compressed_len)
+        .enumerate()
+        .map(|(index, (block, _))| {
+            let next_offset = paired.get(index + 1).map(|(next, _)| next.offset);
+            let slice_end = slices.iter().find_map(|slice| {
+                slice
+                    .blocks
+                    .iter()
+                    .any(|existing| existing.offset == block.offset)
+                    .then_some(slice.data_len)
+            });
+            let header = frame_header_len(block, next_offset.or(slice_end));
+            block.offset + header + u64::from(block.compressed_len)
         })
         .max()
         .unwrap_or(0);
-    let index_len = segment::INDEX_HEADER_LEN as u64
-        + paired.len() as u64 * segment::INDEX_ENTRY_LEN as u64;
+    let index_len =
+        segment::INDEX_HEADER_LEN as u64 + paired.len() as u64 * segment::INDEX_ENTRY_LEN as u64;
     let dict_bytes = slices
         .iter()
         .map(|slice| slice.dict_bytes)
@@ -1358,8 +1382,6 @@ impl Disk {
             &compressed,
             item.uncompressed_len,
             item.row_count,
-            item.min_ts,
-            item.max_ts,
             dict.is_some(),
         )?;
         Ok((framed, compressed.len() as u32))
