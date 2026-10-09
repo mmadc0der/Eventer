@@ -120,7 +120,7 @@ fn main() -> ExitCode {
     match eventer::uncompressed_column_sizes(&schema, &events[..sample_end]) {
         Ok(sizes) => {
             for (name, size) in sizes {
-                if matches!(name.as_str(), "ts" | "user_id" | "amount" | "score") {
+                if matches!(name.as_str(), "ts" | "user_id" | "amount" | "score" | "note") {
                     println!("uncompressed_column_bytes {name}: {size}");
                 }
             }
