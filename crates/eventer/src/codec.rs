@@ -655,23 +655,114 @@ pub fn uncompressed_column_sizes(schema: &Schema, rows: &[Row]) -> Result<Vec<(S
     Ok(sizes)
 }
 
+/// Float kinds. 0–2 are the original empty, constant, and raw f64 frame.
+/// Kind 3 is one decimal exponent whose scaled integers repeat
+/// `base + (i % period) * stride`.
+const KIND_FLOAT_EMPTY: u8 = 0;
+const KIND_FLOAT_CONSTANT: u8 = 1;
+const KIND_FLOAT_RAW: u8 = 2;
+const KIND_FLOAT_REPEATED: u8 = 3;
+const FLOAT_REPEATED_LEN: usize = 1 + 1 + 8 + 8 + 4;
+
 fn encode_f64s(values: &[Option<f64>]) -> Vec<u8> {
     let present: Vec<f64> = values.iter().copied().flatten().collect();
     if present.is_empty() {
-        return vec![0];
+        return vec![KIND_FLOAT_EMPTY];
     }
     let first = present[0].to_bits();
     if present.iter().all(|value| value.to_bits() == first) {
-        let mut out = vec![1];
+        let mut out = vec![KIND_FLOAT_CONSTANT];
         out.extend_from_slice(&present[0].to_le_bytes());
         return out;
     }
+    if let Some(repeated) = encode_repeated_decimal_stride(&present) {
+        return repeated;
+    }
     let mut out = Vec::with_capacity(1 + present.len() * 8);
-    out.push(2);
+    out.push(KIND_FLOAT_RAW);
     for value in present {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out
+}
+
+/// `10^exp` for `exp` in `0..=18`. Each step is exact in f64.
+fn pow10(exp: u8) -> f64 {
+    let mut value = 1.0f64;
+    for _ in 0..exp {
+        value *= 10.0;
+    }
+    value
+}
+
+struct FloatRepeated {
+    exp: u8,
+    base: i64,
+    stride: i64,
+    period: usize,
+}
+
+/// One arithmetic period, repeated. The first delta is the stride. The period
+/// is the first index that breaks `base + i * stride`. Later values must be
+/// `base + (i % period) * stride`, and every present value must round-trip
+/// through that exponent bit-exactly. A constant stays kind 1.
+fn encode_repeated_decimal_stride(present: &[f64]) -> Option<Vec<u8>> {
+    let count = present.len();
+    if count < 3 || FLOAT_REPEATED_LEN >= 1 + count * 8 {
+        return None;
+    }
+    if present.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    for exp in 0..=18u8 {
+        let scale = pow10(exp);
+        let mut scaled = Vec::with_capacity(count);
+        let mut fits = true;
+        for value in present {
+            let n = (*value * scale).round() as i64;
+            let back = (n as f64) / scale;
+            if back.to_bits() != value.to_bits() {
+                fits = false;
+                break;
+            }
+            scaled.push(n);
+        }
+        if !fits {
+            continue;
+        }
+        let base = scaled[0];
+        let stride = scaled[1].wrapping_sub(base);
+        let mut period = count;
+        for index in 2..count {
+            let expected = base.wrapping_add((index as i64).wrapping_mul(stride));
+            if scaled[index] != expected {
+                period = index;
+                break;
+            }
+        }
+        if period < 2 || period >= count {
+            continue;
+        }
+        let mut matches = true;
+        for index in period..count {
+            let expected = base.wrapping_add(((index % period) as i64).wrapping_mul(stride));
+            if scaled[index] != expected {
+                matches = false;
+                break;
+            }
+        }
+        if !matches {
+            continue;
+        }
+        let mut out = Vec::with_capacity(FLOAT_REPEATED_LEN);
+        out.push(KIND_FLOAT_REPEATED);
+        out.push(exp);
+        out.extend_from_slice(&base.to_le_bytes());
+        out.extend_from_slice(&stride.to_le_bytes());
+        out.extend_from_slice(&(period as u32).to_le_bytes());
+        return Some(out);
+    }
+    None
 }
 
 fn encode_bools(values: &[Option<bool>]) -> Vec<u8> {
@@ -1254,16 +1345,20 @@ fn skip_packed(
 
 fn skip_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
     if count == 0 {
-        return expect_kind(bytes, cursor, 0);
+        return expect_kind(bytes, cursor, KIND_FLOAT_EMPTY);
     }
     let kind = read_u8(bytes, cursor)?;
     match kind {
-        1 => {
+        KIND_FLOAT_CONSTANT => {
             let _ = read_f64(bytes, cursor)?;
             Ok(())
         }
-        2 => {
+        KIND_FLOAT_RAW => {
             let _ = read_exact(bytes, cursor, count.saturating_mul(8))?;
+            Ok(())
+        }
+        KIND_FLOAT_REPEATED => {
+            let _ = read_float_repeated(bytes, cursor, count)?;
             Ok(())
         }
         _ => Err(Error::corrupt(format!("unknown float encoding {kind}"))),
@@ -1460,24 +1555,56 @@ fn read_packed<'a>(
 
 fn decode_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<f64>> {
     if count == 0 {
-        expect_kind(bytes, cursor, 0)?;
+        expect_kind(bytes, cursor, KIND_FLOAT_EMPTY)?;
         return Ok(Vec::new());
     }
     let kind = read_u8(bytes, cursor)?;
     match kind {
-        1 => {
+        KIND_FLOAT_CONSTANT => {
             let value = read_f64(bytes, cursor)?;
             Ok(vec![value; count])
         }
-        2 => {
+        KIND_FLOAT_RAW => {
             let mut out = Vec::with_capacity(count);
             for _ in 0..count {
                 out.push(read_f64(bytes, cursor)?);
             }
             Ok(out)
         }
+        KIND_FLOAT_REPEATED => {
+            let repeated = read_float_repeated(bytes, cursor, count)?;
+            let scale = pow10(repeated.exp);
+            let mut out = Vec::with_capacity(count);
+            for index in 0..count {
+                let scaled = repeated
+                    .base
+                    .wrapping_add(((index % repeated.period) as i64).wrapping_mul(repeated.stride));
+                out.push((scaled as f64) / scale);
+            }
+            Ok(out)
+        }
         _ => Err(Error::corrupt(format!("unknown float encoding {kind}"))),
     }
+}
+
+fn read_float_repeated(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<FloatRepeated> {
+    let exp = read_u8(bytes, cursor)?;
+    if exp > 18 {
+        return Err(Error::corrupt("float stride exponent is invalid"));
+    }
+    let base = read_i64(bytes, cursor)?;
+    let stride = read_i64(bytes, cursor)?;
+    let raw = read_exact(bytes, cursor, 4)?;
+    let period = u32::from_le_bytes(raw.try_into().unwrap()) as usize;
+    if period < 2 || period >= count {
+        return Err(Error::corrupt("float stride period is invalid"));
+    }
+    Ok(FloatRepeated {
+        exp,
+        base,
+        stride,
+        period,
+    })
 }
 
 fn decode_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<bool>> {
@@ -3467,4 +3594,223 @@ mod tests {
         assert!(matches!(&decoded[0].values[2], Scalar::Int(1)));
         assert!(matches!(&decoded[0].values[1], Scalar::Str(text) if text == &note));
     }
-}
+
+    fn assert_f64_bits(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (left, right)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                left.to_bits(),
+                right.to_bits(),
+                "bit mismatch at {index}: {left} vs {right}"
+            );
+        }
+    }
+
+    fn score_cycle(count: usize) -> Vec<f64> {
+        (0..count)
+            .map(|index| (index % 100) as f64 / 10.0)
+            .collect()
+    }
+
+    #[test]
+    fn repeated_decimal_stride_encodes_the_stock_score_cycle() {
+        let scores = score_cycle(2048);
+        let values: Vec<Option<f64>> = scores.iter().copied().map(Some).collect();
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], KIND_FLOAT_REPEATED);
+        assert_eq!(encoded[1], 1, "score tenths use exponent 1");
+        assert_eq!(i64::from_le_bytes(encoded[2..10].try_into().unwrap()), 0);
+        assert_eq!(i64::from_le_bytes(encoded[10..18].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(encoded[18..22].try_into().unwrap()), 100);
+        assert!(encoded.len() < 1 + scores.len() * 8);
+        let mut cursor = 0;
+        let decoded = decode_f64s(&encoded, &mut cursor, scores.len()).unwrap();
+        assert_eq!(cursor, encoded.len());
+        assert_f64_bits(&decoded, &scores);
+        let mut skip = 0;
+        skip_f64s(&encoded, &mut skip, scores.len()).unwrap();
+        assert_eq!(skip, encoded.len());
+
+        let short_tail = score_cycle(250);
+        let values: Vec<Option<f64>> = short_tail.iter().copied().map(Some).collect();
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], KIND_FLOAT_REPEATED);
+        let mut cursor = 0;
+        assert_f64_bits(
+            &decode_f64s(&encoded, &mut cursor, short_tail.len()).unwrap(),
+            &short_tail,
+        );
+    }
+
+    #[test]
+    fn constant_float_stays_constant_and_irregular_stays_raw() {
+        let constant = vec![Some(1.5f64); 32];
+        let encoded = encode_f64s(&constant);
+        assert_eq!(encoded[0], KIND_FLOAT_CONSTANT);
+        let mut cursor = 0;
+        assert_f64_bits(
+            &decode_f64s(&encoded, &mut cursor, constant.len()).unwrap(),
+            &[1.5; 32],
+        );
+
+        let pure = (0..8)
+            .map(|index| Some(index as f64 / 10.0))
+            .collect::<Vec<_>>();
+        let encoded = encode_f64s(&pure);
+        assert_eq!(
+            encoded[0], KIND_FLOAT_RAW,
+            "one unrepeated stride stays the raw frame"
+        );
+
+        let irregular = vec![
+            Some(0.1f64),
+            Some(0.2),
+            Some(0.4),
+            Some(0.1),
+            Some(0.2),
+            Some(0.4),
+        ];
+        let encoded = encode_f64s(&irregular);
+        assert_eq!(encoded[0], KIND_FLOAT_RAW);
+        let mut cursor = 0;
+        assert_f64_bits(
+            &decode_f64s(&encoded, &mut cursor, irregular.len()).unwrap(),
+            &[0.1, 0.2, 0.4, 0.1, 0.2, 0.4],
+        );
+
+        let non_finite = vec![
+            Some(0.0f64),
+            Some(f64::INFINITY),
+            Some(0.0),
+            Some(f64::INFINITY),
+        ];
+        assert_eq!(encode_f64s(&non_finite)[0], KIND_FLOAT_RAW);
+    }
+
+    #[test]
+    fn repeated_decimal_stride_roundtrips_with_nulls_and_a_negative_cycle() {
+        let mut values = Vec::new();
+        let mut present_index = 0usize;
+        for index in 0..30 {
+            if index % 5 == 0 {
+                values.push(None);
+            } else {
+                values.push(Some((present_index % 6) as f64 / 10.0));
+                present_index += 1;
+            }
+        }
+        let encoded = encode_f64s(&values);
+        assert_eq!(encoded[0], KIND_FLOAT_REPEATED);
+        let present: Vec<f64> = values.iter().copied().flatten().collect();
+        let mut cursor = 0;
+        assert_f64_bits(
+            &decode_f64s(&encoded, &mut cursor, present.len()).unwrap(),
+            &present,
+        );
+
+        let negative: Vec<f64> = (0..40)
+            .map(|index| -1.5 + ((index % 4) as f64) * 0.25)
+            .collect();
+        let wrapped: Vec<Option<f64>> = negative.iter().copied().map(Some).collect();
+        let encoded = encode_f64s(&wrapped);
+        assert_eq!(encoded[0], KIND_FLOAT_REPEATED);
+        assert_eq!(encoded[1], 2);
+        let mut cursor = 0;
+        assert_f64_bits(
+            &decode_f64s(&encoded, &mut cursor, negative.len()).unwrap(),
+            &negative,
+        );
+
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "score", "type": "float"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for (index, score) in values.iter().enumerate() {
+            let mut obj = serde_json::json!({"ts": 1_000 + index as i64});
+            if let Some(score) = score {
+                obj["score"] = serde_json::json!(score);
+            }
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let block = encode_block(&schema, &rows).unwrap();
+        let decoded = decode_block(&schema, &block.bytes).unwrap();
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            match (&left.values[1], &right.values[1]) {
+                (Scalar::Null, Scalar::Null) => {}
+                (Scalar::Float(expected), Scalar::Float(actual)) => {
+                    assert_eq!(expected.to_bits(), actual.to_bits());
+                }
+                _ => panic!("score column changed type"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_raw_f64_block_still_decodes() {
+        let scores = [0.1f64, 1.25, -3.5, 0.0];
+        let mut payload = vec![KIND_FLOAT_RAW];
+        for score in scores {
+            payload.extend_from_slice(&score.to_le_bytes());
+        }
+        let mut cursor = 0;
+        assert_f64_bits(
+            &decode_f64s(&payload, &mut cursor, scores.len()).unwrap(),
+            &scores,
+        );
+        assert_eq!(cursor, payload.len());
+        let mut skip = 0;
+        skip_f64s(&payload, &mut skip, scores.len()).unwrap();
+        assert_eq!(skip, payload.len());
+
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "score", "type": "float"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.push(0);
+        bytes.push(KIND_CONSTANT);
+        bytes.extend_from_slice(&1000i64.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&payload);
+        let rows = decode_block(&schema, &bytes).unwrap();
+        for (row, score) in rows.iter().zip(scores.iter()) {
+            match row.values[1] {
+                Scalar::Float(value) => assert_eq!(value.to_bits(), score.to_bits()),
+                _ => panic!("expected a float"),
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_float_stride_rejects_a_bad_exponent_and_period() {
+        let mut bad_exp = vec![KIND_FLOAT_REPEATED, 19];
+        bad_exp.extend_from_slice(&0i64.to_le_bytes());
+        bad_exp.extend_from_slice(&1i64.to_le_bytes());
+        bad_exp.extend_from_slice(&2u32.to_le_bytes());
+        assert!(decode_f64s(&bad_exp, &mut 0, 6).is_err());
+        assert!(skip_f64s(&bad_exp, &mut 0, 6).is_err());
+
+        let mut bad_period = vec![KIND_FLOAT_REPEATED, 1];
+        bad_period.extend_from_slice(&0i64.to_le_bytes());
+        bad_period.extend_from_slice(&1i64.to_le_bytes());
+        bad_period.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode_f64s(&bad_period, &mut 0, 6)
+            .unwrap_err()
+            .to_string()
+            .contains("period"));
+        assert!(skip_f64s(&bad_period, &mut 0, 6).is_err());
+    }}
