@@ -713,7 +713,8 @@ mod tests {
         assert_eq!(store.stats().index_bytes, index_on_disk);
         store.drop_blocks_before(i64::MIN).unwrap();
         assert_eq!(
-            store.stats().index_bytes, index_on_disk,
+            store.stats().index_bytes,
+            index_on_disk,
             "a no-op retention pass still counts the compressed index"
         );
         store.close().unwrap();
@@ -1522,6 +1523,48 @@ mod tests {
     }
 
     #[test]
+    fn magicless_segment_reopens_and_returns_every_row() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let mut options = test_options(8);
+        options.zstd_level = 3;
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let rows = 24i64;
+        for ts in 0..rows {
+            store
+                .append_json(&event(ts, Some(ts), "click", Some("hello"), "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        store.close().unwrap();
+
+        let data_file = segment::data_path(&data, 1);
+        let payloads = compressed_payloads(&data_file);
+        assert!(!payloads.is_empty());
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| payload.len() < 4 || payload[..4] != [0x28, 0xB5, 0x2F, 0xFD]),
+            "new payloads omit the zstd magic"
+        );
+        let kinds = block_kinds(&data_file);
+        assert!(kinds
+            .iter()
+            .all(|(magic, _, _)| magic == segment::BLOCK_MAGIC));
+
+        let reopened = Store::open_with(&data, &schema, options).unwrap();
+        let got = reopened.query(0, rows).unwrap();
+        assert_eq!(got.len(), rows as usize);
+        assert_eq!(row_value(&reopened, &got[0])["action"], "click");
+        assert_eq!(
+            row_value(&reopened, got.last().unwrap())["user_id"],
+            rows - 1
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn legacy_segment_without_dictionary_round_trips() {
         let dir = TempDir::new();
         let schema_path = write_schema(dir.path());
@@ -1801,6 +1844,13 @@ mod tests {
                 .iter()
                 .all(|(magic, _, _)| magic == segment::BLOCK_MAGIC_DICT),
             "training-sample blocks must be EVBD after one flush: {kinds:?}"
+        );
+        let payloads = compressed_payloads(&data_file);
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| payload.len() < 4 || payload[..4] != [0x28, 0xB5, 0x2F, 0xFD]),
+            "new EVBD payloads are magicless zstd frames"
         );
         let dict_file = segment::dictionary_path(&data, 1);
         let dict_len = fs::metadata(&dict_file).unwrap().len();
