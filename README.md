@@ -37,7 +37,7 @@ Types: `int` (i64), `float` (f64), `bool`, `string` (dictionary-encoded when tha
 }
 ```
 
-The first open writes `schema.lock` into the data directory. A later open with a different schema is rejected.
+The first open writes `schema.lock` into the data directory. A later open may append fields at the end of that locked list. The lock file is rewritten to the new canonical schema, and rows stored before the append read null for the new columns. Old segment files stay as they were written. A different timestamp field, a type or decimal-scale change, a removed field, a renamed field, or a reordered field is rejected.
 
 ## Build
 
