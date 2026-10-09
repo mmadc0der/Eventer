@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{
     self, frame_block, read_dictionary, ActiveSegment, BlockMeta, Catalog, BLOCK_HEADER_LEN,
-    DICT_MAX_BYTES, DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX,
+    DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX, DICT_TRAIN_MAX_BYTES,
 };
 use crate::value::{parse_event, Row, Scalar};
 
@@ -200,10 +200,11 @@ impl DictSampler {
         let _ = thread::Builder::new()
             .name("eventer-dict".into())
             .spawn(move || {
-                let Ok(bytes) = zstd::dict::from_continuous(&sample, &sizes, DICT_MAX_BYTES) else {
+                let Ok(bytes) = zstd::dict::from_continuous(&sample, &sizes, DICT_TRAIN_MAX_BYTES)
+                else {
                     return;
                 };
-                if bytes.is_empty() || bytes.len() > DICT_MAX_BYTES {
+                if bytes.is_empty() || bytes.len() > DICT_TRAIN_MAX_BYTES {
                     return;
                 }
                 publish.set(epoch, Arc::new(bytes));

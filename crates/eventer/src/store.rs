@@ -1172,7 +1172,10 @@ mod tests {
         let dict_len = fs::metadata(&dict_file).unwrap().len();
         assert_eq!(store.stats().data_bytes, data_len + dict_len);
         assert!(dict_len > segment::DICT_HEADER_LEN as u64);
-        assert!(dict_len <= (segment::DICT_HEADER_LEN + segment::DICT_MAX_BYTES) as u64);
+        assert!(
+            dict_len <= (segment::DICT_HEADER_LEN + segment::DICT_TRAIN_MAX_BYTES) as u64,
+            "trained sidecar is {dict_len} bytes"
+        );
         store.close().unwrap();
 
         let reopened = Store::open_with(&data, &schema, options).unwrap();
@@ -1183,6 +1186,114 @@ mod tests {
         assert_eq!(reopened.query(0, n - 1).unwrap().len(), n as usize);
         assert_eq!(reopened.stats().data_bytes, data_len + dict_len);
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn older_3345_byte_dictionary_still_opens_and_decodes() {
+        let dir = TempDir::new();
+        let schema_path = write_schema(dir.path());
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        let notes = ["landing", "checkout", "search", ""];
+        let mut sample = Vec::new();
+        let mut sizes = Vec::new();
+        let mut rows = Vec::new();
+        let mut encoded = None;
+        let mut next = 0i64;
+        while sample.len() < segment::DICT_SAMPLE_MAX {
+            let block_rows: Vec<Row> = (0..2048)
+                .map(|offset| {
+                    let i = next + offset;
+                    let amount_cents = (i % 5_000) as i64;
+                    let amount = format!("{}.{:02}", amount_cents / 100, amount_cents % 100);
+                    let note = notes[i as usize % notes.len()];
+                    crate::value::parse_event(
+                        &schema,
+                        &event(
+                            i,
+                            Some(i % 1_000),
+                            actions[i as usize % actions.len()],
+                            if note.is_empty() { None } else { Some(note) },
+                            &amount,
+                        ),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let block = crate::codec::encode_block(&schema, &block_rows).unwrap();
+            if sample.len() + block.bytes.len() > segment::DICT_SAMPLE_MAX {
+                break;
+            }
+            let mut offset = 0;
+            while offset < block.bytes.len() {
+                let take = (block.bytes.len() - offset).min(segment::DICT_SAMPLE_CHUNK);
+                sizes.push(take);
+                offset += take;
+            }
+            sample.extend_from_slice(&block.bytes);
+            if encoded.is_none() {
+                rows = block_rows;
+                encoded = Some(block);
+            }
+            next += 2048;
+        }
+        let encoded = encoded.expect("training sample");
+        const LEGACY_DICT_BYTES: usize = 3345;
+        let dict = zstd::dict::from_continuous(&sample, &sizes, LEGACY_DICT_BYTES)
+            .expect("train a pre-cap dictionary");
+        assert_eq!(
+            dict.len(),
+            LEGACY_DICT_BYTES,
+            "legacy sidecar payload should be the 3345-byte dictionary this reader still accepts"
+        );
+        assert!(dict.len() > segment::DICT_TRAIN_MAX_BYTES);
+        assert!(dict.len() <= segment::DICT_MAX_BYTES);
+
+        let compressed = zstd::bulk::Compressor::with_dictionary(3, &dict)
+            .unwrap()
+            .compress(&encoded.bytes)
+            .unwrap();
+        let framed = segment::frame_block(
+            &compressed,
+            encoded.bytes.len() as u32,
+            encoded.row_count,
+            encoded.min_ts,
+            encoded.max_ts,
+            true,
+        )
+        .unwrap();
+        assert_eq!(&framed[..4], segment::BLOCK_MAGIC_DICT);
+        let file_len = segment::write_dictionary(&data, 1, &dict).unwrap();
+        assert_eq!(
+            file_len,
+            (segment::DICT_HEADER_LEN + LEGACY_DICT_BYTES) as u64
+        );
+
+        let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
+        let meta = segment::BlockMeta {
+            segment_id: 1,
+            offset: 0,
+            compressed_len: compressed.len() as u32,
+            uncompressed_len: encoded.bytes.len() as u32,
+            row_count: encoded.row_count,
+            min_ts: encoded.min_ts,
+            max_ts: encoded.max_ts,
+        };
+        active.write_framed(&framed, &meta).unwrap();
+        active.flush_os(true).unwrap();
+        drop(active);
+
+        let store = Store::open_with(&data, &schema_path, test_options(64)).unwrap();
+        let got = store.query(encoded.min_ts, encoded.max_ts).unwrap();
+        assert_eq!(got.len(), rows.len());
+        assert_eq!(row_value(&store, &got[0])["action"], "click");
+        assert_eq!(
+            row_value(&store, got.last().unwrap())["user_id"],
+            (rows.len() as i64 - 1) % 1_000
+        );
+        store.close().unwrap();
     }
 
     #[test]

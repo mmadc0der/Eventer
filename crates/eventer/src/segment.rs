@@ -15,8 +15,13 @@ pub const INDEX_ENTRY_LEN: usize = 40;
 pub const DICT_HEADER_LEN: usize = 16;
 pub const INDEX_VERSION: u16 = 1;
 pub const DICT_VERSION: u16 = 1;
-/// Trained dictionary cap. The sidecar stores this plus a 16-byte header.
+/// Largest dictionary a reader will open. Sidecars written before the trainer
+/// cap below used this limit (a full buffer is 4096 dictionary bytes; the
+/// stock bench at the time this cap was introduced stored 3345).
 pub const DICT_MAX_BYTES: usize = 4 * 1024;
+/// `dictBufferCapacity` for `zstd::dict::from_continuous`. New sidecars stay
+/// within this plus the 16-byte header. `ZDICT_DICTSIZE_MIN` is 256.
+pub const DICT_TRAIN_MAX_BYTES: usize = 1024;
 /// Uncompressed sealed-block sample kept before training one dictionary.
 pub const DICT_SAMPLE_MAX: usize = 256 * 1024;
 /// Slice size for `zstd::dict::from_continuous`. Fast cover keeps a train/test
