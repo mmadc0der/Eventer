@@ -869,8 +869,6 @@ fn compress_block(
             &compressed,
             block.raw.len() as u32,
             block.row_count,
-            block.min_ts,
-            block.max_ts,
             used_dict,
         ) {
             Ok(framed) => CompOut::Block(BlockOut {
@@ -1196,8 +1194,6 @@ impl Disk {
             &compressed,
             item.uncompressed_len,
             item.row_count,
-            item.min_ts,
-            item.max_ts,
             dict.is_some(),
         )?;
         Ok((framed, compressed.len() as u32))

@@ -607,6 +607,21 @@ mod tests {
         }
         store.close().unwrap();
 
+        let data_file = segment::data_path(&data, 1);
+        let segment_bytes = fs::read(&data_file).unwrap();
+        let frames = segment::frames_in(&segment_bytes);
+        assert!(
+            frames.len() >= 2,
+            "expected more than one block, got {}",
+            frames.len()
+        );
+        assert!(
+            frames.iter().all(|frame| {
+                frame.header_len == segment::BLOCK_HEADER_LEN && frame.min_ts.is_none()
+            }),
+            "new frames must omit min_ts and max_ts"
+        );
+
         let index = segment::index_path(&data, 1);
         fs::write(&index, b"EVIX").unwrap();
         let schema_text = parse_schema(SCHEMA_JSON).unwrap();
@@ -616,7 +631,15 @@ mod tests {
         let rows = store.query(0, 10_000).unwrap();
         assert_eq!(rows.len(), 10);
         assert_eq!(row_value(&store, &rows[9])["user_id"], 9);
-        assert!(segment::index_path(&data, 1).exists());
+        assert_eq!(
+            fs::read(&data_file).unwrap(),
+            segment_bytes,
+            "rebuilding the index must not write timestamps back into the segment"
+        );
+        let indexed = segment::read_index(&segment::index_path(&data, 1)).unwrap();
+        assert_eq!(indexed.len(), frames.len());
+        assert_eq!(indexed[0].min_ts, 1_000);
+        assert_eq!(indexed.last().unwrap().max_ts, 1_009);
         store.close().unwrap();
     }
 
@@ -1170,21 +1193,14 @@ mod tests {
 
     fn block_kinds(path: &Path) -> Vec<([u8; 4], i64, i64)> {
         let data = fs::read(path).unwrap();
-        let mut off = 0usize;
-        let mut out = Vec::new();
-        while off + segment::BLOCK_HEADER_LEN <= data.len() {
-            let magic: [u8; 4] = data[off..off + 4].try_into().unwrap();
-            if magic != *segment::BLOCK_MAGIC && magic != *segment::BLOCK_MAGIC_DICT {
-                break;
-            }
-            let compressed_len =
-                u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
-            let min_ts = i64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
-            let max_ts = i64::from_le_bytes(data[off + 24..off + 32].try_into().unwrap());
-            out.push((magic, min_ts, max_ts));
-            off += segment::BLOCK_HEADER_LEN + compressed_len;
-        }
-        out
+        let frames = segment::frames_in(&data);
+        let indexed = segment::read_index(&path.with_extension("idx")).unwrap();
+        assert_eq!(frames.len(), indexed.len());
+        frames
+            .into_iter()
+            .zip(indexed)
+            .map(|(frame, meta)| (frame.magic, meta.min_ts, meta.max_ts))
+            .collect()
     }
 
     #[test]
@@ -1202,7 +1218,7 @@ mod tests {
             .collect();
         let encoded = crate::codec::encode_block(&schema, &rows).unwrap();
         let compressed = zstd::bulk::compress(&encoded.bytes, 3).unwrap();
-        let framed = segment::frame_block(
+        let framed = segment::frame_block_v1(
             &compressed,
             encoded.bytes.len() as u32,
             encoded.row_count,
@@ -1211,6 +1227,10 @@ mod tests {
             false,
         )
         .unwrap();
+        assert_eq!(
+            framed.len(),
+            segment::BLOCK_HEADER_LEN_V1 + compressed.len()
+        );
         assert_eq!(&framed[..4], segment::BLOCK_MAGIC);
         let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
         let meta = segment::BlockMeta {
@@ -1238,6 +1258,24 @@ mod tests {
         assert_eq!(row_value(&store, &got[4])["action"], "click");
         assert_eq!(row_value(&store, &got[4])["amount"], "1.00");
         assert!(!segment::dictionary_path(&data, 1).exists());
+        let segment_bytes = fs::read(segment::data_path(&data, 1)).unwrap();
+        let frames = segment::frames_in(&segment_bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].header_len, segment::BLOCK_HEADER_LEN_V1);
+        assert_eq!(frames[0].min_ts, Some(encoded.min_ts));
+        assert_eq!(frames[0].max_ts, Some(encoded.max_ts));
+        store.close().unwrap();
+
+        fs::remove_file(segment::index_path(&data, 1)).unwrap();
+        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
+        assert_eq!(store.query(0, 10).unwrap().len(), 5);
+        assert_eq!(
+            fs::read(segment::data_path(&data, 1)).unwrap(),
+            segment_bytes
+        );
+        let indexed = segment::read_index(&segment::index_path(&data, 1)).unwrap();
+        assert_eq!(indexed[0].min_ts, encoded.min_ts);
+        assert_eq!(indexed[0].max_ts, encoded.max_ts);
         store.close().unwrap();
 
         let dict_path = segment::dictionary_path(&data, 1);
@@ -1250,6 +1288,69 @@ mod tests {
         fs::write(&dict_path, &oversized).unwrap();
         let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
         assert_eq!(store.query(0, 10).unwrap().len(), 5);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn legacy_dictionary_header_round_trips_after_the_index_is_removed() {
+        let dir = TempDir::new();
+        let schema_path = write_schema(dir.path());
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let rows: Vec<Row> = (0..4)
+            .map(|ts| {
+                crate::value::parse_event(&schema, &event(10 + ts, Some(ts), "view", None, "2.00"))
+                    .unwrap()
+            })
+            .collect();
+        let encoded = crate::codec::encode_block(&schema, &rows).unwrap();
+        let dict = vec![0x11u8; 128];
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(1, &dict).unwrap();
+        let compressed = compressor.compress(&encoded.bytes).unwrap();
+        let framed = segment::frame_block_v1(
+            &compressed,
+            encoded.bytes.len() as u32,
+            encoded.row_count,
+            encoded.min_ts,
+            encoded.max_ts,
+            true,
+        )
+        .unwrap();
+        assert_eq!(&framed[..4], segment::BLOCK_MAGIC_DICT);
+        segment::write_dictionary(&data, 1, &dict).unwrap();
+        let mut active = segment::ActiveSegment::create_new(&data, 1).unwrap();
+        let meta = segment::BlockMeta {
+            segment_id: 1,
+            offset: 0,
+            compressed_len: compressed.len() as u32,
+            uncompressed_len: encoded.bytes.len() as u32,
+            row_count: encoded.row_count,
+            min_ts: encoded.min_ts,
+            max_ts: encoded.max_ts,
+        };
+        active.write_framed(&framed, &meta).unwrap();
+        active.flush_os(true).unwrap();
+        drop(active);
+
+        let segment_bytes = fs::read(segment::data_path(&data, 1)).unwrap();
+        let frames = segment::frames_in(&segment_bytes);
+        assert_eq!(frames[0].header_len, segment::BLOCK_HEADER_LEN_V1);
+        assert_eq!(frames[0].magic, *segment::BLOCK_MAGIC_DICT);
+
+        fs::remove_file(segment::index_path(&data, 1)).unwrap();
+        let store = Store::open_with(&data, &schema_path, test_options(8)).unwrap();
+        let got = store.query(0, 100).unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(row_value(&store, &got[0])["ts"], 10);
+        assert_eq!(row_value(&store, &got[3])["user_id"], 3);
+        assert_eq!(
+            fs::read(segment::data_path(&data, 1)).unwrap(),
+            segment_bytes
+        );
+        let indexed = segment::read_index(&segment::index_path(&data, 1)).unwrap();
+        assert_eq!(indexed[0].min_ts, encoded.min_ts);
+        assert_eq!(indexed[0].max_ts, encoded.max_ts);
         store.close().unwrap();
     }
 
