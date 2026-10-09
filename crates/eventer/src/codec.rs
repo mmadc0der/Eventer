@@ -536,23 +536,303 @@ pub fn uncompressed_column_sizes(schema: &Schema, rows: &[Row]) -> Result<Vec<(S
     Ok(sizes)
 }
 
+/// Float kinds. 0–2 are the original empty, constant, and raw little-endian
+/// frames. Kind 3 is Chimp128 (Liakos, Papakonstantinopoulou, and Kotidis,
+/// PVLDB 15(11), 2022): each value is XOR-ed with one of the previous 128
+/// and the leading-zero run is stored. It is used only when that body is
+/// strictly smaller than the raw frame. A constant column stays kind 1.
+const KIND_F64_EMPTY: u8 = 0;
+const KIND_F64_CONSTANT: u8 = 1;
+const KIND_F64_RAW: u8 = 2;
+const KIND_F64_CHIMP128: u8 = 3;
+
 fn encode_f64s(values: &[Option<f64>]) -> Vec<u8> {
     let present: Vec<f64> = values.iter().copied().flatten().collect();
     if present.is_empty() {
-        return vec![0];
+        return vec![KIND_F64_EMPTY];
     }
     let first = present[0].to_bits();
     if present.iter().all(|value| value.to_bits() == first) {
-        let mut out = vec![1];
+        let mut out = vec![KIND_F64_CONSTANT];
         out.extend_from_slice(&present[0].to_le_bytes());
         return out;
     }
+    let raw = encode_raw_f64s(&present);
+    let chimp = encode_chimp128(&present);
+    if chimp.len() < raw.len() {
+        chimp
+    } else {
+        raw
+    }
+}
+
+fn encode_raw_f64s(present: &[f64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + present.len() * 8);
-    out.push(2);
+    out.push(KIND_F64_RAW);
     for value in present {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out
+}
+
+/// Chimp128 window. The trailing-zero threshold is `6 + log2(window)`.
+const CHIMP_WINDOW: usize = 128;
+const CHIMP_WINDOW_BITS: u32 = 7;
+const CHIMP_TRAILING_THRESHOLD: u32 = 6 + CHIMP_WINDOW_BITS;
+const CHIMP_KEY_MASK: u64 = (1 << (CHIMP_TRAILING_THRESHOLD + 1)) - 1;
+
+/// Rounded leading-zero counts, indexed by the actual count `0..64`.
+const CHIMP_LEADING_ROUND: [u32; 64] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 12, 12, 12, 12, 16, 16, 18, 18, 20, 20, 22, 22, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+];
+
+/// 3-bit code to rounded leading-zero count.
+const CHIMP_LEADING_DECODE: [u32; 8] = [0, 8, 12, 16, 18, 20, 22, 24];
+
+fn chimp_leading_code(rounded: u32) -> u32 {
+    match rounded {
+        0 => 0,
+        8 => 1,
+        12 => 2,
+        16 => 3,
+        18 => 4,
+        20 => 5,
+        22 => 6,
+        24 => 7,
+        _ => unreachable!("rounded leading-zero count is not a chimp code"),
+    }
+}
+
+fn encode_chimp128(present: &[f64]) -> Vec<u8> {
+    let mut writer = BitWriter::with_capacity(1 + present.len());
+    writer.write_bits(u64::from(KIND_F64_CHIMP128), 8);
+    let mut stored = [0u64; CHIMP_WINDOW];
+    let mut recent = vec![0u32; CHIMP_KEY_MASK as usize + 1];
+    let mut current = 0usize;
+    let mut index = 0u32;
+    // 65 means the next value must not reuse a leading-zero count. The
+    // rounded counts above never reach it.
+    let mut stored_leading = 65u32;
+
+    let first = present[0].to_bits();
+    writer.write_bits(first, 64);
+    stored[0] = first;
+    recent[(first & CHIMP_KEY_MASK) as usize] = 0;
+
+    for value in &present[1..] {
+        let bits = value.to_bits();
+        let key = (bits & CHIMP_KEY_MASK) as usize;
+        let seen = recent[key];
+        let mut trailing = 0u32;
+        let (reference, xor) = if index.wrapping_sub(seen) < CHIMP_WINDOW as u32 {
+            let slot = seen as usize % CHIMP_WINDOW;
+            let candidate = bits ^ stored[slot];
+            let candidate_trailing = candidate.trailing_zeros();
+            if candidate_trailing > CHIMP_TRAILING_THRESHOLD {
+                trailing = candidate_trailing;
+                (slot, candidate)
+            } else {
+                (current, stored[current] ^ bits)
+            }
+        } else {
+            (current, stored[current] ^ bits)
+        };
+
+        if xor == 0 {
+            writer.write_bits(0b00, 2);
+            writer.write_bits(reference as u64, CHIMP_WINDOW_BITS);
+            stored_leading = 65;
+        } else {
+            let rounded = CHIMP_LEADING_ROUND[xor.leading_zeros() as usize];
+            if trailing > CHIMP_TRAILING_THRESHOLD {
+                let significant = 64 - rounded - trailing;
+                writer.write_bits(0b01, 2);
+                writer.write_bits(reference as u64, CHIMP_WINDOW_BITS);
+                writer.write_bits(u64::from(chimp_leading_code(rounded)), 3);
+                // A 64-bit center does not fit in 6 bits; 0 stands for 64.
+                writer.write_bits(u64::from(significant & 63), 6);
+                writer.write_bits(xor >> trailing, significant);
+                stored_leading = 65;
+            } else if rounded == stored_leading {
+                writer.write_bits(0b10, 2);
+                writer.write_bits(xor, 64 - rounded);
+            } else {
+                stored_leading = rounded;
+                writer.write_bits(0b11, 2);
+                writer.write_bits(u64::from(chimp_leading_code(rounded)), 3);
+                writer.write_bits(xor, 64 - rounded);
+            }
+        }
+
+        current = (current + 1) % CHIMP_WINDOW;
+        stored[current] = bits;
+        index += 1;
+        recent[key] = index;
+    }
+    writer.finish()
+}
+
+struct BitWriter {
+    out: Vec<u8>,
+    acc: u8,
+    filled: u32,
+}
+
+impl BitWriter {
+    fn with_capacity(values: usize) -> Self {
+        Self {
+            out: Vec::with_capacity(1 + values * 8),
+            acc: 0,
+            filled: 0,
+        }
+    }
+
+    /// Writes the low `width` bits, most-significant bit first.
+    fn write_bits(&mut self, mut value: u64, mut width: u32) {
+        debug_assert!(width <= 64);
+        debug_assert!(width == 64 || width == 0 || value >> width == 0);
+        while width > 0 {
+            let space = 8 - self.filled;
+            let take = width.min(space);
+            let shift = width - take;
+            let chunk = (value >> shift) as u8;
+            if take == 8 {
+                self.out.push(chunk);
+            } else {
+                let mask = (1u8 << take) - 1;
+                self.acc = (self.acc << take) | (chunk & mask);
+                self.filled += take;
+                if self.filled == 8 {
+                    self.out.push(self.acc);
+                    self.acc = 0;
+                    self.filled = 0;
+                }
+            }
+            width -= take;
+            if shift > 0 {
+                value &= (1u64 << shift) - 1;
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.filled > 0 {
+            self.acc <<= 8 - self.filled;
+            self.out.push(self.acc);
+        }
+        self.out
+    }
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    acc: u8,
+    filled: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            acc: 0,
+            filled: 0,
+        }
+    }
+
+    fn read_bits(&mut self, mut width: u32) -> Result<u64> {
+        if width > 64 {
+            return Err(Error::corrupt("chimp128 float column bit width is invalid"));
+        }
+        let mut result = 0u64;
+        while width > 0 {
+            if self.filled == 0 {
+                let byte = *self
+                    .data
+                    .get(self.pos)
+                    .ok_or_else(|| Error::corrupt("truncated chimp128 float column"))?;
+                self.pos += 1;
+                self.acc = byte;
+                self.filled = 8;
+            }
+            let take = width.min(self.filled);
+            let shift = self.filled - take;
+            let chunk = u64::from(self.acc >> shift);
+            result = (result << take) | chunk;
+            self.acc &= (1u8 << shift) - 1;
+            self.filled -= take;
+            width -= take;
+        }
+        Ok(result)
+    }
+}
+
+fn decode_chimp128(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<f64>> {
+    if count == 0 {
+        return Err(Error::corrupt("chimp128 float column is empty"));
+    }
+    let mut reader = BitReader::new(&bytes[*cursor..]);
+    let mut stored = [0u64; CHIMP_WINDOW];
+    let mut current = 0usize;
+    let mut stored_leading: Option<u32> = None;
+    let mut out = Vec::with_capacity(count);
+
+    let first = reader.read_bits(64)?;
+    stored[0] = first;
+    let mut stored_val = first;
+    out.push(f64::from_bits(first));
+
+    for _ in 1..count {
+        let flag = reader.read_bits(2)?;
+        let value = match flag {
+            0 => {
+                let slot = reader.read_bits(CHIMP_WINDOW_BITS)? as usize;
+                stored[slot]
+            }
+            1 => {
+                let slot = reader.read_bits(CHIMP_WINDOW_BITS)? as usize;
+                let code = reader.read_bits(3)? as usize;
+                let mut significant = reader.read_bits(6)?;
+                if significant == 0 {
+                    significant = 64;
+                }
+                let leading = CHIMP_LEADING_DECODE[code];
+                if u64::from(leading) + significant > 64 {
+                    return Err(Error::corrupt(
+                        "chimp128 float center is wider than 64 bits",
+                    ));
+                }
+                let trailing = 64 - significant - u64::from(leading);
+                let center = reader.read_bits(significant as u32)?;
+                stored_leading = Some(leading);
+                stored[slot] ^ (center << trailing)
+            }
+            2 => {
+                let leading = stored_leading.ok_or_else(|| {
+                    Error::corrupt("chimp128 float column reuses a missing leading-zero count")
+                })?;
+                let center = reader.read_bits(64 - leading)?;
+                stored_val ^ center
+            }
+            3 => {
+                let code = reader.read_bits(3)? as usize;
+                let leading = CHIMP_LEADING_DECODE[code];
+                stored_leading = Some(leading);
+                let center = reader.read_bits(64 - leading)?;
+                stored_val ^ center
+            }
+            _ => return Err(Error::corrupt("chimp128 float control bits are invalid")),
+        };
+        current = (current + 1) % CHIMP_WINDOW;
+        stored[current] = value;
+        stored_val = value;
+        out.push(f64::from_bits(value));
+    }
+    *cursor += reader.pos;
+    Ok(out)
 }
 
 fn encode_bools(values: &[Option<bool>]) -> Vec<u8> {
@@ -1127,16 +1407,20 @@ fn skip_packed(
 
 fn skip_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
     if count == 0 {
-        return expect_kind(bytes, cursor, 0);
+        return expect_kind(bytes, cursor, KIND_F64_EMPTY);
     }
     let kind = read_u8(bytes, cursor)?;
     match kind {
-        1 => {
+        KIND_F64_CONSTANT => {
             let _ = read_f64(bytes, cursor)?;
             Ok(())
         }
-        2 => {
+        KIND_F64_RAW => {
             let _ = read_exact(bytes, cursor, count.saturating_mul(8))?;
+            Ok(())
+        }
+        KIND_F64_CHIMP128 => {
+            let _ = decode_chimp128(bytes, cursor, count)?;
             Ok(())
         }
         _ => Err(Error::corrupt(format!("unknown float encoding {kind}"))),
@@ -1325,22 +1609,23 @@ fn read_packed<'a>(
 
 fn decode_f64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<f64>> {
     if count == 0 {
-        expect_kind(bytes, cursor, 0)?;
+        expect_kind(bytes, cursor, KIND_F64_EMPTY)?;
         return Ok(Vec::new());
     }
     let kind = read_u8(bytes, cursor)?;
     match kind {
-        1 => {
+        KIND_F64_CONSTANT => {
             let value = read_f64(bytes, cursor)?;
             Ok(vec![value; count])
         }
-        2 => {
+        KIND_F64_RAW => {
             let mut out = Vec::with_capacity(count);
             for _ in 0..count {
                 out.push(read_f64(bytes, cursor)?);
             }
             Ok(out)
         }
+        KIND_F64_CHIMP128 => decode_chimp128(bytes, cursor, count),
         _ => Err(Error::corrupt(format!("unknown float encoding {kind}"))),
     }
 }
@@ -3076,5 +3361,235 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert!(matches!(&decoded[0].values[2], Scalar::Int(1)));
         assert!(matches!(&decoded[0].values[1], Scalar::Str(text) if text == &note));
+    }
+
+    fn assert_f64_bits(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (left, right) in actual.iter().zip(expected) {
+            assert_eq!(left.to_bits(), right.to_bits());
+        }
+    }
+
+    fn float_values_roundtrip(values: &[Option<f64>]) {
+        let encoded = encode_f64s(values);
+        let present: Vec<f64> = values.iter().copied().flatten().collect();
+        let mut cursor = 0;
+        let decoded = decode_f64s(&encoded, &mut cursor, present.len()).unwrap();
+        assert_eq!(cursor, encoded.len());
+        assert_f64_bits(&decoded, &present);
+        let mut skipped = 0;
+        skip_f64s(&encoded, &mut skipped, present.len()).unwrap();
+        assert_eq!(skipped, encoded.len());
+    }
+
+    #[test]
+    fn chimp128_roundtrips_cycle_smooth_random_and_non_finite() {
+        let cycle: Vec<f64> = (0..2048).map(|i| (i % 100) as f64 / 10.0).collect();
+        let mut mixed = Vec::new();
+        for i in 0..300 {
+            mixed.push((i as f64) * 0.001);
+        }
+        for i in 0..80 {
+            mixed.push(mixed[i]);
+        }
+        mixed.extend_from_slice(&cycle[..100]);
+        mixed.push(0.0);
+        mixed.push(-0.0);
+        mixed.push(f64::INFINITY);
+        mixed.push(f64::NEG_INFINITY);
+        mixed.push(f64::NAN);
+        mixed.push(f64::from_bits(0x7ff8_0000_0000_0001));
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for _ in 0..200 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            mixed.push(f64::from_bits(state));
+        }
+        let encoded = encode_chimp128(&mixed);
+        assert_eq!(encoded[0], KIND_F64_CHIMP128);
+        let mut cursor = 1;
+        let decoded = decode_chimp128(&encoded, &mut cursor, mixed.len()).unwrap();
+        assert_f64_bits(&decoded, &mixed);
+        assert_eq!(cursor, encoded.len());
+
+        float_values_roundtrip(&cycle.iter().copied().map(Some).collect::<Vec<_>>());
+        float_values_roundtrip(&mixed.iter().copied().map(Some).collect::<Vec<_>>());
+        let with_nulls: Vec<Option<f64>> = mixed
+            .iter()
+            .enumerate()
+            .map(|(i, value)| if i % 7 == 0 { None } else { Some(*value) })
+            .collect();
+        float_values_roundtrip(&with_nulls);
+    }
+
+    #[test]
+    fn chimp128_is_chosen_only_when_smaller_than_raw_and_constant_stays_constant() {
+        let constant = vec![Some(1.5); 32];
+        let encoded = encode_f64s(&constant);
+        assert_eq!(encoded[0], KIND_F64_CONSTANT);
+        float_values_roundtrip(&constant);
+
+        let smooth: Vec<Option<f64>> = (0..256).map(|i| Some(i as f64 * 0.015625)).collect();
+        let present: Vec<f64> = smooth.iter().copied().flatten().collect();
+        let raw = encode_raw_f64s(&present);
+        let chimp = encode_chimp128(&present);
+        assert!(chimp.len() < raw.len());
+        let encoded = encode_f64s(&smooth);
+        assert_eq!(encoded[0], KIND_F64_CHIMP128);
+        assert_eq!(encoded, chimp);
+        float_values_roundtrip(&smooth);
+
+        let mut state = 0x0fed_cba9_8765_4321u64;
+        let random: Vec<Option<f64>> = (0..64)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                Some(f64::from_bits(state))
+            })
+            .collect();
+        let present: Vec<f64> = random.iter().copied().flatten().collect();
+        let raw = encode_raw_f64s(&present);
+        let chimp = encode_chimp128(&present);
+        let encoded = encode_f64s(&random);
+        if chimp.len() < raw.len() {
+            assert_eq!(encoded, chimp);
+        } else {
+            assert_eq!(encoded, raw);
+            assert_eq!(encoded[0], KIND_F64_RAW);
+        }
+        float_values_roundtrip(&random);
+    }
+
+    #[test]
+    fn stock_score_cycle_constant_float_and_legacy_raw_roundtrip() {
+        let schema = schema();
+        let mut rows = Vec::new();
+        let actions = ["click", "view", "buy", "scroll"];
+        let notes = ["landing", "checkout", "search"];
+        for i in 0..2048i64 {
+            let obj = serde_json::json!({
+                "ts": 1_700_000_000_000i64 + i * 10,
+                "user_id": i % 1_000,
+                "score": (i % 100) as f64 / 10.0,
+                "ok": i % 2 == 0,
+                "action": actions[i as usize % 4],
+                "note": notes[i as usize % 3],
+                "amount": format!("{}.{:02}", (i % 5_000) / 100, (i % 5_000) % 100),
+            });
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let decoded = decode_block(&schema, &encoded.bytes).unwrap();
+        assert_eq!(decoded.len(), rows.len());
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            for (lv, rv) in left.values.iter().zip(right.values.iter()) {
+                match (lv, rv) {
+                    (Scalar::Float(l), Scalar::Float(r)) => assert_eq!(l.to_bits(), r.to_bits()),
+                    _ => assert_eq!(lv, rv),
+                }
+            }
+        }
+
+        let constant_schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "score", "type": "float"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let constant_rows: Vec<Row> = (0..16)
+            .map(|i| {
+                parse_event(
+                    &constant_schema,
+                    format!(r#"{{"ts":{i},"score":1.5}}"#).as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let block = encode_block(&constant_schema, &constant_rows).unwrap();
+        let nrows = block_row_count(&block.bytes).unwrap();
+        let mut cursor = 4;
+        skip_column(FieldType::Timestamp, &block.bytes, &mut cursor, nrows, true).unwrap();
+        let null_flag = block.bytes[cursor];
+        assert_eq!(null_flag, 0);
+        assert_eq!(block.bytes[cursor + 1], KIND_F64_CONSTANT);
+        let decoded = decode_block(&constant_schema, &block.bytes).unwrap();
+        assert!(decoded
+            .iter()
+            .all(|row| matches!(row.values[1], Scalar::Float(value) if value.to_bits() == 1.5f64.to_bits())));
+
+        let legacy_rows: Vec<Row> = (0..8)
+            .map(|i| {
+                let score = if i % 2 == 0 { 0.0 } else { -0.0 };
+                parse_event(
+                    &constant_schema,
+                    format!(r#"{{"ts":{i},"score":{score}}}"#).as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        // -0.0 is not preserved by JSON, so build the legacy frame from bits.
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&(legacy_rows.len() as u32).to_le_bytes());
+        encode_column(&mut legacy, FieldType::Timestamp, &legacy_rows, 0).unwrap();
+        write_nulls(&mut legacy, &[false; 8]);
+        legacy.push(KIND_F64_RAW);
+        for i in 0..8 {
+            let bits = if i % 2 == 0 {
+                0.0f64.to_bits()
+            } else {
+                (-0.0f64).to_bits()
+            };
+            legacy.extend_from_slice(&f64::from_bits(bits).to_le_bytes());
+        }
+        assert_eq!(legacy[legacy.len() - 8 * 8 - 1], KIND_F64_RAW);
+        let decoded = decode_block(&constant_schema, &legacy).unwrap();
+        assert_eq!(decoded.len(), 8);
+        for (i, row) in decoded.iter().enumerate() {
+            let expected = if i % 2 == 0 {
+                0.0f64.to_bits()
+            } else {
+                (-0.0f64).to_bits()
+            };
+            match row.values[1] {
+                Scalar::Float(value) => assert_eq!(value.to_bits(), expected),
+                _ => panic!("expected a float"),
+            }
+        }
+
+        let early_float = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "score", "type": "float"},
+                    {"name": "ts", "type": "timestamp"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let early_rows: Vec<Row> = (0..180)
+            .map(|i| {
+                parse_event(
+                    &early_float,
+                    format!(r#"{{"score":{},"ts":{}}}"#, i as f64 * 0.01, 1_000 + i).as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let block = encode_block(&early_float, &early_rows).unwrap();
+        let decoded =
+            decode_rows_in_range(&early_float, &block.bytes, 1_000, 1_179, usize::MAX).unwrap();
+        assert_eq!(decoded.len(), early_rows.len());
+        for (left, right) in early_rows.iter().zip(decoded.iter()) {
+            match (&left.values[0], &right.values[0]) {
+                (Scalar::Float(l), Scalar::Float(r)) => assert_eq!(l.to_bits(), r.to_bits()),
+                _ => panic!("expected floats"),
+            }
+        }
     }
 }
