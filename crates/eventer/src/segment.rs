@@ -17,8 +17,12 @@ pub const INDEX_ENTRY_LEN: usize = 40;
 pub const DICT_HEADER_LEN: usize = 16;
 pub const INDEX_VERSION: u16 = 1;
 pub const DICT_VERSION: u16 = 1;
-/// Trained dictionary cap. The sidecar stores this plus a 16-byte header.
+/// Trained dictionary cap. The sidecar frames this plus a 16-byte header.
 pub const DICT_MAX_BYTES: usize = 4 * 1024;
+/// Plain zstd level for the on-disk sidecar. Block frames keep the store level.
+const DICT_SIDECAR_ZSTD_LEVEL: i32 = 3;
+/// Little-endian zstd frame magic (`0xFD2FB528`).
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Uncompressed sealed-block sample kept before training one dictionary.
 pub const DICT_SAMPLE_MAX: usize = 256 * 1024;
 /// Slice size for `zstd::dict::from_continuous`. Fast cover keeps a train/test
@@ -325,7 +329,8 @@ pub fn read_dictionary(path: &Path) -> Result<Option<StoredDictionary>> {
     if bytes.len() as u64 > max {
         return Err(Error::corrupt("segment dictionary exceeds the size cap"));
     }
-    let dict = parse_dictionary_file(&bytes)?;
+    let sidecar = decode_dictionary_sidecar(&bytes)?;
+    let dict = parse_dictionary_file(&sidecar)?;
     Ok(Some(StoredDictionary {
         bytes: dict,
         file_len: bytes.len() as u64,
@@ -342,18 +347,42 @@ pub fn write_dictionary(dir: &Path, id: u32, dict: &[u8]) -> Result<u64> {
     // Publish via rename so a crash cannot leave a truncated sidecar in place
     // of a previous dictionary, or invent one before the bytes are durable.
     let tmp = dir.join(format!(".seg-{id:06}.dict.partial"));
-    let mut header = [0u8; DICT_HEADER_LEN];
-    header[0..4].copy_from_slice(DICT_MAGIC);
-    header[4..6].copy_from_slice(&DICT_VERSION.to_le_bytes());
-    header[8..12].copy_from_slice(&(dict.len() as u32).to_le_bytes());
-    header[12..16].copy_from_slice(&crc32fast::hash(dict).to_le_bytes());
+    let sidecar = encode_dictionary_sidecar(dict);
+    // Plain zstd only. The segment dictionary cannot decode its own sidecar.
+    let compressed = zstd::bulk::compress(&sidecar, DICT_SIDECAR_ZSTD_LEVEL).map_err(Error::io)?;
+    let stored = if compressed.len() < sidecar.len() {
+        compressed
+    } else {
+        sidecar
+    };
     let mut file = File::create(&tmp)?;
-    file.write_all(&header)?;
-    file.write_all(dict)?;
+    file.write_all(&stored)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&tmp, &path)?;
-    Ok((DICT_HEADER_LEN + dict.len()) as u64)
+    Ok(stored.len() as u64)
+}
+
+fn encode_dictionary_sidecar(dict: &[u8]) -> Vec<u8> {
+    let mut sidecar = Vec::with_capacity(DICT_HEADER_LEN + dict.len());
+    sidecar.extend_from_slice(DICT_MAGIC);
+    sidecar.extend_from_slice(&DICT_VERSION.to_le_bytes());
+    sidecar.extend_from_slice(&0u16.to_le_bytes());
+    sidecar.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+    sidecar.extend_from_slice(&crc32fast::hash(dict).to_le_bytes());
+    sidecar.extend_from_slice(dict);
+    sidecar
+}
+
+/// Expand a plain zstd sidecar, or return a raw `EVZD` file unchanged.
+fn decode_dictionary_sidecar(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() >= 4 && bytes[0..4] == ZSTD_FRAME_MAGIC {
+        let cap = DICT_HEADER_LEN + DICT_MAX_BYTES;
+        zstd::bulk::decompress(bytes, cap)
+            .map_err(|_| Error::corrupt("truncated segment dictionary"))
+    } else {
+        Ok(bytes.to_vec())
+    }
 }
 
 /// True when the block frame at `meta.offset` is dictionary-compressed (`EVBD`).
@@ -590,5 +619,97 @@ impl ActiveSegment {
             self.index.get_ref().sync_data()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eventer-dict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn plain_zstd_sidecar_round_trips_and_raw_evzd_still_loads() {
+        let dir = scratch_dir();
+        let dict: Vec<u8> = (0..1024).map(|i| (i % 17) as u8).collect();
+        let file_len = write_dictionary(&dir, 1, &dict).unwrap();
+        let path = dictionary_path(&dir, 1);
+        let on_disk = fs::read(&path).unwrap();
+        assert_eq!(file_len, on_disk.len() as u64);
+        assert!(on_disk.len() < DICT_HEADER_LEN + dict.len());
+        assert_eq!(&on_disk[..4], &ZSTD_FRAME_MAGIC);
+        let stored = read_dictionary(&path).unwrap().unwrap();
+        assert_eq!(stored.bytes, dict);
+        assert_eq!(stored.file_len, file_len);
+
+        let raw = encode_dictionary_sidecar(&dict);
+        fs::write(&path, &raw).unwrap();
+        let stored = read_dictionary(&path).unwrap().unwrap();
+        assert_eq!(stored.bytes, dict);
+        assert_eq!(stored.file_len, raw.len() as u64);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incompressible_sidecar_stays_raw_evzd() {
+        let dir = scratch_dir();
+        // Already a zstd frame, so a second plain pass does not shrink the sidecar.
+        let seed: Vec<u8> = (0..384u32)
+            .map(|i| (i.wrapping_mul(17) ^ 0xA5) as u8)
+            .collect();
+        let dict = zstd::bulk::compress(&seed, 19).unwrap();
+        assert!(dict.len() <= DICT_MAX_BYTES);
+        let file_len = write_dictionary(&dir, 3, &dict).unwrap();
+        let path = dictionary_path(&dir, 3);
+        let on_disk = fs::read(&path).unwrap();
+        let raw = encode_dictionary_sidecar(&dict);
+        assert_eq!(
+            on_disk, raw,
+            "plain zstd grew or tied; raw EVZD must be kept"
+        );
+        assert_eq!(file_len, raw.len() as u64);
+        assert_eq!(read_dictionary(&path).unwrap().unwrap().bytes, dict);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_zstd_sidecar_is_corrupt() {
+        let dir = scratch_dir();
+        let dict = vec![7u8; 256];
+        write_dictionary(&dir, 1, &dict).unwrap();
+        let path = dictionary_path(&dir, 1);
+        let on_disk = fs::read(&path).unwrap();
+        assert_eq!(&on_disk[..4], &ZSTD_FRAME_MAGIC);
+        fs::write(&path, &on_disk[..on_disk.len() - 1]).unwrap();
+        let err = read_dictionary(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("truncated segment dictionary"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zstd_sidecar_above_the_dictionary_cap_is_corrupt() {
+        let dir = scratch_dir();
+        let path = dictionary_path(&dir, 1);
+        let huge = vec![0u8; DICT_HEADER_LEN + DICT_MAX_BYTES + 64];
+        let frame = zstd::bulk::compress(&huge, 1).unwrap();
+        assert!(frame.len() <= DICT_HEADER_LEN + DICT_MAX_BYTES);
+        fs::write(&path, &frame).unwrap();
+        let err = read_dictionary(&path).unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

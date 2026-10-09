@@ -1262,12 +1262,14 @@ mod tests {
         assert_eq!(store.query(0, n).unwrap().len(), n as usize);
         let data_len = fs::metadata(&data_file).unwrap().len();
         let dict_len = fs::metadata(&dict_file).unwrap().len();
+        let dict_bytes = fs::read(&dict_file).unwrap();
+        assert_eq!(&dict_bytes[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
         assert_eq!(store.stats().data_bytes, data_len + dict_len);
         assert!(dict_len > segment::DICT_HEADER_LEN as u64);
         assert!(dict_len <= (segment::DICT_HEADER_LEN + segment::DICT_MAX_BYTES) as u64);
         store.close().unwrap();
 
-        let reopened = Store::open_with(&data, &schema, options).unwrap();
+        let reopened = Store::open_with(&data, &schema, options.clone()).unwrap();
         assert_eq!(
             reopened.query(span_from, span_to).unwrap().len(),
             spanned.len()
@@ -1275,6 +1277,23 @@ mod tests {
         assert_eq!(reopened.query(0, n - 1).unwrap().len(), n as usize);
         assert_eq!(reopened.stats().data_bytes, data_len + dict_len);
         reopened.close().unwrap();
+
+        let trained = segment::read_dictionary(&dict_file).unwrap().unwrap().bytes;
+        let mut raw_sidecar = Vec::with_capacity(segment::DICT_HEADER_LEN + trained.len());
+        raw_sidecar.extend_from_slice(segment::DICT_MAGIC);
+        raw_sidecar.extend_from_slice(&segment::DICT_VERSION.to_le_bytes());
+        raw_sidecar.extend_from_slice(&0u16.to_le_bytes());
+        raw_sidecar.extend_from_slice(&(trained.len() as u32).to_le_bytes());
+        raw_sidecar.extend_from_slice(&crc32fast::hash(&trained).to_le_bytes());
+        raw_sidecar.extend_from_slice(&trained);
+        fs::write(&dict_file, &raw_sidecar).unwrap();
+        let legacy = Store::open_with(&data, &schema, options).unwrap();
+        assert_eq!(legacy.query(0, n - 1).unwrap().len(), n as usize);
+        assert_eq!(
+            legacy.stats().data_bytes,
+            data_len + raw_sidecar.len() as u64
+        );
+        legacy.close().unwrap();
     }
 
     #[test]
