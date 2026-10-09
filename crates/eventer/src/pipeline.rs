@@ -1159,15 +1159,16 @@ impl Disk {
         }
     }
 
-    fn prepare(&mut self) -> Result<()> {
+    fn prepare(&mut self) -> Result<i64> {
         let rotate = self
             .active
             .as_ref()
             .map(|segment| segment.data_len >= self.rotate_at)
             .unwrap_or(false);
+        let mut index_delta = 0i64;
         if rotate {
             if let Some(mut segment) = self.active.take() {
-                segment.flush_os(true)?;
+                index_delta = segment.flush_os(true)?;
             }
         }
         if self.active.is_none() {
@@ -1184,7 +1185,7 @@ impl Disk {
                 self.segment_epoch = self.publish.bump_and_clear();
             }
         }
-        Ok(())
+        Ok(index_delta)
     }
 
     fn commit(&mut self, batch: &mut Vec<BlockOut>, sync: bool) -> Result<()> {
@@ -1198,8 +1199,9 @@ impl Disk {
         let mut zones = Vec::with_capacity(batch.len());
         let mut acks = Vec::new();
         let result = (|| {
+            let mut index_delta = 0i64;
             for item in batch.iter_mut() {
-                self.prepare()?;
+                index_delta = index_delta.saturating_add(self.prepare()?);
                 let (framed, compressed_len) = self.frame_for(item)?;
                 let segment = self.active.as_mut().expect("segment prepared");
                 if framed.len() != BLOCK_HEADER_LEN + compressed_len as usize {
@@ -1218,10 +1220,12 @@ impl Disk {
                 metas.push(meta);
                 zones.push(item.zone.clone());
             }
-            self.active
-                .as_mut()
-                .expect("segment prepared")
-                .flush_os(sync)?;
+            index_delta = index_delta.saturating_add(
+                self.active
+                    .as_mut()
+                    .expect("segment prepared")
+                    .flush_os(sync)?,
+            );
             let zone_bytes = write_zone_batch(
                 &self.dir,
                 self.schema_crc,
@@ -1230,7 +1234,7 @@ impl Disk {
                 &zones,
                 sync,
             )?;
-            Ok(zone_bytes)
+            Ok(zone_bytes.saturating_add(index_delta))
         })();
         match result {
             Ok(zone_bytes) => {
