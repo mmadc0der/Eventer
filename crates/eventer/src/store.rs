@@ -1186,6 +1186,49 @@ mod tests {
     }
 
     #[test]
+    fn flush_frames_training_sample_with_dictionary() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let mut options = test_options(128);
+        options.zstd_level = 3;
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        // Unique text so the sealed blocks stay large enough to fill the 256 KiB sample.
+        let rows = 128 * 16;
+        for n in 0..rows {
+            let note = format!("{n:04}-{}", "n".repeat(300));
+            store
+                .append_json(&event(n, Some(n % 50), "click", Some(&note), "19.99"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        store.close().unwrap();
+
+        let data_file = segment::data_path(&data, 1);
+        let kinds = block_kinds(&data_file);
+        assert!(
+            kinds.len() > 1,
+            "expected the sample to span more than one block"
+        );
+        assert!(
+            kinds
+                .iter()
+                .all(|(magic, _, _)| magic == segment::BLOCK_MAGIC_DICT),
+            "training-sample blocks must be EVBD after one flush: {kinds:?}"
+        );
+        let dict_file = segment::dictionary_path(&data, 1);
+        let dict_len = fs::metadata(&dict_file).unwrap().len();
+        assert!(dict_len > segment::DICT_HEADER_LEN as u64);
+        assert!(dict_len <= (segment::DICT_HEADER_LEN + segment::DICT_MAX_BYTES) as u64);
+
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        assert_eq!(store.query(0, rows).unwrap().len(), rows as usize);
+        let data_len = fs::metadata(&data_file).unwrap().len();
+        assert_eq!(store.stats().data_bytes, data_len + dict_len);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn truncated_or_missing_dictionary_is_corrupt() {
         let dir = TempDir::new();
         let (schema, options, n) = write_until_dictionary(dir.path());
