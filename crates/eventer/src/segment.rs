@@ -1217,11 +1217,10 @@ pub fn read_block_payload(
             meta.offset, meta.segment_id
         )));
     }
-    let want = if available >= old_total {
-        old_total
-    } else {
-        new_total
-    };
+    // A 20-byte frame that ends the file is longer than the 12-byte header and
+    // shorter than the 36-byte header. Read through the legacy length when it
+    // is present, and otherwise the bytes that remain, then try 12, 20, and 36.
+    let want = old_total.min(available);
     file.seek(SeekFrom::Start(meta.offset))?;
     let mut buf = vec![0u8; want as usize];
     file.read_exact(&mut buf)?;
@@ -1247,6 +1246,13 @@ pub fn read_block_payload(
         }
     }
     let uncompressed_len = meta.uncompressed_len;
+    // A 12-byte frame has no length of its own. The index value is what
+    // `decompress` reserves, and zstd 0.13 does not cap that reservation.
+    if uncompressed_len as usize > MAX_BLOCK_UNCOMPRESSED {
+        return Err(Error::corrupt(
+            "uncompressed length exceeds the block bound",
+        ));
+    }
     if dictionary_frame {
         let Some(dictionary) = dictionary else {
             return Err(Error::corrupt(format!(
@@ -1665,5 +1671,70 @@ mod tests {
         with_len.meta.uncompressed_len = 32;
         with_len.header_len = BLOCK_HEADER_LEN_V20;
         assert_eq!(decompress_cap(&with_len), 32);
+    }
+
+    fn block_meta(offset: u64, compressed_len: u32, uncompressed_len: u32) -> BlockMeta {
+        BlockMeta {
+            segment_id: 1,
+            offset,
+            compressed_len,
+            uncompressed_len,
+            row_count: 1,
+            min_ts: 1,
+            max_ts: 1,
+        }
+    }
+
+    #[test]
+    fn read_block_payload_decodes_a_lone_20_byte_frame_and_a_trailing_one() {
+        let raw = b"only-twenty-byte-frame";
+        let payload = zstd::bulk::compress(raw, 1).unwrap();
+        let frame20 = frame_v20(&payload, raw.len() as u32, 1);
+        let dir = scratch_dir();
+        let path = data_path(&dir, 1);
+        fs::write(&path, &frame20).unwrap();
+        let got = read_block_payload(
+            &path,
+            &block_meta(0, payload.len() as u32, raw.len() as u32),
+            None,
+        )
+        .unwrap();
+        assert_eq!(got, raw);
+
+        let leading = frame_block(&payload, false).unwrap();
+        fs::write(&path, [leading.as_slice(), frame20.as_slice()].concat()).unwrap();
+        let tail = read_block_payload(
+            &path,
+            &block_meta(leading.len() as u64, payload.len() as u32, raw.len() as u32),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tail, raw);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_block_payload_refuses_an_index_length_past_the_block_cap() {
+        let raw = b"small";
+        let payload = zstd::bulk::compress(raw, 1).unwrap();
+        let frame = frame_block(&payload, false).unwrap();
+        let dir = scratch_dir();
+        let path = data_path(&dir, 1);
+        fs::write(&path, &frame).unwrap();
+        let mut meta = block_meta(0, payload.len() as u32, u32::MAX);
+        let err = read_block_payload(&path, &meta, None).unwrap_err();
+        assert!(err.to_string().contains("block bound"), "{err}");
+
+        let dict: Vec<u8> = (0..128).map(|i| (i % 19) as u8).collect();
+        let compressed = zstd::bulk::Compressor::with_dictionary(1, &dict)
+            .unwrap()
+            .compress(raw)
+            .unwrap();
+        let framed = frame_block(&compressed, true).unwrap();
+        fs::write(&path, &framed).unwrap();
+        meta.compressed_len = compressed.len() as u32;
+        let err = read_block_payload(&path, &meta, Some(&dict)).unwrap_err();
+        assert!(err.to_string().contains("block bound"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
