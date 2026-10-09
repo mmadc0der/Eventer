@@ -119,13 +119,12 @@ pub(crate) fn decode_rows_in_range_filtered(
                 return finish_empty(schema, bytes, &mut cursor, index);
             }
             if let Some(predicate) = predicate {
-                if matches!(field.ty, FieldType::String | FieldType::Text | FieldType::Json) {
-                    let spans = read_text_spans(
-                        bytes,
-                        &mut cursor,
-                        nrows,
-                        field.ty == FieldType::Json,
-                    )?;
+                if matches!(
+                    field.ty,
+                    FieldType::String | FieldType::Text | FieldType::Json
+                ) {
+                    let spans =
+                        read_text_spans(bytes, &mut cursor, nrows, field.ty == FieldType::Json)?;
                     mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
                     if !mask.iter().any(|keep| *keep) {
                         return finish_empty(schema, bytes, &mut cursor, index + 1);
@@ -197,7 +196,11 @@ pub(crate) fn decode_rows_in_range_filtered(
     }
     for (index, json, spans) in deferred {
         columns[index] = Some(materialize_text_spans(
-            bytes, &spans, &mask, &mut budget, json,
+            bytes,
+            &spans,
+            &mask,
+            &mut budget,
+            json,
         )?);
     }
 
@@ -536,18 +539,24 @@ fn encode_stride_i128(base: i128, stride: i128) -> Vec<u8> {
 /// returned here. A run of equal values becomes single-value pieces; more
 /// than eight pieces is not this encoding.
 fn stride_pieces_i64(present: &[i64]) -> Option<Vec<StridePiece>> {
-    stride_pieces(present, |value| i128::from(value), |base, offset, stride| {
-        let base = base as i64;
-        let stride = stride as i64;
-        let offset = offset as i64;
-        i128::from(base.wrapping_add(offset.wrapping_mul(stride)))
-    })
+    stride_pieces(
+        present,
+        |value| i128::from(value),
+        |base, offset, stride| {
+            let base = base as i64;
+            let stride = stride as i64;
+            let offset = offset as i64;
+            i128::from(base.wrapping_add(offset.wrapping_mul(stride)))
+        },
+    )
 }
 
 fn stride_pieces_i128(present: &[i128]) -> Option<Vec<StridePiece>> {
-    stride_pieces(present, |value| value, |base, offset, stride| {
-        base.wrapping_add(offset.wrapping_mul(stride))
-    })
+    stride_pieces(
+        present,
+        |value| value,
+        |base, offset, stride| base.wrapping_add(offset.wrapping_mul(stride)),
+    )
 }
 
 fn stride_pieces<T: Copy>(
@@ -784,6 +793,12 @@ fn encode_bools(values: &[Option<bool>]) -> Vec<u8> {
     out
 }
 
+/// String bodies. Kind 1 is a dictionary plus one code per present value.
+/// Kind 4 is that same dictionary plus one period of codes, expanded with
+/// `code[i] = code[i % p]` on read. Kinds 0, 2, and 3 are unchanged.
+const STRING_DICT: u8 = 1;
+const STRING_DICT_PERIOD: u8 = 4;
+
 fn encode_strings(values: &[Option<String>], allow_dict: bool) -> Vec<u8> {
     let present: Vec<&str> = values.iter().filter_map(|value| value.as_deref()).collect();
     if present.is_empty() {
@@ -799,12 +814,20 @@ fn encode_strings(values: &[Option<String>], allow_dict: bool) -> Vec<u8> {
     if !allow_dict || !string_dict_might_compress(&present) {
         return raw;
     }
-    let dict = encode_dict_strings(&present);
-    if dict.len() < raw.len() {
-        dict
-    } else {
-        raw
+    let (dict, codes, width) = build_string_dictionary(&present);
+    let full = write_string_dictionary(STRING_DICT, &dict, width, &codes);
+    // The dictionary has to beat raw strings on its own. A periodic code
+    // vector never rescues a dictionary that lost that comparison.
+    if full.len() >= raw.len() {
+        return raw;
     }
+    if let Some(period) = repeating_code_period(&codes) {
+        let periodic = write_string_dictionary(STRING_DICT_PERIOD, &dict, width, &codes[..period]);
+        if periodic.len() < full.len() {
+            return periodic;
+        }
+    }
+    full
 }
 
 /// Dictionary encoding only wins when some values repeat; unique strings pay extra
@@ -863,7 +886,13 @@ fn encode_raw_strings(present: &[&str]) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn encode_dict_strings(present: &[&str]) -> Vec<u8> {
+    let (dict, codes, width) = build_string_dictionary(present);
+    write_string_dictionary(STRING_DICT, &dict, width, &codes)
+}
+
+fn build_string_dictionary<'a>(present: &[&'a str]) -> (Vec<&'a str>, Vec<u32>, usize) {
     let mut lookup: HashMap<&str, u32> = HashMap::new();
     let mut dict: Vec<&str> = Vec::new();
     let mut codes = Vec::with_capacity(present.len());
@@ -885,17 +914,54 @@ fn encode_dict_strings(present: &[&str]) -> Vec<u8> {
     } else {
         4
     };
-    let mut out = vec![1];
+    (dict, codes, width)
+}
+
+fn write_string_dictionary(kind: u8, dict: &[&str], width: usize, codes: &[u32]) -> Vec<u8> {
+    let mut out = vec![kind];
     write_varint(&mut out, dict.len() as u64);
     for text in dict {
         write_varint(&mut out, text.len() as u64);
         out.extend_from_slice(text.as_bytes());
     }
     out.push(width as u8);
+    if kind == STRING_DICT_PERIOD {
+        write_varint(&mut out, codes.len() as u64);
+    }
     for code in codes {
-        write_uint(&mut out, code as u128, width);
+        write_uint(&mut out, u128::from(*code), width);
     }
     out
+}
+
+/// Smallest `p` in `2..codes.len()` such that `codes[i] == codes[i % p]` for
+/// every index. The scan follows the sequence against its prefix and shortens
+/// that prefix when they disagree. `n - border` is the candidate period, and
+/// it is accepted only when the rest of the column matches.
+fn repeating_code_period(codes: &[u32]) -> Option<usize> {
+    let n = codes.len();
+    if n < 3 {
+        return None;
+    }
+    let mut border = vec![0usize; n];
+    let mut matched = 0usize;
+    for i in 1..n {
+        while matched > 0 && codes[i] != codes[matched] {
+            matched = border[matched - 1];
+        }
+        if codes[i] == codes[matched] {
+            matched += 1;
+        }
+        border[i] = matched;
+    }
+    let period = n - border[n - 1];
+    if period < 2 || period >= n {
+        return None;
+    }
+    if (period..n).any(|index| codes[index] != codes[index % period]) {
+        return None;
+    }
+    Some(period)
 }
 
 fn kind_for_width(width: usize) -> u8 {
@@ -1386,6 +1452,89 @@ fn skip_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
     }
 }
 
+fn read_string_dict_len(bytes: &[u8], cursor: &mut usize) -> Result<usize> {
+    let dict_len = read_varint(bytes, cursor)? as usize;
+    if dict_len == 0 {
+        return Err(Error::corrupt("string dictionary is empty"));
+    }
+    Ok(dict_len)
+}
+
+fn read_dict_code_width(bytes: &[u8], cursor: &mut usize) -> Result<usize> {
+    let width = read_u8(bytes, cursor)? as usize;
+    if !matches!(width, 1 | 2 | 4) {
+        return Err(Error::corrupt("string dictionary code width is invalid"));
+    }
+    Ok(width)
+}
+
+fn read_one_dict_code(
+    bytes: &[u8],
+    cursor: &mut usize,
+    width: usize,
+    dict_len: usize,
+) -> Result<usize> {
+    let code = read_uint(bytes, cursor, width)? as usize;
+    if code >= dict_len {
+        return Err(Error::corrupt("string dictionary code is out of range"));
+    }
+    Ok(code)
+}
+
+fn skip_dict_codes(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    dict_len: usize,
+    periodic: bool,
+) -> Result<()> {
+    let width = read_dict_code_width(bytes, cursor)?;
+    let stored = if periodic {
+        dictionary_period(bytes, cursor, count)?
+    } else {
+        count
+    };
+    for _ in 0..stored {
+        let _ = read_one_dict_code(bytes, cursor, width, dict_len)?;
+    }
+    Ok(())
+}
+
+fn read_dict_codes(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    dict_len: usize,
+    periodic: bool,
+) -> Result<Vec<usize>> {
+    let width = read_dict_code_width(bytes, cursor)?;
+    if !periodic {
+        let mut codes = Vec::with_capacity(count);
+        for _ in 0..count {
+            codes.push(read_one_dict_code(bytes, cursor, width, dict_len)?);
+        }
+        return Ok(codes);
+    }
+    let period = dictionary_period(bytes, cursor, count)?;
+    let mut prefix = Vec::with_capacity(period);
+    for _ in 0..period {
+        prefix.push(read_one_dict_code(bytes, cursor, width, dict_len)?);
+    }
+    let mut codes = Vec::with_capacity(count);
+    for index in 0..count {
+        codes.push(prefix[index % period]);
+    }
+    Ok(codes)
+}
+
+fn dictionary_period(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<usize> {
+    let period = read_varint(bytes, cursor)?;
+    if period < 2 || period >= count as u64 {
+        return Err(Error::corrupt("string dictionary period is invalid"));
+    }
+    Ok(period as usize)
+}
+
 fn skip_strings(bytes: &[u8], cursor: &mut usize, count: usize, validate_json: bool) -> Result<()> {
     if count == 0 {
         return expect_kind(bytes, cursor, 0);
@@ -1399,24 +1548,12 @@ fn skip_strings(bytes: &[u8], cursor: &mut usize, count: usize, validate_json: b
             }
             Ok(())
         }
-        1 => {
-            let dict_len = read_varint(bytes, cursor)? as usize;
-            if dict_len == 0 {
-                return Err(Error::corrupt("string dictionary is empty"));
-            }
+        1 | 4 => {
+            let dict_len = read_string_dict_len(bytes, cursor)?;
             for _ in 0..dict_len {
                 skip_lp_string_value(bytes, cursor, validate_json)?;
             }
-            let width = read_u8(bytes, cursor)? as usize;
-            if !matches!(width, 1 | 2 | 4) {
-                return Err(Error::corrupt("string dictionary code width is invalid"));
-            }
-            for _ in 0..count {
-                let code = read_uint(bytes, cursor, width)?;
-                if code >= dict_len as u128 {
-                    return Err(Error::corrupt("string dictionary code is out of range"));
-                }
-            }
+            skip_dict_codes(bytes, cursor, count, dict_len, kind == STRING_DICT_PERIOD)?;
             Ok(())
         }
         _ => Err(Error::corrupt(format!("unknown string encoding {kind}"))),
@@ -1715,11 +1852,8 @@ fn decode_strings(
             }
             Ok(out)
         }
-        1 => {
-            let dict_len = read_varint(bytes, cursor)? as usize;
-            if dict_len == 0 {
-                return Err(Error::corrupt("string dictionary is empty"));
-            }
+        1 | 4 => {
+            let dict_len = read_string_dict_len(bytes, cursor)?;
             let mut dict = Vec::with_capacity(dict_len);
             for _ in 0..dict_len {
                 let text = read_lp_string(bytes, cursor)?;
@@ -1728,18 +1862,8 @@ fn decode_strings(
                 }
                 dict.push(text);
             }
-            let width = read_u8(bytes, cursor)? as usize;
-            if !matches!(width, 1 | 2 | 4) {
-                return Err(Error::corrupt("string dictionary code width is invalid"));
-            }
-            let mut codes = Vec::with_capacity(count);
-            for _ in 0..count {
-                let code = read_uint(bytes, cursor, width)? as usize;
-                if code >= dict.len() {
-                    return Err(Error::corrupt("string dictionary code is out of range"));
-                }
-                codes.push(code);
-            }
+            let codes =
+                read_dict_codes(bytes, cursor, count, dict.len(), kind == STRING_DICT_PERIOD)?;
             let mut expanded = 0usize;
             for (code, flag) in codes.iter().zip(keep.iter()) {
                 if !*flag {
@@ -1889,11 +2013,15 @@ fn read_stride_pieces(
             ));
         }
         if pair[1].start as usize >= count {
-            return Err(Error::corrupt("integer stride piece starts past the column"));
+            return Err(Error::corrupt(
+                "integer stride piece starts past the column",
+            ));
         }
     }
     if pieces.last().unwrap().start as usize >= count {
-        return Err(Error::corrupt("integer stride piece starts past the column"));
+        return Err(Error::corrupt(
+            "integer stride piece starts past the column",
+        ));
     }
     Ok(pieces)
 }
@@ -2063,28 +2191,26 @@ fn read_text_spans(
             }
             Ok(spans)
         }
-        1 => {
-            let dict_len = read_varint(bytes, cursor)? as usize;
-            if dict_len == 0 {
-                return Err(Error::corrupt("string dictionary is empty"));
-            }
+        1 | 4 => {
+            let dict_len = read_string_dict_len(bytes, cursor)?;
             let mut dict = Vec::with_capacity(dict_len);
             for _ in 0..dict_len {
                 dict.push(read_lp_span(bytes, cursor, validate_json)?);
             }
-            let width = read_u8(bytes, cursor)? as usize;
-            if !matches!(width, 1 | 2 | 4) {
-                return Err(Error::corrupt("string dictionary code width is invalid"));
-            }
+            let codes = read_dict_codes(
+                bytes,
+                cursor,
+                present_count,
+                dict.len(),
+                kind == STRING_DICT_PERIOD,
+            )?;
+            let mut present_index = 0usize;
             for row in 0..nrows {
                 if !row_is_present(&present, row) {
                     continue;
                 }
-                let code = read_uint(bytes, cursor, width)? as usize;
-                if code >= dict.len() {
-                    return Err(Error::corrupt("string dictionary code is out of range"));
-                }
-                spans[row] = Some(dict[code]);
+                spans[row] = Some(dict[codes[present_index]]);
+                present_index += 1;
             }
             Ok(spans)
         }
@@ -2396,8 +2522,8 @@ mod tests {
         let encoded = encode_block(&text_schema(), &rows).unwrap();
         assert_eq!(
             text_encoding_kind(&encoded.bytes),
-            1,
-            "repeated notes should use dictionary kind 1"
+            STRING_DICT_PERIOD,
+            "repeated notes should store one period of dictionary codes"
         );
         assert_text_roundtrip(&rows);
     }
@@ -2453,7 +2579,155 @@ mod tests {
         let dict = encode_dict_strings(&present);
         assert!(dict.len() < raw.len());
         let encoded = encode_strings(&values, true);
-        assert_eq!(encoded[0], 1, "expected dictionary encoding kind 1");
+        assert_eq!(
+            encoded[0], STRING_DICT_PERIOD,
+            "a repeated code cycle should store one period"
+        );
+    }
+
+    #[test]
+    fn dictionary_without_a_repeated_period_keeps_the_full_code_vector() {
+        let values: Vec<Option<String>> = ["click", "view", "click", "view", "click", "buy"]
+            .into_iter()
+            .map(|text| Some(text.to_string()))
+            .collect();
+        let encoded = encode_strings(&values, true);
+        assert_eq!(encoded[0], STRING_DICT);
+        let present: Vec<&str> = values.iter().filter_map(|value| value.as_deref()).collect();
+        let (_, codes, _) = build_string_dictionary(&present);
+        assert_eq!(repeating_code_period(&codes), None);
+    }
+
+    #[test]
+    fn period_body_is_kept_only_when_it_is_strictly_smaller() {
+        // Period is count - 1, so the extra period length costs the one code it saves.
+        let repeated = "click".repeat(20);
+        let values = [
+            repeated.as_str(),
+            "v",
+            repeated.as_str(),
+            "b",
+            "s",
+            "w",
+            repeated.as_str(),
+        ];
+        let values: Vec<Option<String>> = values
+            .into_iter()
+            .map(|text| Some(text.to_string()))
+            .collect();
+        let present: Vec<&str> = values.iter().filter_map(|value| value.as_deref()).collect();
+        let (dict, codes, width) = build_string_dictionary(&present);
+        let period = repeating_code_period(&codes).expect("period");
+        let full = write_string_dictionary(STRING_DICT, &dict, width, &codes);
+        let periodic = write_string_dictionary(STRING_DICT_PERIOD, &dict, width, &codes[..period]);
+        assert_eq!(full.len(), periodic.len());
+        assert!(full.len() < encode_raw_strings(&present).len());
+        assert_eq!(encode_strings(&values, true)[0], STRING_DICT);
+    }
+
+    #[test]
+    fn stock_action_and_note_store_one_period() {
+        let actions = ["click", "view", "buy", "scroll"];
+        let notes = ["landing", "checkout", "search", ""];
+        let schema = schema();
+        let mut rows = Vec::new();
+        for i in 0..16 {
+            let mut obj = serde_json::json!({
+                "ts": 1_700_000_000_000i64 + i * 10,
+                "user_id": i,
+                "score": 1.0,
+                "ok": true,
+                "action": actions[i as usize % actions.len()],
+                "amount": "1.00",
+            });
+            let note = notes[i as usize % notes.len()];
+            if !note.is_empty() {
+                obj["note"] = serde_json::json!(note);
+            }
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let kinds = string_column_kinds(&schema, &encoded.bytes);
+        assert_eq!(kinds["action"], STRING_DICT_PERIOD);
+        assert_eq!(kinds["note"], STRING_DICT_PERIOD);
+        let decoded = decode_block(&schema, &encoded.bytes).unwrap();
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(left.values, right.values);
+        }
+        let ranged = decode_rows_in_range(
+            &schema,
+            &encoded.bytes,
+            1_700_000_000_000,
+            1_700_000_000_000 + 15 * 10,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(ranged.len(), rows.len());
+        let filtered = decode_rows_in_range_filtered(
+            &schema,
+            &encoded.bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[ColumnPredicate {
+                index: 4,
+                allowed: vec![Scalar::Str("click".into())],
+            }],
+        )
+        .unwrap();
+        assert_eq!(filtered.len(), 4);
+        assert!(filtered
+            .iter()
+            .all(|row| row.values[4] == Scalar::Str("click".into())));
+    }
+
+    #[test]
+    fn legacy_dictionary_block_still_decodes() {
+        let notes = ["landing", "checkout", "search"];
+        let rows = rows_with_notes(&(0..12).map(|i| Some(notes[i % 3])).collect::<Vec<_>>());
+        let bytes = encode_legacy_dict_text_block(&rows);
+        assert_eq!(text_encoding_kind(&bytes), STRING_DICT);
+        let decoded = decode_block(&text_schema(), &bytes).unwrap();
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(left.values[1], right.values[1]);
+        }
+    }
+
+    fn encode_legacy_dict_text_block(rows: &[Row]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        encode_column(&mut bytes, FieldType::Timestamp, rows, 0).unwrap();
+        let values = strings(rows, 1).unwrap();
+        let nulls: Vec<bool> = values.iter().map(|value| value.is_none()).collect();
+        write_nulls(&mut bytes, &nulls);
+        let present: Vec<&str> = values.iter().filter_map(|value| value.as_deref()).collect();
+        bytes.extend_from_slice(&encode_dict_strings(&present));
+        bytes
+    }
+
+    fn string_column_kinds(schema: &Schema, bytes: &[u8]) -> std::collections::HashMap<String, u8> {
+        let nrows = block_row_count(bytes).unwrap();
+        let mut cursor = 4;
+        let mut kinds = std::collections::HashMap::new();
+        for field in &schema.fields {
+            let start = cursor;
+            skip_column(field.ty, bytes, &mut cursor, nrows, false).unwrap();
+            if matches!(
+                field.ty,
+                FieldType::String | FieldType::Text | FieldType::Json
+            ) {
+                let mut at = start;
+                let present = read_present(bytes, &mut at, nrows).unwrap();
+                let present_count = match present {
+                    None => nrows,
+                    Some(flags) => flags.iter().filter(|flag| **flag).count(),
+                };
+                if present_count > 0 {
+                    kinds.insert(field.name.clone(), bytes[at]);
+                }
+            }
+        }
+        kinds
     }
 
     #[test]
@@ -2685,7 +2959,10 @@ mod tests {
             let mut cursor = 0;
             let decoded = decode_i64s(&encoded, &mut cursor, values.len()).unwrap();
             assert_eq!(cursor, encoded.len());
-            assert_eq!(decoded, values.iter().copied().flatten().collect::<Vec<_>>());
+            assert_eq!(
+                decoded,
+                values.iter().copied().flatten().collect::<Vec<_>>()
+            );
             let mut skip = 0;
             skip_i64s(&encoded, &mut skip, values.len()).unwrap();
             assert_eq!(skip, encoded.len());
@@ -2724,7 +3001,10 @@ mod tests {
         let encoded = encode_i64s(&values);
         assert_eq!(encoded[0], KIND_PIECES);
         assert_eq!(u16::from_le_bytes(encoded[1..3].try_into().unwrap()), 3);
-        assert!(encoded.len() < 100, "three i64 pieces are a few dozen bytes");
+        assert!(
+            encoded.len() < 100,
+            "three i64 pieces are a few dozen bytes"
+        );
         let mut cursor = 0;
         let decoded = decode_i64s(&encoded, &mut cursor, values.len()).unwrap();
         assert_eq!(cursor, encoded.len());
@@ -3201,16 +3481,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let click = parse_event(
-            &schema,
-            br#"{"ts":1000,"action":"click","props":{"a":1}}"#,
-        )
-        .unwrap();
-        let view = parse_event(
-            &schema,
-            br#"{"ts":2000,"action":"view","props":{"b":2}}"#,
-        )
-        .unwrap();
+        let click =
+            parse_event(&schema, br#"{"ts":1000,"action":"click","props":{"a":1}}"#).unwrap();
+        let view = parse_event(&schema, br#"{"ts":2000,"action":"view","props":{"b":2}}"#).unwrap();
         let view_json = match &view.values[2] {
             Scalar::Json(text) => text.clone(),
             other => panic!("expected json, got {other:?}"),
@@ -3438,9 +3711,16 @@ mod tests {
             index: 0,
             allowed: vec![Scalar::Timestamp(999)],
         };
-        let filtered = decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[filter])
-            .unwrap_err()
-            .to_string();
+        let filtered = decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[filter],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(filtered.contains("timestamp column is null or the wrong type"));
     }
 
@@ -3453,9 +3733,16 @@ mod tests {
             index: 0,
             allowed: vec![Scalar::Str("click".into())],
         };
-        let filtered = decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[filter])
-            .unwrap_err()
-            .to_string();
+        let filtered = decode_rows_in_range_filtered(
+            &schema,
+            &bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[filter],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(filtered.contains("timestamp column is null or the wrong type"));
     }
 
@@ -3507,30 +3794,18 @@ mod tests {
             index: 2,
             allowed: vec![Scalar::Str("click".into())],
         };
-        let rows = decode_rows_in_range_filtered(
-            &schema,
-            &bytes,
-            i64::MIN,
-            i64::MAX,
-            usize::MAX,
-            &[hit],
-        )
-        .unwrap();
+        let rows =
+            decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[hit])
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].values[1], Scalar::Null));
         let miss = ColumnPredicate {
             index: 2,
             allowed: vec![Scalar::Str("missing".into())],
         };
-        let rows = decode_rows_in_range_filtered(
-            &schema,
-            &bytes,
-            i64::MIN,
-            i64::MAX,
-            usize::MAX,
-            &[miss],
-        )
-        .unwrap();
+        let rows =
+            decode_rows_in_range_filtered(&schema, &bytes, i64::MIN, i64::MAX, usize::MAX, &[miss])
+                .unwrap();
         assert!(rows.is_empty());
     }
 
@@ -3558,7 +3833,7 @@ mod tests {
             })
             .collect();
         let encoded = encode_block(&schema, &rows).unwrap();
-        let predicates = | | {
+        let predicates = || {
             vec![
                 ColumnPredicate {
                     index: 1,
