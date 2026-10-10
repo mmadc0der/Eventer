@@ -2520,7 +2520,7 @@ mod tests {
             stored
         };
         assert_eq!(&plain[..4], b"EVZN");
-        assert_eq!(u16::from_le_bytes(plain[4..6].try_into().unwrap()), 2);
+        assert_eq!(u16::from_le_bytes(plain[4..6].try_into().unwrap()), 3);
         let split = plain.len() - 4;
         assert_eq!(
             crc32fast::hash(&plain[..split]),
@@ -2557,6 +2557,78 @@ mod tests {
             .collect();
         assert_eq!(rows, expected);
         rebuilt.close().unwrap();
+    }
+
+    #[test]
+    fn timestamp_equality_skips_a_block_outside_the_index_range() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(2);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        for ts in [10i64, 20, 100, 110] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let full: Vec<_> = store
+            .query(0, 1_000)
+            .unwrap()
+            .iter()
+            .map(|row| row.ts)
+            .collect();
+        assert_eq!(full, vec![10, 20, 100, 110]);
+
+        let early = [Predicate::Eq("ts".into(), Scalar::Timestamp(10))];
+        let late = [Predicate::Eq("ts".into(), Scalar::Timestamp(100))];
+        let early_rows = store.query_with_filter(0, 1_000, &early).unwrap();
+        assert_eq!(early_rows.len(), 1);
+        assert_eq!(early_rows[0].ts, 10);
+        let resolved = resolve_predicates(store.schema(), &early).unwrap();
+        let candidates = store.blocks_in_range(0, 1_000, &resolved);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].min_ts, 10);
+
+        store.close().unwrap();
+        let zone_file = crate::zone::zone_path(&data, 1);
+        fs::remove_file(&zone_file).unwrap();
+        let reopened = Store::open_with(&data, &schema, options).unwrap();
+        let rebuilt: Vec<_> = reopened
+            .query(0, 1_000)
+            .unwrap()
+            .iter()
+            .map(|row| row.ts)
+            .collect();
+        assert_eq!(rebuilt, full);
+        assert_eq!(
+            reopened
+                .query_with_filter(0, 1_000, &early)
+                .unwrap()
+                .iter()
+                .map(|row| row.ts)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+
+        let victim = reopened.catalog().segments[0].blocks[1].clone();
+        assert!(victim.min_ts >= 100);
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        let flip_at = victim.offset as usize + segment::BLOCK_HEADER_LEN + 4;
+        bytes[flip_at] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            reopened
+                .query_with_filter(0, 1_000, &early)
+                .unwrap()
+                .iter()
+                .map(|row| row.ts)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert!(reopened.query_with_filter(0, 1_000, &late).is_err());
+        reopened.close().unwrap();
     }
 
     fn dir_suffix_bytes(dir: &Path, suffix: &str) -> u64 {
