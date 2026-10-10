@@ -584,11 +584,10 @@ fn try_frame(buf: &[u8], header_len: usize) -> Option<ParsedFrame> {
 
 /// Choose among crc-valid views of the same bytes.
 ///
-/// A longer header that still starts with the zstd magic wins over a shorter
-/// view that does not. That keeps a 20-byte frame whose payload is `28 b5 2f
-/// fd`, and every 36-byte frame. When neither a 12-byte view nor a 20-byte
-/// view has the magic, the 20-byte header wins so a magicless frame from main
-/// is not truncated to the colliding 12-byte prefix.
+/// A crc-valid 20-byte frame wins over the 12-byte view, even when
+/// `row_count` is the zstd magic and the real payload is magicless. A
+/// crc-valid 36-byte frame also wins over that 12-byte view. Between 20 and
+/// 36, the 36-byte header is used only when the 20-byte payload has no magic.
 fn parse_framed_block(buf: &[u8]) -> Option<ParsedFrame> {
     let frames = [
         try_frame(buf, BLOCK_HEADER_LEN),
@@ -610,21 +609,32 @@ fn parse_framed_block(buf: &[u8]) -> Option<ParsedFrame> {
     choose_parsed_frame(paired)
 }
 
-/// A magic payload beats a shorter magicless view. With no magic at all, the
-/// longer header wins, so a magicless 20-byte frame is not cut to 12 bytes.
+/// A crc-valid 20-byte header beats the 12-byte view. It also beats a 36-byte
+/// header when its own payload starts with the zstd magic. Otherwise a
+/// crc-valid 36-byte header wins, including over a 12-byte view whose payload
+/// happens to be the magic.
 fn choose_parsed_frame(found: Vec<(ParsedFrame, bool)>) -> Option<ParsedFrame> {
-    let any_magic = found.iter().any(|(_, has_magic)| *has_magic);
-    if any_magic {
-        found
-            .into_iter()
-            .find(|(_, has_magic)| *has_magic)
-            .map(|(frame, _)| frame)
-    } else {
-        found
-            .into_iter()
-            .max_by_key(|(frame, _)| frame.header_len)
-            .map(|(frame, _)| frame)
+    let mut v12 = None;
+    let mut v20 = None;
+    let mut v36 = None;
+    for (frame, has_magic) in found {
+        match frame.header_len {
+            BLOCK_HEADER_LEN => v12 = Some(frame),
+            BLOCK_HEADER_LEN_V20 => v20 = Some((frame, has_magic)),
+            BLOCK_HEADER_LEN_V1 => v36 = Some(frame),
+            _ => {}
+        }
     }
+    if let Some((frame, has_magic)) = v20 {
+        if has_magic {
+            return Some(frame);
+        }
+        if v36.is_some() {
+            return v36;
+        }
+        return Some(frame);
+    }
+    v36.or(v12)
 }
 
 fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<ScannedBlock>, u64, bool)> {
@@ -687,7 +697,13 @@ fn read_parsed_frame(file: &mut File, offset: u64, file_len: u64) -> Result<Opti
         return Ok(None);
     }
     let mut found = Vec::new();
-    for header_len in [BLOCK_HEADER_LEN, BLOCK_HEADER_LEN_V20, BLOCK_HEADER_LEN_V1] {
+    // Longer headers first. On a 20-byte or 36-byte frame the 12-byte
+    // `compressed_len` is `uncompressed_len`, so that try would read about one
+    // uncompressed block and crc it. Skip it once a longer header matches.
+    for header_len in [BLOCK_HEADER_LEN_V20, BLOCK_HEADER_LEN_V1, BLOCK_HEADER_LEN] {
+        if header_len == BLOCK_HEADER_LEN && !found.is_empty() {
+            break;
+        }
         if available < header_len as u64 {
             continue;
         }
@@ -1811,6 +1827,84 @@ mod tests {
         assert_eq!(decoded, raw);
         let kept = read_kept_frame(&mut File::open(&path).unwrap(), &block_meta(0, 2, 4)).unwrap();
         assert_eq!(kept, collision);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `row_count` is the zstd magic, so the 12-byte payload starts with
+    /// `28 b5 2f fd` and its crc equals `compressed_len`. The real 16-byte
+    /// payload is magicless. The 20-byte frame must be kept whole.
+    #[test]
+    fn row_count_magic_does_not_select_the_twelve_byte_view() {
+        let payload = [
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0xc5, 0xb8,
+            0xde, 0xe5,
+        ];
+        let row_count = u32::from_le_bytes(ZSTD_FRAME_MAGIC);
+        let frame = frame_v20(&payload, 8, row_count);
+        assert_eq!(frame.len(), 36);
+        let prefix = &frame[BLOCK_HEADER_LEN..BLOCK_HEADER_LEN + 8];
+        assert!(payload_has_legacy_magic(prefix));
+        assert_eq!(crc32fast::hash(prefix), payload.len() as u32);
+        assert!(!payload_has_legacy_magic(&payload));
+
+        let parsed = parse_framed_block(&frame).unwrap();
+        assert_eq!(parsed.header_len, BLOCK_HEADER_LEN_V20);
+        assert_eq!(parsed.compressed_len, payload.len() as u32);
+        assert_eq!(parsed.uncompressed_len, Some(8));
+
+        let dir = scratch_dir();
+        let path = data_path(&dir, 1);
+        fs::write(&path, &frame).unwrap();
+        let (blocks, len, _) = scan_and_repair(&path, 1).unwrap();
+        assert_eq!(len, frame.len() as u64);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].header_len, BLOCK_HEADER_LEN_V20);
+        assert_eq!(blocks[0].meta.compressed_len, payload.len() as u32);
+        assert_eq!(fs::metadata(&path).unwrap().len(), len);
+        let kept = read_kept_frame(
+            &mut File::open(&path).unwrap(),
+            &block_meta(0, payload.len() as u32, 8),
+        )
+        .unwrap();
+        assert_eq!(kept, frame);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A 36-byte frame whose 12-byte prefix is a crc-valid magic view is still
+    /// the 36-byte frame. The 20-byte view does not match.
+    #[test]
+    fn thirty_six_byte_frame_beats_a_magic_twelve_byte_prefix() {
+        let row_count = u32::from_le_bytes(ZSTD_FRAME_MAGIC);
+        let min_ts = 0x1122_3344_5566_7788i64;
+        let prefix = {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&row_count.to_le_bytes());
+            bytes.extend_from_slice(&min_ts.to_le_bytes()[..4]);
+            bytes
+        };
+        assert!(payload_has_legacy_magic(&prefix));
+        let compressed_len = crc32fast::hash(&prefix);
+        let payload = {
+            let mut raw = ZSTD_FRAME_MAGIC.to_vec();
+            raw.extend(std::iter::repeat(0xab).take(compressed_len as usize - 4));
+            raw
+        };
+        let frame = frame_block_v1(&payload, 8, row_count, min_ts, 20, false).unwrap();
+        let parsed = parse_framed_block(&frame).unwrap();
+        assert_eq!(parsed.header_len, BLOCK_HEADER_LEN_V1);
+        assert_eq!(parsed.compressed_len, compressed_len);
+        assert!(try_frame(&frame, BLOCK_HEADER_LEN).is_some());
+        assert!(try_frame(&frame, BLOCK_HEADER_LEN_V20).is_none());
+
+        let dir = scratch_dir();
+        let path = data_path(&dir, 1);
+        fs::write(&path, &frame).unwrap();
+        let (blocks, len, _) = scan_and_repair(&path, 1).unwrap();
+        assert_eq!(len, frame.len() as u64);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].header_len, BLOCK_HEADER_LEN_V1);
+        assert_eq!(blocks[0].meta.compressed_len, compressed_len);
+        assert_eq!(fs::metadata(&path).unwrap().len(), len);
         let _ = fs::remove_dir_all(&dir);
     }
 
