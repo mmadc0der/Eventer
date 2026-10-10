@@ -5,15 +5,16 @@
 //! queued, then queued together so the batch shares one fsync.
 //! `GET /events?from=&to=` returns a JSON array of events in that inclusive
 //! millisecond range. Repeat `eq=field=value` to AND equality filters into the scan.
+//! `GET /events/count` returns `{"count":N}` for that same range and filters.
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::{Query, RawQuery, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::body::Body;
-use axum::http::header::CONTENT_TYPE;
 use axum::routing::get;
 use axum::{Json, Router};
 use eventer::Predicate;
@@ -28,6 +29,7 @@ struct AppState {
 pub fn router(store: Arc<eventer::Store>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/events/count", get(count_events))
         .route("/events", get(get_events).post(post_event))
         .with_state(AppState { store })
 }
@@ -123,10 +125,9 @@ async fn get_events(
         }
     }
     let store = Arc::clone(&state.store);
-    let joined = tokio::task::spawn_blocking(move || {
-        store.query_json_with_filter(from, to, &predicates)
-    })
-    .await;
+    let joined =
+        tokio::task::spawn_blocking(move || store.query_json_with_filter(from, to, &predicates))
+            .await;
     match joined {
         Ok(Ok(bytes)) => (
             StatusCode::OK,
@@ -141,6 +142,67 @@ async fn get_events(
         )
             .into_response(),
     }
+}
+
+async fn count_events(
+    State(state): State<AppState>,
+    Query(params): Query<RangeParams>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let raw = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_page_params(raw) {
+        return *response;
+    }
+    let from = match parse_bound(params.from, "from") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let to = match parse_bound(params.to, "to") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let specs = match eq_specs(raw) {
+        Ok(specs) => specs,
+        Err(response) => return *response,
+    };
+    let mut predicates = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        match parse_eq(state.store.schema(), spec) {
+            Ok(predicate) => predicates.push(predicate),
+            Err(response) => return *response,
+        }
+    }
+    let store = Arc::clone(&state.store);
+    let joined =
+        tokio::task::spawn_blocking(move || store.count_with_filter(from, to, &predicates)).await;
+    match joined {
+        Ok(Ok(count)) => (StatusCode::OK, Json(json!({"count": count}))).into_response(),
+        Ok(Err(err)) => error_response(&err),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "count task failed"})),
+        )
+            .into_response(),
+    }
+}
+
+fn reject_page_params(query: &str) -> std::result::Result<(), Box<Response>> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = percent_decode(key)?;
+        if key == "limit" || key == "offset" {
+            return Err(bad_request(&format!(
+                "`{key}` is not a parameter of /events/count"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn eq_specs(query: &str) -> std::result::Result<Vec<String>, Box<Response>> {
@@ -526,6 +588,98 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[tokio::test]
+    async fn count_matches_unpaged_get_and_rejects_page_params() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-count-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = eventer::StoreOptions {
+            linger: Duration::from_millis(1),
+            parser_threads: 1,
+            compress_threads: 1,
+            ..eventer::StoreOptions::default()
+        };
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+
+        for (ts, action) in [
+            (1000, "click"),
+            (2000, "view"),
+            (3000, "click"),
+            (4000, "buy"),
+            (5000, "view"),
+        ] {
+            let body = format!(r#"{{"ts":{ts},"action":"{action}","amount":"1.00"}}"#);
+            let (status, _) = post(&app, &body).await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let all_rows = query(&app, "/events?from=1000&to=5000").await;
+        assert_eq!(all_rows.len(), 5);
+        let all = get_json(&app, "/events/count?from=1000&to=5000").await;
+        assert_eq!(all.0, StatusCode::OK);
+        assert_eq!(all.1, json!({"count": 5}));
+
+        let ranged_rows = query(&app, "/events?from=2000&to=3000").await;
+        assert_eq!(ranged_rows.len(), 2);
+        let ranged = get_json(&app, "/events/count?from=2000&to=3000").await;
+        assert_eq!(ranged.0, StatusCode::OK);
+        assert_eq!(ranged.1["count"], json!(ranged_rows.len()));
+
+        let buy_rows = query(&app, "/events?from=1000&to=5000&eq=action=buy").await;
+        assert_eq!(buy_rows.len(), 1);
+        let buy = get_json(&app, "/events/count?from=1000&to=5000&eq=action=buy").await;
+        assert_eq!(buy.0, StatusCode::OK);
+        assert_eq!(buy.1["count"], json!(buy_rows.len()));
+
+        let empty = get_json(&app, "/events/count?from=9000&to=9000").await;
+        assert_eq!(empty.0, StatusCode::OK);
+        assert_eq!(empty.1, json!({"count": 0}));
+
+        let limited = get_json(&app, "/events/count?from=1000&to=5000&limit=1").await;
+        assert_eq!(limited.0, StatusCode::BAD_REQUEST);
+        assert!(limited.1.get("count").is_none());
+        assert!(limited.1["error"].is_string());
+
+        let skipped = get_json(&app, "/events/count?from=1000&to=5000&offset=0").await;
+        assert_eq!(skipped.0, StatusCode::BAD_REQUEST);
+        assert!(skipped.1.get("count").is_none());
+
+        let missing = get_json(&app, "/events/count?from=1000").await;
+        assert_eq!(missing.0, StatusCode::BAD_REQUEST);
+        let bad_bound = get_json(&app, "/events/count?from=1000&to=nope").await;
+        assert_eq!(bad_bound.0, StatusCode::BAD_REQUEST);
+        let bad_eq = get_json(&app, "/events/count?from=1000&to=5000&eq=action").await;
+        assert_eq!(bad_eq.0, StatusCode::BAD_REQUEST);
+
+        let still = query(&app, "/events?from=1000&to=5000").await;
+        assert_eq!(still.len(), 5);
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
     async fn post(app: &Router, body: &str) -> (StatusCode, Value) {
         let response = app
             .clone()
@@ -554,5 +708,17 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, value)
     }
 }

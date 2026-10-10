@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::codec::{block_row_count, decode_rows_in_range_filtered, ColumnPredicate};
+use crate::codec::{
+    block_row_count, count_rows_in_range_filtered, decode_rows_in_range_filtered, ColumnPredicate,
+};
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, Schema};
@@ -297,6 +299,43 @@ impl Store {
         }
         out.push(b']');
         Ok(out)
+    }
+
+    /// Inclusive range count. [`Store::count_with_filter`] with no predicates.
+    pub fn count(&self, from_ms: i64, to_ms: i64) -> Result<u64> {
+        self.count_with_filter(from_ms, to_ms, &[])
+    }
+
+    /// How many rows an unpaged [`Store::query_with_filter`] would return.
+    ///
+    /// A block the zone map can reject is not read. A block with no predicates
+    /// contributes the number of payload timestamps inside the range and does
+    /// not decode the other columns. When every timestamp is inside, that
+    /// number is the block row count. A timestamp outside the range is not
+    /// counted, even when the index min/max sit inside the range. Predicate
+    /// blocks decode the timestamp and the predicate columns only.
+    pub fn count_with_filter(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+    ) -> Result<u64> {
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
+            return Ok(0);
+        };
+        let _retention = self.pipeline.lock_for_read();
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+        let mut total = 0u64;
+        let mut dictionaries = HashMap::new();
+        for block in blocks {
+            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let matched =
+                count_rows_in_range_filtered(&self.schema, &payload, from_ms, to_ms, &resolved)?;
+            total = total
+                .checked_add(matched)
+                .ok_or_else(|| Error::event("event count overflow"))?;
+        }
+        Ok(total)
     }
 
     /// Delete every block whose maximum timestamp is strictly less than `cutoff_ms`.
@@ -1386,6 +1425,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(same.len(), 2);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn count_matches_the_unpaged_query_and_ignores_a_lying_index() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        for (ts, action) in [
+            (1000i64, "click"),
+            (2000, "view"),
+            (3000, "click"),
+            (4000, "buy"),
+            (5000, "view"),
+        ] {
+            store
+                .append_json(&event(ts, Some(ts), action, Some("note"), "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.count(1000, 5000).unwrap(), 5);
+        assert_eq!(store.query(1000, 5000).unwrap().len(), 5);
+        assert_eq!(store.count(2000, 3000).unwrap(), 2);
+        assert_eq!(store.query(2000, 3000).unwrap().len(), 2);
+        let buy = [Predicate::Eq("action".into(), "buy".into())];
+        assert_eq!(store.count_with_filter(1000, 5000, &buy).unwrap(), 1);
+        assert_eq!(store.query_with_filter(1000, 5000, &buy).unwrap().len(), 1);
+        assert_eq!(store.count(9000, 9000).unwrap(), 0);
+        assert!(store.query(9000, 9000).unwrap().is_empty());
+
+        let narrow = Store::open_with(dir.path().join("narrow"), &schema, test_options(8)).unwrap();
+        for ts in [100i64, 200, 300] {
+            narrow
+                .append_json(&event(ts, Some(1), "click", Some("note"), "1.00"))
+                .unwrap();
+        }
+        narrow.flush().unwrap();
+        {
+            let mut catalog = narrow.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            assert_eq!(block.row_count, 3);
+            block.min_ts = 150;
+            block.max_ts = 250;
+        }
+        assert_eq!(narrow.count(150, 250).unwrap(), 1);
+        assert_eq!(narrow.query(150, 250).unwrap().len(), 1);
+        narrow.close().unwrap();
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn count_does_not_read_a_block_the_zone_map_rejects() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        for run in 0..2i64 {
+            for seq in 0..32i64 {
+                let action = format!("run-{run}");
+                store
+                    .append_json(&event(
+                        run * 32 + seq,
+                        Some(run),
+                        &action,
+                        Some("note"),
+                        "1.00",
+                    ))
+                    .unwrap();
+            }
+        }
+        store.flush().unwrap();
+        let predicates = [Predicate::Eq("action".into(), "run-0".into())];
+        let resolved = resolve_predicates(store.schema(), &predicates).unwrap();
+        let candidates = store.blocks_in_range(0, 10_000, &resolved);
+        assert_eq!(candidates.len(), 1);
+        let kept = candidates[0].offset;
+        let victim = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.offset != kept)
+            .cloned()
+            .unwrap();
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        let flip_at = victim.offset as usize + segment::BLOCK_HEADER_LEN + 4;
+        bytes[flip_at] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(store.count_with_filter(0, 10_000, &predicates).unwrap(), 32);
+        assert!(store.query(victim.min_ts, victim.max_ts).is_err());
         store.close().unwrap();
     }
 

@@ -8,6 +8,9 @@
 //! equality stats (exact sets or a bloom filter for strings, min/max for numbers)
 //! so a filtered query can skip the payload as well. Equality predicates that still
 //! need the block are applied while it is decoded.
+//! [`Store::count_with_filter`](store::Store::count_with_filter) counts those
+//! rows without building the JSON array. A block with no predicates reads
+//! timestamps only.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares
