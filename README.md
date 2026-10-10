@@ -1,6 +1,6 @@
 # Eventer
 
-Append-only store for JSON events. A typed schema fixes the columns. Rows are packed into columnar blocks, compressed with zstd, and written to segment files. A sparse index records each block's minimum and maximum timestamp so a time-range read can skip blocks that cannot match. A zone map next to that index records equality stats for each column, so a filtered read can skip a block whose payload cannot contain the value.
+Append-only store for JSON events. A typed schema fixes the columns. Rows are packed into columnar blocks, compressed with zstd, and written to segment files. A sparse index records each block's minimum and maximum timestamp so a time-range read can skip blocks that cannot match. A zone map next to that index records equality stats for the other columns, so a filtered read can skip a block whose payload cannot contain the value. The timestamp column is the sparse-index range, so a new zone file stores that column as a one-byte tag.
 
 The library is both an rlib and a cdylib (`libeventer.so` / `eventer.dll`) with a small C API. `eventer-server` links the rlib and serves the HTTP routes.
 

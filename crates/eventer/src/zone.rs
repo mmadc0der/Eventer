@@ -7,11 +7,14 @@
 //!
 //! Strings and text use the exact distinct set when it is small, and a bloom
 //! filter otherwise. A bloom hit can be wrong; a miss is not. Numbers use an
-//! inclusive min/max. Floats and JSON stay unpruned. Segments written before
-//! zone maps existed are summarized once on open and the summary is kept.
+//! inclusive min/max. Floats and JSON stay unpruned. The timestamp column is
+//! not stored again: a new file keeps a one-byte tag, and the reader uses that
+//! block's sparse-index minimum and maximum, with no nulls. Segments written
+//! before zone maps existed are summarized once on open and the summary is kept.
 //!
 //! The bytes on disk are still that zone file: `EVZN` header, then each block's
 //! length and column records, then one crc32 of the bytes before that trailer.
+//! Version 2 files use that trailer and still store the timestamp min/max.
 //! Version 1 files, which stored a crc32 in front of every record, still load.
 //! The whole file is replaced by a plain zstd frame when the frame is strictly
 //! smaller, and left raw otherwise. A batch append rewrites the segment's zone
@@ -32,10 +35,12 @@ use crate::segment::{self, BlockMeta};
 use crate::value::{Row, Scalar};
 
 const ZONE_MAGIC: &[u8; 4] = b"EVZN";
-/// A crc32 sits in front of every record. Still loaded; new files use version 2.
+/// A crc32 sits in front of every record. Still loaded.
 const ZONE_VERSION_V1: u16 = 1;
-/// Each record is a length and a payload. One crc32 covers the image before the trailer.
-const ZONE_VERSION: u16 = 2;
+/// Length and payload per record, one trailer crc32, timestamp min/max in the record.
+const ZONE_VERSION_V2: u16 = 2;
+/// Same container as version 2. The timestamp column is a one-byte tag.
+const ZONE_VERSION: u16 = 3;
 const ZONE_HEADER_LEN: usize = 16;
 const ZONE_TRAILER_LEN: usize = 4;
 /// Plain zstd frame magic. Distinct from [`ZONE_MAGIC`].
@@ -62,6 +67,8 @@ const TAG_I128: u8 = 3;
 const TAG_BOOL: u8 = 4;
 const TAG_EXACT: u8 = 5;
 const TAG_BLOOM: u8 = 6;
+/// Timestamp bounds live in the sparse index. The column is this byte and nothing else.
+const TAG_INDEX_TS: u8 = 7;
 
 /// Statistics for one sealed block, aligned with schema field order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +103,12 @@ pub(crate) enum ColumnZone {
     Bloom {
         has_null: bool,
         bloom: Bloom,
+    },
+    /// Primary timestamp. `min` and `max` are the sparse-index range, and the
+    /// column has no nulls. The on-disk form is [`TAG_INDEX_TS`].
+    IndexTs {
+        min: i64,
+        max: i64,
     },
 }
 
@@ -136,7 +149,13 @@ pub(crate) fn from_rows(schema: &Schema, rows: &[Row]) -> BlockZone {
         .fields
         .iter()
         .enumerate()
-        .map(|(index, field)| column_from_rows(field.ty, rows, index))
+        .map(|(index, field)| {
+            if index == schema.timestamp_index {
+                index_timestamp_zone(rows)
+            } else {
+                column_from_rows(field.ty, rows, index)
+            }
+        })
         .collect();
     BlockZone { columns }
 }
@@ -169,7 +188,11 @@ pub(crate) fn load_segment_zones(
     let path = zone_path(dir, segment_id);
     let schema_crc = schema_crc(schema);
     let field_count = field_count(schema)?;
-    if let Some(zones) = read_zone_file(&path, schema_crc, field_count, blocks.len())? {
+    let bounds: Vec<(i64, i64)> = blocks
+        .iter()
+        .map(|block| (block.min_ts, block.max_ts))
+        .collect();
+    if let Some(zones) = read_zone_file(&path, schema_crc, field_count, &bounds)? {
         return Ok(zones);
     }
     let zones = build_from_payloads(dir, blocks, dictionary, schema)?;
@@ -220,6 +243,20 @@ pub(crate) fn schema_crc(schema: &Schema) -> u32 {
 pub(crate) fn field_count(schema: &Schema) -> Result<u16> {
     u16::try_from(schema.fields.len())
         .map_err(|_| Error::schema("schema has too many fields for a zone map"))
+}
+
+/// The sparse index already stores this range. Every accepted row has a timestamp.
+fn index_timestamp_zone(rows: &[Row]) -> ColumnZone {
+    if rows.is_empty() {
+        return ColumnZone::Unknown;
+    }
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for row in rows {
+        min = min.min(row.ts);
+        max = max.max(row.ts);
+    }
+    ColumnZone::IndexTs { min, max }
 }
 
 fn column_from_rows(ty: FieldType, rows: &[Row], index: usize) -> ColumnZone {
@@ -387,6 +424,11 @@ impl ColumnZone {
                 Scalar::Str(text) => bloom.contains(text.as_bytes()),
                 _ => true,
             },
+            ColumnZone::IndexTs { min, max } => match value {
+                Scalar::Null => false,
+                Scalar::Timestamp(value) => *value >= *min && *value <= *max,
+                _ => true,
+            },
         }
     }
 }
@@ -411,7 +453,7 @@ fn read_zone_file(
     path: &Path,
     schema_crc: u32,
     field_count: u16,
-    block_count: usize,
+    bounds: &[(i64, i64)],
 ) -> Result<Option<Vec<BlockZone>>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -422,7 +464,7 @@ fn read_zone_file(
         Ok(plain) => plain,
         Err(_) => return Ok(None),
     };
-    match parse_zone_file(&plain, schema_crc, field_count, block_count) {
+    match parse_zone_file(&plain, schema_crc, field_count, bounds) {
         Ok(zones) => Ok(Some(zones)),
         Err(_) => Ok(None),
     }
@@ -493,7 +535,7 @@ fn read_zone_header(bytes: &[u8]) -> Result<(u16, u32, u16)> {
 
 fn require_known_zone(bytes: &[u8], expect_crc: u32, field_count: u16) -> Result<u16> {
     let (version, stored_crc, stored_fields) = read_zone_header(bytes)?;
-    if version != ZONE_VERSION_V1 && version != ZONE_VERSION {
+    if version != ZONE_VERSION_V1 && version != ZONE_VERSION_V2 && version != ZONE_VERSION {
         return Err(Error::corrupt(format!(
             "unsupported zone map version {version}"
         )));
@@ -560,27 +602,31 @@ fn record_payloads(body: &[u8], version: u16) -> Result<Vec<&[u8]>> {
     Ok(payloads)
 }
 
+fn zone_has_trailer(version: u16) -> bool {
+    version == ZONE_VERSION_V2 || version == ZONE_VERSION
+}
+
 fn parse_zone_file(
     bytes: &[u8],
     expect_crc: u32,
     field_count: u16,
-    block_count: usize,
+    bounds: &[(i64, i64)],
 ) -> Result<Vec<BlockZone>> {
     let version = require_known_zone(bytes, expect_crc, field_count)?;
-    let body = if version == ZONE_VERSION {
+    let body = if zone_has_trailer(version) {
         v2_body(bytes)?
     } else {
         bytes
     };
     let payloads = record_payloads(body, version)?;
-    if payloads.len() != block_count {
+    if payloads.len() != bounds.len() {
         return Err(Error::corrupt(
             "zone map block count does not match the segment",
         ));
     }
-    let mut zones = Vec::with_capacity(block_count);
-    for payload in payloads {
-        zones.push(decode_zone(payload, field_count)?);
+    let mut zones = Vec::with_capacity(payloads.len());
+    for (payload, (min_ts, max_ts)) in payloads.iter().zip(bounds.iter()) {
+        zones.push(decode_zone(payload, field_count, *min_ts, *max_ts)?);
     }
     Ok(zones)
 }
@@ -592,7 +638,7 @@ fn parse_zone_file(
 /// caller starts a new image instead of appending onto a torn one.
 fn v2_prefix_for_append(plain: &[u8], schema_crc: u32, field_count: u16) -> Option<Vec<u8>> {
     let version = require_known_zone(plain, schema_crc, field_count).ok()?;
-    let body = if version == ZONE_VERSION {
+    let body = if zone_has_trailer(version) {
         v2_body(plain).ok()?
     } else {
         plain
@@ -701,7 +747,7 @@ fn split_zone_records(
     block_count: usize,
 ) -> Result<Vec<Vec<u8>>> {
     let version = require_known_zone(bytes, expect_crc, field_count)?;
-    let body = if version == ZONE_VERSION {
+    let body = if zone_has_trailer(version) {
         v2_body(bytes)?
     } else {
         bytes
@@ -801,13 +847,14 @@ fn encode_column(out: &mut Vec<u8>, column: &ColumnZone) {
             out.push(bloom.k);
             out.extend_from_slice(&bloom.bits);
         }
+        ColumnZone::IndexTs { .. } => out.push(TAG_INDEX_TS),
     }
 }
 
-fn decode_zone(mut bytes: &[u8], field_count: u16) -> Result<BlockZone> {
+fn decode_zone(mut bytes: &[u8], field_count: u16, min_ts: i64, max_ts: i64) -> Result<BlockZone> {
     let mut columns = Vec::with_capacity(field_count as usize);
     for _ in 0..field_count {
-        columns.push(decode_column(&mut bytes)?);
+        columns.push(decode_column(&mut bytes, min_ts, max_ts)?);
     }
     if !bytes.is_empty() {
         return Err(Error::corrupt("zone map record has trailing bytes"));
@@ -815,7 +862,7 @@ fn decode_zone(mut bytes: &[u8], field_count: u16) -> Result<BlockZone> {
     Ok(BlockZone { columns })
 }
 
-fn decode_column(bytes: &mut &[u8]) -> Result<ColumnZone> {
+fn decode_column(bytes: &mut &[u8], min_ts: i64, max_ts: i64) -> Result<ColumnZone> {
     let tag = *bytes
         .first()
         .ok_or_else(|| Error::corrupt("truncated zone column"))?;
@@ -898,6 +945,10 @@ fn decode_column(bytes: &mut &[u8]) -> Result<ColumnZone> {
                 bloom: Bloom { k, bits },
             })
         }
+        TAG_INDEX_TS => Ok(ColumnZone::IndexTs {
+            min: min_ts,
+            max: max_ts,
+        }),
         _ => Err(Error::corrupt("unknown zone column tag")),
     }
 }
@@ -962,11 +1013,13 @@ fn bit_is_set(bits: &[u8], bit: u64) -> bool {
 #[cfg(test)]
 pub(crate) fn legacy_v1_image(v2_plain: &[u8]) -> Result<Vec<u8>> {
     let (version, _, _) = read_zone_header(v2_plain)?;
-    if version != ZONE_VERSION {
-        return Err(Error::corrupt("expected a version-2 zone image"));
+    if !zone_has_trailer(version) {
+        return Err(Error::corrupt(
+            "expected a zone image with a trailer checksum",
+        ));
     }
     let body = v2_body(v2_plain)?;
-    let payloads = record_payloads(body, ZONE_VERSION)?;
+    let payloads = record_payloads(body, version)?;
     let mut out = v2_plain[..ZONE_HEADER_LEN].to_vec();
     out[4..6].copy_from_slice(&ZONE_VERSION_V1.to_le_bytes());
     for payload in payloads {
@@ -1017,6 +1070,19 @@ mod tests {
         }
     }
 
+    fn index_bounds(zone: &BlockZone) -> (i64, i64) {
+        match zone.columns.first() {
+            Some(ColumnZone::IndexTs { min, max } | ColumnZone::I64 { min, max, .. }) => {
+                (*min, *max)
+            }
+            _ => (0, 0),
+        }
+    }
+
+    fn bounds_of(zones: &[BlockZone]) -> Vec<(i64, i64)> {
+        zones.iter().map(index_bounds).collect()
+    }
+
     #[test]
     fn exact_string_and_ranges_reject_absent_values() {
         let schema = schema();
@@ -1056,8 +1122,24 @@ mod tests {
             &zone,
             &[pred(&schema, "score", Scalar::Float(99.0))]
         ));
+        assert!(matches!(
+            zone.columns[0],
+            ColumnZone::IndexTs { min: 10, max: 20 }
+        ));
+        assert!(!may_match(
+            &zone,
+            &[pred(&schema, "ts", Scalar::Timestamp(9))]
+        ));
+        assert!(may_match(
+            &zone,
+            &[pred(&schema, "ts", Scalar::Timestamp(10))]
+        ));
+        assert!(!may_match(&zone, &[pred(&schema, "ts", Scalar::Null)]));
         let encoded = encode_zone(&zone);
-        let decoded = decode_zone(&encoded, schema.fields.len() as u16).unwrap();
+        assert_eq!(encoded[0], TAG_INDEX_TS);
+        assert_eq!(encoded[1], TAG_I64, "user_id still stores min and max");
+        let (min_ts, max_ts) = index_bounds(&zone);
+        let decoded = decode_zone(&encoded, schema.fields.len() as u16, min_ts, max_ts).unwrap();
         assert_eq!(decoded, zone);
     }
 
@@ -1124,7 +1206,7 @@ mod tests {
         let stored = fs::read(&path).unwrap();
         assert!(is_zstd_frame(&stored), "repeated zone records compress");
         assert_eq!(first + second, stored.len() as i64);
-        let loaded = read_zone_file(&path, crc, fields, zones.len())
+        let loaded = read_zone_file(&path, crc, fields, &bounds_of(&zones))
             .unwrap()
             .expect("compressed zone file");
         assert_eq!(loaded, zones);
@@ -1141,13 +1223,13 @@ mod tests {
             u32::from_le_bytes(raw[split..].try_into().unwrap())
         );
         fs::write(&path, &raw).unwrap();
-        let from_raw = read_zone_file(&path, crc, fields, zones.len())
+        let from_raw = read_zone_file(&path, crc, fields, &bounds_of(&zones))
             .unwrap()
             .expect("raw zone file");
         assert_eq!(from_raw, zones);
 
         fs::write(&path, &stored[..8]).unwrap();
-        assert!(read_zone_file(&path, crc, fields, zones.len())
+        assert!(read_zone_file(&path, crc, fields, &bounds_of(&zones))
             .unwrap()
             .is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -1218,21 +1300,21 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = zone_path(&dir, 1);
         fs::write(&path, &v1).unwrap();
-        let loaded = read_zone_file(&path, crc, fields, zones.len())
+        let loaded = read_zone_file(&path, crc, fields, &bounds_of(&zones))
             .unwrap()
             .expect("version-1 zone file");
         assert_eq!(loaded, zones);
 
         let mut bad = v1.clone();
         bad[ZONE_HEADER_LEN + 4] ^= 0xff;
-        let err = parse_zone_file(&bad, crc, fields, zones.len()).unwrap_err();
+        let err = parse_zone_file(&bad, crc, fields, &bounds_of(&zones)).unwrap_err();
         assert!(
             err.to_string()
                 .contains("zone map record checksum mismatch"),
             "{err}"
         );
         fs::write(&path, &bad).unwrap();
-        assert!(read_zone_file(&path, crc, fields, zones.len())
+        assert!(read_zone_file(&path, crc, fields, &bounds_of(&zones))
             .unwrap()
             .is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -1253,14 +1335,18 @@ mod tests {
         let mut raw = header(crc, fields).to_vec();
         write_record(&mut raw, &zone).unwrap();
         seal_zone_image(&mut raw);
-        let loaded = parse_zone_file(&raw, crc, fields, 1).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(raw[4..6].try_into().unwrap()),
+            ZONE_VERSION
+        );
+        let loaded = parse_zone_file(&raw, crc, fields, &bounds_of(&[zone.clone()])).unwrap();
         assert_eq!(loaded, vec![zone.clone()]);
         assert!(matches!(loaded[0].columns[6], ColumnZone::Unknown));
 
         let mut flipped = raw.clone();
         let last = flipped.len() - 1;
         flipped[last] ^= 0xff;
-        let err = parse_zone_file(&flipped, crc, fields, 1).unwrap_err();
+        let err = parse_zone_file(&flipped, crc, fields, &bounds_of(&[zone.clone()])).unwrap_err();
         assert!(
             err.to_string().contains("zone map checksum mismatch"),
             "{err}"
@@ -1277,10 +1363,14 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = zone_path(&dir, 1);
         fs::write(&path, &flipped).unwrap();
-        assert!(read_zone_file(&path, crc, fields, 1).unwrap().is_none());
+        assert!(
+            read_zone_file(&path, crc, fields, &bounds_of(&[zone.clone()]))
+                .unwrap()
+                .is_none()
+        );
 
         append_zones(&dir, 1, crc, fields, &[zone.clone()], true).unwrap();
-        let appended = read_zone_file(&path, crc, fields, 1)
+        let appended = read_zone_file(&path, crc, fields, &bounds_of(&[zone.clone()]))
             .unwrap()
             .expect("append replaces a torn image");
         assert_eq!(appended, vec![zone]);
@@ -1321,10 +1411,152 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(zone_path(&dir, 1), &v1).unwrap();
         append_zones(&dir, 1, crc, fields, &[second.clone()], true).unwrap();
-        let loaded = read_zone_file(&zone_path(&dir, 1), crc, fields, 2)
-            .unwrap()
-            .expect("version-1 records survive an append");
+        let loaded = read_zone_file(
+            &zone_path(&dir, 1),
+            crc,
+            fields,
+            &bounds_of(&[first.clone(), second.clone()]),
+        )
+        .unwrap()
+        .expect("version-1 records survive an append");
         assert_eq!(loaded, vec![first, second]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn legacy_i64_timestamp(zone: &BlockZone) -> BlockZone {
+        let mut legacy = zone.clone();
+        let ColumnZone::IndexTs { min, max } = legacy.columns[0] else {
+            panic!("primary timestamp is the sparse-index column");
+        };
+        legacy.columns[0] = ColumnZone::I64 {
+            has_null: false,
+            min,
+            max,
+        };
+        legacy
+    }
+
+    fn seal_as_version(raw: &mut Vec<u8>, version: u16) {
+        if raw.len() >= ZONE_TRAILER_LEN {
+            raw.truncate(raw.len() - ZONE_TRAILER_LEN);
+        }
+        raw[4..6].copy_from_slice(&version.to_le_bytes());
+        seal_zone_image(raw);
+    }
+
+    #[test]
+    fn version2_timestamp_bounds_still_load_and_a_bad_trailer_fails() {
+        let schema = schema();
+        let crc = schema_crc(&schema);
+        let fields = field_count(&schema).unwrap();
+        let current = from_rows(
+            &schema,
+            &[row(
+                &schema,
+                r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":1.5}"#,
+            )],
+        );
+        let zone = legacy_i64_timestamp(&current);
+        let mut raw = header(crc, fields).to_vec();
+        write_record(&mut raw, &zone).unwrap();
+        seal_zone_image(&mut raw);
+        seal_as_version(&mut raw, ZONE_VERSION_V2);
+        let loaded = parse_zone_file(&raw, crc, fields, &[(99, 100)]).unwrap();
+        assert_eq!(loaded, vec![zone.clone()]);
+        assert!(matches!(
+            loaded[0].columns[0],
+            ColumnZone::I64 {
+                has_null: false,
+                min: 10,
+                max: 10
+            }
+        ));
+
+        let mut flipped = raw.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0xff;
+        let err = parse_zone_file(&flipped, crc, fields, &[(99, 100)]).unwrap_err();
+        assert!(
+            err.to_string().contains("zone map checksum mismatch"),
+            "{err}"
+        );
+
+        let v1 = legacy_v1_image(&raw).unwrap();
+        let mut bad_record = v1.clone();
+        bad_record[ZONE_HEADER_LEN + 4] ^= 0xff;
+        let err = parse_zone_file(&bad_record, crc, fields, &[(99, 100)]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("zone map record checksum mismatch"),
+            "{err}"
+        );
+        let from_v1 = parse_zone_file(&v1, crc, fields, &[(99, 100)]).unwrap();
+        assert_eq!(from_v1, vec![zone]);
+    }
+
+    #[test]
+    fn index_tag_uses_the_sparse_index_and_leaves_other_columns() {
+        let schema = schema();
+        let crc = schema_crc(&schema);
+        let fields = field_count(&schema).unwrap();
+        let zone = from_rows(
+            &schema,
+            &[row(
+                &schema,
+                r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":1.5}"#,
+            )],
+        );
+        let mut raw = header(crc, fields).to_vec();
+        write_record(&mut raw, &zone).unwrap();
+        seal_zone_image(&mut raw);
+        let loaded = parse_zone_file(&raw, crc, fields, &[(100, 110)]).unwrap();
+        assert_eq!(
+            loaded[0].columns[0],
+            ColumnZone::IndexTs { min: 100, max: 110 }
+        );
+        assert!(!may_match(
+            &loaded[0],
+            &[pred(&schema, "ts", Scalar::Timestamp(10))]
+        ));
+        assert!(may_match(
+            &loaded[0],
+            &[pred(&schema, "ts", Scalar::Timestamp(100))]
+        ));
+        assert!(matches!(
+            loaded[0].columns[1],
+            ColumnZone::I64 {
+                has_null: false,
+                min: 1,
+                max: 1
+            }
+        ));
+        assert!(matches!(loaded[0].columns[5], ColumnZone::I128 { .. }));
+
+        let extra = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "event_time", "type": "timestamp"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let both = from_rows(&extra, &[row(&extra, r#"{"ts":10,"event_time":40}"#)]);
+        assert!(matches!(
+            both.columns[0],
+            ColumnZone::IndexTs { min: 10, max: 10 }
+        ));
+        assert!(matches!(
+            both.columns[1],
+            ColumnZone::I64 {
+                has_null: false,
+                min: 40,
+                max: 40
+            }
+        ));
+        let encoded = encode_zone(&both);
+        assert_eq!(encoded[0], TAG_INDEX_TS);
+        assert_eq!(encoded[1], TAG_I64);
     }
 }
