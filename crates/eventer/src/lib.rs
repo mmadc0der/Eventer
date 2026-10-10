@@ -18,6 +18,9 @@
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares
 //! a block with a row that is still inside the window.
+//! [`Store::rewrite_directory`](store::Store::rewrite_directory) copies an existing
+//! directory into a new one written with the current encoder and reports how the
+//! stored data and index bytes changed. The source files stay as they were.
 
 mod c_api;
 mod codec;
@@ -32,7 +35,10 @@ mod zone;
 
 pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
-pub use store::{HistogramBucket, Predicate, Stats, Store, StoreOptions, MAX_HISTOGRAM_BUCKETS};
+pub use store::{
+    HistogramBucket, Predicate, RewriteReport, Stats, Store, StoreOptions, StoredBytes,
+    MAX_HISTOGRAM_BUCKETS,
+};
 pub use value::{scalar_from_literal, Scalar};
 
 /// Uncompressed size of each column for one block, including its null bitmap.

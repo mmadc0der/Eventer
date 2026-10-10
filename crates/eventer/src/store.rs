@@ -544,6 +544,168 @@ impl Store {
         self.pipeline.drop_blocks_before(cutoff_ms)
     }
 
+    /// Copy `source` into `destination` with the current encoder, then flush once.
+    ///
+    /// `source` is an existing store directory (`schema.lock` plus its segment
+    /// files). `destination` must not already exist, or it must be an empty
+    /// directory. The call reads every row in ingest order, including rows
+    /// written before a column was appended, and appends them through the
+    /// default pipeline. A `json` column is written back as the original field
+    /// text. The destination schema is the source schema.
+    ///
+    /// The source directory is only read. Nothing in it is truncated, and no
+    /// index or zone file is written there. A rejected event, a full disk, or a
+    /// crash before the destination is published leaves those files in place
+    /// and does not put a store at `destination`. The rewritten store is written
+    /// in a private directory and published after the flush. When `destination`
+    /// does not exist yet, that directory is renamed into place. When
+    /// `destination` already exists, a marker file is created there before the
+    /// private directory. The finished files are moved in after they are
+    /// fsynced, with `schema.lock` last. The marker is removed only after that
+    /// lock is in place and the destination directory is fsynced. Opening the
+    /// destination while the marker is present fails, including when
+    /// `schema.lock` is already there, and does not read segment files or
+    /// create `schema.lock`. A destination that still has that marker is an
+    /// unfinished attempt: the marker, any `eventer-rewrite-*` scratch
+    /// directory, and store files left beside them are removed and the copy
+    /// starts again. A directory that holds a store and has no marker is
+    /// refused. A rename or fsync error moves the published names back. The
+    /// marker stays until the scratch directory has been removed, and is
+    /// unlinked after that.
+    ///
+    /// The report uses the same totals as [`Store::stats`]: `stored_data_bytes`
+    /// is segment data plus dictionary sidecars, and `stored_index_bytes` is
+    /// sparse indexes plus zone files. `data_bytes_change` is
+    /// `(source − destination) / source` for data bytes, and
+    /// `stored_bytes_change` is that ratio for data plus index. A source total
+    /// of zero reports a change of `0.0`. A directory that is already in the
+    /// current format is still copied.
+    ///
+    /// Queued events still sitting in a live [`Store`] are not on disk yet.
+    /// Flush that store before calling this if those rows should be copied.
+    pub fn rewrite_directory(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<RewriteReport> {
+        let source = source.as_ref();
+        let destination = destination.as_ref();
+        if !source.is_dir() {
+            return Err(Error::io(format!(
+                "source {} is not a directory",
+                source.display()
+            )));
+        }
+        if !source.join("schema.lock").is_file() {
+            return Err(Error::schema(
+                "source directory has no schema.lock; this is not a store directory",
+            ));
+        }
+        if destination.exists() {
+            if !destination.is_dir() {
+                return Err(Error::io(format!(
+                    "destination {} is not a directory",
+                    destination.display()
+                )));
+            }
+            if rewrite_marker_present(destination) {
+                clear_unfinished_rewrite(destination)?;
+            }
+            if directory_holds_store(destination)? {
+                return Err(Error::event(
+                    "destination already holds a store; refusing to replace it",
+                ));
+            }
+            if directory_has_entries(destination)? {
+                return Err(Error::event(
+                    "destination directory is not empty; refusing to publish a store into it",
+                ));
+            }
+        }
+        let source_abs = source.canonicalize().map_err(Error::io)?;
+        let destination_abs = anchor_path(destination)?;
+        if paths_overlap(&source_abs, &destination_abs) {
+            return Err(Error::event(
+                "source and destination directories must be separate",
+            ));
+        }
+
+        let source_bytes = directory_stored_bytes(&source_abs)?;
+        let schema = schema::load_schema(&source_abs.join("schema.lock"))?;
+        let destination_existed = destination_abs.exists();
+        let marker = if destination_existed {
+            write_rewrite_marker(&destination_abs)?;
+            Some(RemoveRewriteMarker::new(destination_abs.clone()))
+        } else {
+            None
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(Error::io)?
+            .as_nanos();
+        let scratch_name = format!("eventer-rewrite-{}-{nanos}", std::process::id());
+        // An existing destination may be a mount point. `rename` onto that
+        // directory returns EBUSY, so the new store has to be written on that
+        // filesystem and the files moved in. A path that does not exist yet
+        // is still published by renaming a directory on the parent filesystem.
+        let bases = if destination_existed {
+            vec![destination_abs.clone()]
+        } else {
+            scratch_bases(&source_abs, &destination_abs)
+        };
+        let mut last_error = None;
+        for base in &bases {
+            let Some(created) = scratch_dir_in(
+                std::slice::from_ref(base),
+                &scratch_name,
+                &source_abs,
+                &destination_abs,
+            )
+            .map(Some)
+            .or_else(|err| {
+                last_error = Some(err);
+                Ok::<Option<PathBuf>, Error>(None)
+            })?
+            else {
+                continue;
+            };
+            let scratch = RemoveOnDrop::new(created);
+            match write_rewritten_store(scratch.path(), &source_abs, &schema) {
+                Ok((staging, destination_bytes)) => {
+                    if rewrite_should_fail_before_publish() {
+                        return Err(Error::io(
+                            "rewrite failed before the destination was published",
+                        ));
+                    }
+                    publish_directory(&staging, &destination_abs, destination_existed)?;
+                    if let Some(marker) = marker {
+                        marker.disarm();
+                    }
+                    return Ok(RewriteReport {
+                        source: source_bytes,
+                        destination: destination_bytes,
+                        data_bytes_change: relative_change(
+                            source_bytes.stored_data_bytes,
+                            destination_bytes.stored_data_bytes,
+                        ),
+                        stored_bytes_change: relative_change_sum(
+                            source_bytes.stored_data_bytes,
+                            source_bytes.stored_index_bytes,
+                            destination_bytes.stored_data_bytes,
+                            destination_bytes.stored_index_bytes,
+                        ),
+                    });
+                }
+                Err(err) if is_no_space(&err) => {
+                    last_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            Error::io("could not create a scratch directory outside the source and the destination")
+        }))
+    }
+
     /// File sizes from the last committed batch. Call [`Store::flush`] first for a stable view.
     pub fn stats(&self) -> Stats {
         let catalog = self.catalog();
@@ -631,6 +793,25 @@ impl Store {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
     }
+}
+
+/// Data and index bytes, using the same split as [`Stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredBytes {
+    pub stored_data_bytes: u64,
+    pub stored_index_bytes: u64,
+}
+
+/// Sizes before and after [`Store::rewrite_directory`].
+///
+/// `data_bytes_change` and `stored_bytes_change` are
+/// `(source − destination) / source`. A zero source total is `0.0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RewriteReport {
+    pub source: StoredBytes,
+    pub destination: StoredBytes,
+    pub data_bytes_change: f64,
+    pub stored_bytes_change: f64,
 }
 
 impl Drop for Store {
@@ -857,6 +1038,9 @@ enum SchemaLockAction {
 }
 
 fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
+    if rewrite_marker_present(dir) {
+        return Err(Error::corrupt("directory contains an unfinished rewrite"));
+    }
     let path = dir.join("schema.lock");
     let canonical = schema.canonical();
     if !path.exists() {
@@ -876,6 +1060,628 @@ fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
         schema::SchemaEvolution::Unchanged => Ok(SchemaLockAction::Ready),
         schema::SchemaEvolution::Appended { .. } => Ok(SchemaLockAction::Rewrite),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REWRITE_FAIL_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REWRITE_COPY_ACROSS_DEVICES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fail the publish rename once this many calls have been allowed through.
+    /// `0` disables the hook. `1` fails the first rename.
+    static REWRITE_FAIL_PUBLISH_RENAME_AFTER: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn rewrite_should_copy_across_devices() -> bool {
+    #[cfg(test)]
+    {
+        REWRITE_COPY_ACROSS_DEVICES.with(|flag| {
+            let copy = flag.get();
+            flag.set(false);
+            copy
+        })
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn rewrite_publish_rename_should_fail() -> bool {
+    #[cfg(test)]
+    {
+        REWRITE_FAIL_PUBLISH_RENAME_AFTER.with(|flag| {
+            let left = flag.get();
+            if left == 0 {
+                return false;
+            }
+            if left == 1 {
+                flag.set(0);
+                return true;
+            }
+            flag.set(left - 1);
+            false
+        })
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn rewrite_should_fail_before_publish() -> bool {
+    #[cfg(test)]
+    {
+        REWRITE_FAIL_BEFORE_PUBLISH.with(|flag| {
+            let fail = flag.get();
+            flag.set(false);
+            fail
+        })
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn relative_change(source: u64, destination: u64) -> f64 {
+    if source == 0 {
+        0.0
+    } else {
+        (source as f64 - destination as f64) / source as f64
+    }
+}
+
+fn relative_change_sum(
+    source_a: u64,
+    source_b: u64,
+    destination_a: u64,
+    destination_b: u64,
+) -> f64 {
+    let source = u128::from(source_a) + u128::from(source_b);
+    let destination = u128::from(destination_a) + u128::from(destination_b);
+    if source == 0 {
+        0.0
+    } else {
+        (source as f64 - destination as f64) / source as f64
+    }
+}
+
+fn directory_has_entries(dir: &Path) -> Result<bool> {
+    Ok(fs::read_dir(dir)?.next().is_some())
+}
+
+/// Present from the moment an existing destination starts a rewrite until
+/// `schema.lock` is in place and that directory has been fsynced.
+const REWRITE_INCOMPLETE_MARKER: &str = "eventer-rewrite.incomplete";
+
+fn write_rewrite_marker(dir: &Path) -> Result<()> {
+    let path = dir.join(REWRITE_INCOMPLETE_MARKER);
+    {
+        let mut file = fs::File::create(&path).map_err(Error::io)?;
+        file.write_all(b"incomplete\n").map_err(Error::io)?;
+        file.sync_all().map_err(Error::io)?;
+    }
+    fsync_dir(dir)
+}
+
+fn remove_rewrite_marker(dir: &Path) -> Result<()> {
+    let path = dir.join(REWRITE_INCOMPLETE_MARKER);
+    if path.exists() {
+        fs::remove_file(&path).map_err(Error::io)?;
+        fsync_dir(dir)?;
+    }
+    Ok(())
+}
+
+fn rewrite_marker_present(dir: &Path) -> bool {
+    dir.join(REWRITE_INCOMPLETE_MARKER).is_file()
+}
+
+/// Remove a killed rewrite so a later call can publish into `dir`.
+/// Store files and scratch directories go first. The marker is last, so a
+/// crash in the middle still leaves a directory that [`Store::open`] refuses.
+fn clear_unfinished_rewrite(dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name == REWRITE_INCOMPLETE_MARKER {
+            continue;
+        }
+        if file_type.is_dir() {
+            if name.starts_with("eventer-rewrite-") {
+                fs::remove_dir_all(entry.path()).map_err(Error::io)?;
+            }
+            continue;
+        }
+        if file_type.is_file() && (name == "schema.lock" || name.starts_with("seg-")) {
+            fs::remove_file(entry.path()).map_err(Error::io)?;
+        }
+    }
+    fsync_dir(dir)?;
+    remove_rewrite_marker(dir)
+}
+
+/// Deletes the rewrite marker unless [`RemoveRewriteMarker::disarm`] ran.
+struct RemoveRewriteMarker {
+    dir: Option<PathBuf>,
+}
+
+impl RemoveRewriteMarker {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir: Some(dir) }
+    }
+
+    fn disarm(mut self) {
+        self.dir.take();
+    }
+}
+
+impl Drop for RemoveRewriteMarker {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            let _ = remove_rewrite_marker(&dir);
+        }
+    }
+}
+
+fn directory_holds_store(dir: &Path) -> Result<bool> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    if dir.join("schema.lock").exists() {
+        return Ok(true);
+    }
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("seg-") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Segment `.dat` and `.dict` files are data. `.idx` and `.zon` files are the index.
+fn directory_stored_bytes(dir: &Path) -> Result<StoredBytes> {
+    let mut stored_data_bytes = 0u64;
+    let mut stored_index_bytes = 0u64;
+    if dir.exists() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let len = entry.metadata()?.len();
+            if name.ends_with(".dat") || name.ends_with(".dict") {
+                stored_data_bytes += len;
+            } else if name.ends_with(".idx") || name.ends_with(".zon") {
+                stored_index_bytes += len;
+            }
+        }
+    }
+    Ok(StoredBytes {
+        stored_data_bytes,
+        stored_index_bytes,
+    })
+}
+
+fn anchor_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path.canonicalize().map_err(Error::io);
+    }
+    let name = path.file_name().ok_or_else(|| {
+        Error::io(format!(
+            "destination {} has no directory name",
+            path.display()
+        ))
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = match parent {
+        Some(parent) => parent.canonicalize().map_err(Error::io)?,
+        None => std::env::current_dir().map_err(Error::io)?,
+    };
+    Ok(parent.join(name))
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || right.starts_with(left) || left.starts_with(right)
+}
+
+/// A scratch directory inside an existing destination is the filesystem the
+/// caller asked for. Every other overlap with the source or the destination
+/// is refused.
+fn scratch_overlaps(path: &Path, source: &Path, destination: &Path) -> bool {
+    if paths_overlap(path, source) || path == destination {
+        return true;
+    }
+    if destination.is_dir() && path.starts_with(destination) {
+        return false;
+    }
+    paths_overlap(path, destination)
+}
+
+fn scratch_bases(source: &Path, destination: &Path) -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    if let Some(parent) = destination.parent() {
+        if !parent.as_os_str().is_empty() {
+            bases.push(parent.to_path_buf());
+        }
+    }
+    if let Some(parent) = source.parent() {
+        if !parent.as_os_str().is_empty() && !bases.iter().any(|base| base == parent) {
+            bases.push(parent.to_path_buf());
+        }
+    }
+    let temp = std::env::temp_dir();
+    if !bases.iter().any(|base| base == &temp) {
+        bases.push(temp);
+    }
+    bases
+}
+
+fn is_no_space(err: &Error) -> bool {
+    let text = err.to_string();
+    text.contains("No space left on device") || text.contains("os error 28")
+}
+
+fn write_rewritten_store(
+    scratch: &Path,
+    source: &Path,
+    schema: &Schema,
+) -> Result<(PathBuf, StoredBytes)> {
+    let staging = scratch.join("staging");
+    let schema_file = scratch.join("schema.json");
+    fs::write(&schema_file, schema.canonical())?;
+    let destination_store = Store::open(&staging, &schema_file)?;
+    let copied_rows = segment::visit_stored_rows(source, schema, |row| {
+        destination_store.pipeline.append_row(row)
+    })?;
+    destination_store.flush()?;
+    let stats = destination_store.stats();
+    if stats.rows != copied_rows {
+        return Err(Error::corrupt(
+            "rewritten directory row count does not match the source",
+        ));
+    }
+    destination_store.close()?;
+    let destination_bytes = directory_stored_bytes(&staging)?;
+    if destination_bytes.stored_data_bytes != stats.data_bytes
+        || destination_bytes.stored_index_bytes != stats.index_bytes
+    {
+        return Err(Error::corrupt(
+            "rewritten directory file sizes do not match the flushed store",
+        ));
+    }
+    Ok((staging, destination_bytes))
+}
+
+fn scratch_dir_in(
+    bases: &[PathBuf],
+    name: &str,
+    source: &Path,
+    destination: &Path,
+) -> Result<PathBuf> {
+    let mut last_error = None;
+    for base in bases {
+        if !base.exists() {
+            continue;
+        }
+        let base = match base.canonicalize() {
+            Ok(path) => path,
+            Err(err) => {
+                last_error = Some(Error::io(err));
+                continue;
+            }
+        };
+        let path = base.join(&name);
+        if scratch_overlaps(&path, source, destination) {
+            continue;
+        }
+        match create_private_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => last_error = Some(Error::io(err)),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        Error::io("could not create a scratch directory outside the source and the destination")
+    }))
+}
+
+struct RemoveOnDrop {
+    path: Option<PathBuf>,
+}
+
+impl RemoveOnDrop {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().unwrap_or(Path::new(""))
+    }
+
+    fn disarm(&mut self) {
+        self.path.take();
+    }
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// Mode 0700 survives umask 022, so a traversable parent cannot list the directory.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
+}
+
+fn is_store_file(name: &str) -> bool {
+    if name == "schema.lock" {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("seg-") else {
+        return false;
+    };
+    let Some((id, ext)) = rest.split_once('.') else {
+        return false;
+    };
+    id.len() == 6
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(ext, "dat" | "idx" | "dict" | "zon")
+}
+
+fn fsync_dir(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(Error::io)
+}
+
+/// Copy store files into `to`, which must already exist and be empty.
+/// Each file and `to` itself are fsynced. An extra name in `to` is an error.
+fn copy_store_files_synced(from: &Path, to: &Path) -> Result<()> {
+    let mut copied = Vec::new();
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !is_store_file(&name) {
+            continue;
+        }
+        if file_type.is_symlink() {
+            return Err(Error::io(format!(
+                "refusing to copy symlink {}",
+                entry.path().display()
+            )));
+        }
+        if !file_type.is_file() {
+            return Err(Error::io(format!(
+                "unsupported file in store directory: {}",
+                entry.path().display()
+            )));
+        }
+        let target = to.join(&file_name);
+        if target.exists() {
+            return Err(Error::io(format!(
+                "publish directory already contains {}",
+                target.display()
+            )));
+        }
+        fs::copy(entry.path(), &target)?;
+        fs::File::options()
+            .write(true)
+            .open(&target)
+            .and_then(|file| file.sync_all())
+            .map_err(Error::io)?;
+        copied.push(file_name);
+    }
+    for entry in fs::read_dir(to)? {
+        let name = entry?.file_name();
+        if !copied.iter().any(|copied| copied == &name) {
+            return Err(Error::io(format!(
+                "publish directory contains {} which was not copied",
+                name.to_string_lossy()
+            )));
+        }
+    }
+    fsync_dir(to)
+}
+
+fn exclusive_publish_dir(destination: &Path) -> Result<PathBuf> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = match parent {
+        Some(parent) => parent,
+        None => {
+            return Err(Error::io(format!(
+                "destination {} has no parent directory",
+                destination.display()
+            )))
+        }
+    };
+    let dest_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("store");
+    for _ in 0..8 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(Error::io)?
+            .as_nanos();
+        let sibling = parent.join(format!(
+            ".{dest_name}-publish-{}-{nanos}",
+            std::process::id()
+        ));
+        if paths_overlap(&sibling, destination) {
+            continue;
+        }
+        match create_private_dir(&sibling) {
+            Ok(()) => return Ok(sibling),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(Error::io(err)),
+        }
+    }
+    Err(Error::io(
+        "could not create an exclusive directory to publish the rewritten store",
+    ))
+}
+
+fn fsync_file(path: &Path) -> Result<()> {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(Error::io)
+}
+
+/// Move finished store files from `staging` into an existing `destination`.
+/// `schema.lock` is last. The incomplete-rewrite marker stays until that
+/// lock is in place and `destination` has been fsynced, then it is removed.
+/// A rename or fsync error puts the published names back into `staging` and
+/// leaves the marker. The scratch directory is removed before that marker,
+/// so the unfinished copy is gone before open would accept the directory.
+/// `rename` of the staging directory itself is not used: onto a mount point
+/// it returns `EBUSY`.
+fn publish_into_existing_directory(staging: &Path, destination: &Path) -> Result<()> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(staging)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !is_store_file(&name) {
+            continue;
+        }
+        if file_type.is_symlink() {
+            return Err(Error::io(format!(
+                "refusing to publish symlink {}",
+                entry.path().display()
+            )));
+        }
+        if !file_type.is_file() {
+            return Err(Error::io(format!(
+                "unsupported file in store directory: {}",
+                entry.path().display()
+            )));
+        }
+        let target = destination.join(&file_name);
+        if target.exists() {
+            return Err(Error::io(format!(
+                "publish directory already contains {}",
+                target.display()
+            )));
+        }
+        fsync_file(&entry.path())?;
+        files.push(file_name);
+    }
+    if !files.iter().any(|name| name == "schema.lock") {
+        return Err(Error::io(
+            "rewritten store is missing schema.lock and was not published",
+        ));
+    }
+    files.sort_by(|left, right| {
+        let left_lock = left == "schema.lock";
+        let right_lock = right == "schema.lock";
+        left_lock.cmp(&right_lock).then_with(|| left.cmp(right))
+    });
+    let mut moved = Vec::new();
+    for name in &files {
+        if rewrite_publish_rename_should_fail() {
+            return abort_existing_publish(&moved, staging, destination).and(Err(Error::io(
+                "publish rename failed before the rewritten store was complete",
+            )));
+        }
+        match fs::rename(staging.join(name), destination.join(name)) {
+            Ok(()) => moved.push(name.clone()),
+            Err(err) => {
+                return abort_existing_publish(&moved, staging, destination)
+                    .and(Err(Error::io(err)));
+            }
+        }
+    }
+    if let Err(err) = fsync_dir(destination) {
+        return abort_existing_publish(&moved, staging, destination).and(Err(err));
+    }
+    remove_rewrite_marker(destination)
+}
+
+fn abort_existing_publish(
+    moved: &[std::ffi::OsString],
+    staging: &Path,
+    destination: &Path,
+) -> Result<()> {
+    // The marker stays. `RemoveOnDrop` for the scratch directory runs before
+    // `RemoveRewriteMarker`, which unlinks and fsyncs the marker only after
+    // that scratch directory is gone.
+    rollback_published_files(moved, staging, destination)
+}
+
+fn rollback_published_files(
+    moved: &[std::ffi::OsString],
+    staging: &Path,
+    destination: &Path,
+) -> Result<()> {
+    for name in moved.iter().rev() {
+        fs::rename(destination.join(name), staging.join(name)).map_err(Error::io)?;
+    }
+    Ok(())
+}
+
+fn publish_directory(staging: &Path, destination: &Path, destination_existed: bool) -> Result<()> {
+    if destination_existed {
+        return publish_into_existing_directory(staging, destination);
+    }
+    if let Some(parent) = destination.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let cross_device = cfg!(test) && rewrite_should_copy_across_devices();
+    if !cross_device {
+        match fs::rename(staging, destination) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {}
+            Err(err) => return Err(Error::io(err)),
+        }
+    }
+    let sibling = exclusive_publish_dir(destination)?;
+    let mut cleanup = RemoveOnDrop::new(sibling.clone());
+    copy_store_files_synced(staging, &sibling)?;
+    if let Some(parent) = sibling.parent() {
+        fsync_dir(parent)?;
+    }
+    fs::rename(&sibling, destination)?;
+    cleanup.disarm();
+    Ok(())
 }
 
 fn write_schema_lock(path: &Path, canonical: &str) -> Result<()> {
@@ -3374,5 +4180,691 @@ mod tests {
         assert!(!segment::dictionary_path(&data, 1).exists());
         assert!(!segment::data_path(&data, 1).exists());
         reopened.close().unwrap();
+    }
+
+    fn snapshot_tree(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fn walk(dir: &Path, prefix: &str, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+            let mut entries: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let rel = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{}", entry.file_name().to_string_lossy())
+                };
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, &rel, out);
+                } else {
+                    out.insert(rel, fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        if dir.exists() {
+            walk(dir, "", &mut out);
+        }
+        out
+    }
+
+    fn frame_v20(compressed: &[u8], uncompressed_len: u32, row_count: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(segment::BLOCK_HEADER_LEN_V20 + compressed.len());
+        out.extend_from_slice(segment::BLOCK_MAGIC);
+        out.extend_from_slice(&uncompressed_len.to_le_bytes());
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&row_count.to_le_bytes());
+        out.extend_from_slice(&crc32fast::hash(compressed).to_le_bytes());
+        out.extend_from_slice(compressed);
+        out
+    }
+
+    fn seal_rows(schema: &Schema, rows: &[Row]) -> crate::codec::EncodedBlock {
+        crate::codec::encode_block(schema, rows).unwrap()
+    }
+
+    fn install_schema_lock(dir: &Path, text: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let schema = parse_schema(text).unwrap();
+        fs::write(dir.join("schema.lock"), schema.canonical()).unwrap();
+    }
+
+    fn assert_change(report: &RewriteReport) {
+        let data = relative_change(
+            report.source.stored_data_bytes,
+            report.destination.stored_data_bytes,
+        );
+        let total = relative_change_sum(
+            report.source.stored_data_bytes,
+            report.source.stored_index_bytes,
+            report.destination.stored_data_bytes,
+            report.destination.stored_index_bytes,
+        );
+        assert_eq!(report.data_bytes_change, data);
+        assert_eq!(report.stored_bytes_change, total);
+    }
+
+    fn query_bytes(dir: &Path, schema: &Path) -> Vec<Vec<u8>> {
+        let store = Store::open(dir, schema).unwrap();
+        let rows = store.query(i64::MIN, i64::MAX).unwrap();
+        let bytes = rows
+            .iter()
+            .map(|row| row_to_json_bytes(store.schema(), row).unwrap())
+            .collect();
+        store.close().unwrap();
+        bytes
+    }
+
+    #[test]
+    fn rewrite_directory_turns_a_36_byte_segment_into_the_current_format() {
+        let dir = TempDir::new();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let data = dir.path().join("data");
+        install_schema_lock(&data, SCHEMA_JSON);
+        let rows: Vec<Row> = (0..5)
+            .map(|ts| {
+                crate::value::parse_event(&schema, &event(ts, Some(ts), "click", None, "1.00"))
+                    .unwrap()
+            })
+            .collect();
+        let encoded = seal_rows(&schema, &rows);
+        let compressed = zstd::bulk::compress(&encoded.bytes, 3).unwrap();
+        assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        let framed = segment::frame_block_v1(
+            &compressed,
+            encoded.bytes.len() as u32,
+            encoded.row_count,
+            encoded.min_ts,
+            encoded.max_ts,
+            false,
+        )
+        .unwrap();
+        fs::write(segment::data_path(&data, 1), &framed).unwrap();
+        assert!(segment::frames_in(&framed)[0].header_len == segment::BLOCK_HEADER_LEN_V1);
+        assert!(!crate::zone::zone_path(&data, 1).exists());
+        assert!(!segment::dictionary_path(&data, 1).exists());
+        let before = snapshot_tree(&data);
+        let expected: Vec<_> = rows
+            .iter()
+            .map(|row| row_to_json_bytes(&schema, row).unwrap())
+            .collect();
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before, "source files changed");
+        assert_eq!(
+            report.source,
+            directory_stored_bytes(&data).unwrap(),
+            "source report does not match the directory"
+        );
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        assert_change(&report);
+        assert!(
+            report.data_bytes_change > 0.0
+                || report.destination.stored_data_bytes <= report.source.stored_data_bytes
+        );
+
+        let schema_file = data.join("schema.lock");
+        let got = query_bytes(&dest, &schema_file);
+        assert_eq!(got, expected);
+        let reopened = query_bytes(&dest, &schema_file);
+        assert_eq!(reopened, expected);
+        let dest_bytes = fs::read(segment::data_path(&dest, 1)).unwrap();
+        let frames = segment::frames_in(&dest_bytes);
+        assert!(!frames.is_empty());
+        assert!(frames
+            .iter()
+            .all(|frame| frame.header_len == segment::BLOCK_HEADER_LEN));
+        let opened = Store::open(&dest, &schema_file).unwrap();
+        assert_eq!(opened.stats().rows, 5);
+        assert_eq!(
+            opened.stats().data_bytes,
+            report.destination.stored_data_bytes
+        );
+        assert_eq!(
+            opened.stats().index_bytes,
+            report.destination.stored_index_bytes
+        );
+        opened.close().unwrap();
+    }
+
+    #[test]
+    fn rewrite_directory_copies_mixed_headers_without_touching_the_source() {
+        let dir = TempDir::new();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let data = dir.path().join("data");
+        install_schema_lock(&data, SCHEMA_JSON);
+        let blocks: Vec<Vec<Row>> = (0..3)
+            .map(|block| {
+                (0..2)
+                    .map(|row| {
+                        let ts = block * 10 + row;
+                        crate::value::parse_event(
+                            &schema,
+                            &event(ts, Some(ts), "click", Some("n"), "1.00"),
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+        let encoded: Vec<_> = blocks.iter().map(|rows| seal_rows(&schema, rows)).collect();
+        let magic36 = zstd::bulk::compress(&encoded[0].bytes, 3).unwrap();
+        let frame36 = segment::frame_block_v1(
+            &magic36,
+            encoded[0].bytes.len() as u32,
+            encoded[0].row_count,
+            encoded[0].min_ts,
+            encoded[0].max_ts,
+            false,
+        )
+        .unwrap();
+        let magic20 = zstd::bulk::compress(&encoded[1].bytes, 1).unwrap();
+        let frame20 = frame_v20(
+            &magic20,
+            encoded[1].bytes.len() as u32,
+            encoded[1].row_count,
+        );
+        let dict = vec![0x5Au8; 128];
+        let mut compressor = segment::block_compressor(3, &dict).unwrap();
+        let magicless = compressor.compress(&encoded[2].bytes).unwrap();
+        assert!(magicless.len() < 4 || magicless[..4] != [0x28, 0xB5, 0x2F, 0xFD]);
+        let frame12 = segment::frame_block(&magicless, true).unwrap();
+        assert_eq!(frame12.len(), segment::BLOCK_HEADER_LEN + magicless.len());
+        assert_eq!(&frame12[..4], segment::BLOCK_MAGIC_DICT);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&frame36);
+        bytes.extend_from_slice(&frame20);
+        bytes.extend_from_slice(&frame12);
+        fs::write(segment::data_path(&data, 1), &bytes).unwrap();
+        segment::write_dictionary(&data, 1, &dict).unwrap();
+        let frames = segment::frames_in(&bytes);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].header_len, segment::BLOCK_HEADER_LEN_V1);
+        assert_eq!(frames[1].header_len, segment::BLOCK_HEADER_LEN_V20);
+        assert_eq!(frames[2].header_len, segment::BLOCK_HEADER_LEN);
+        assert_eq!(frames[2].magic, *segment::BLOCK_MAGIC_DICT);
+        let before = snapshot_tree(&data);
+        let expected: Vec<_> = blocks
+            .iter()
+            .flatten()
+            .map(|row| row_to_json_bytes(&schema, row).unwrap())
+            .collect();
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(report.source, directory_stored_bytes(&data).unwrap());
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        assert_change(&report);
+        let schema_file = data.join("schema.lock");
+        assert_eq!(query_bytes(&dest, &schema_file), expected);
+        let reopened = Store::open(&dest, &schema_file).unwrap();
+        assert_eq!(reopened.query(i64::MIN, i64::MAX).unwrap().len(), 6);
+        reopened.close().unwrap();
+        assert_eq!(query_bytes(&dest, &schema_file), expected);
+    }
+
+    #[test]
+    fn rewrite_directory_keeps_json_field_text_and_appended_nulls() {
+        let dir = TempDir::new();
+        let text = r#"{
+            "timestamp_field": "ts",
+            "fields": [
+                {"name": "ts", "type": "timestamp"},
+                {"name": "props", "type": "json"}
+            ]
+        }"#;
+        let schema_path = dir.path().join("schema.json");
+        fs::write(&schema_path, text).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema_path, test_options(4)).unwrap();
+        let raw = br#"{"ts":5,"props":{"a":1,"a":2,"b":{"z":1,"z":3}}}"#;
+        store.append_json(raw).unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+
+        let wide = r#"{
+            "timestamp_field": "ts",
+            "fields": [
+                {"name": "ts", "type": "timestamp"},
+                {"name": "props", "type": "json"},
+                {"name": "region", "type": "string"}
+            ]
+        }"#;
+        let wide_path = dir.path().join("wide.json");
+        fs::write(&wide_path, wide).unwrap();
+        let store = Store::open_with(&data, &wide_path, test_options(4)).unwrap();
+        store
+            .append_json(br#"{"ts":9,"props":[1,2,3],"region":"us"}"#)
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let expected = query_bytes(&data, &wide_path);
+        let before = snapshot_tree(&data);
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(
+            report.source.stored_data_bytes,
+            directory_stored_bytes(&data).unwrap().stored_data_bytes
+        );
+        assert_eq!(
+            report.source.stored_index_bytes,
+            directory_stored_bytes(&data).unwrap().stored_index_bytes
+        );
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        assert_change(&report);
+        let got = query_bytes(&dest, &wide_path);
+        assert_eq!(got, expected);
+        assert!(got[0]
+            .windows(br#"{"a":1,"a":2,"b":{"z":1,"z":3}}"#.len())
+            .any(|window| window == br#"{"a":1,"a":2,"b":{"z":1,"z":3}}"#));
+        let reopened = Store::open(&dest, &wide_path).unwrap();
+        let rows = reopened.query(i64::MIN, i64::MAX).unwrap();
+        assert_eq!(rows.len(), 2);
+        match &rows[0].values[1] {
+            Scalar::Json(text) => assert_eq!(text, r#"{"a":1,"a":2,"b":{"z":1,"z":3}}"#),
+            other => panic!("expected json text, got {other:?}"),
+        }
+        assert!(row_value(&reopened, &rows[0])["region"].is_null());
+        assert_eq!(row_value(&reopened, &rows[1])["region"], "us");
+        assert_eq!(
+            fs::read_to_string(dest.join("schema.lock")).unwrap(),
+            reopened.schema().canonical()
+        );
+        reopened.close().unwrap();
+        assert_eq!(query_bytes(&dest, &wide_path), expected);
+    }
+
+    #[test]
+    fn rewrite_directory_of_a_current_store_reports_directory_totals() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, StoreOptions::default()).unwrap();
+        for ts in 0..8 {
+            store
+                .append_json(&event(ts, Some(ts), "click", Some("hello"), "19.99"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let stats = store.stats();
+        store.close().unwrap();
+        let expected = query_bytes(&data, &schema);
+        let before = snapshot_tree(&data);
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(report.source.stored_data_bytes, stats.data_bytes);
+        assert_eq!(report.source.stored_index_bytes, stats.index_bytes);
+        assert_eq!(report.source, directory_stored_bytes(&data).unwrap());
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(
+            opened.stats().data_bytes,
+            report.destination.stored_data_bytes
+        );
+        assert_eq!(
+            opened.stats().index_bytes,
+            report.destination.stored_index_bytes
+        );
+        assert_eq!(opened.stats().rows, 8);
+        opened.close().unwrap();
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        assert_change(&report);
+        assert_eq!(query_bytes(&dest, &schema), expected);
+        assert_eq!(query_bytes(&dest, &schema), query_bytes(&data, &schema));
+    }
+
+    #[test]
+    fn rewrite_directory_failure_leaves_the_source_segment_in_place() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, Some(2), "view", Some("a"), "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+
+        let blocked = dir.path().join("not-a-directory");
+        fs::write(&blocked, b"file").unwrap();
+        let err = Store::rewrite_directory(&data, &blocked).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(fs::read(&blocked).unwrap(), b"file");
+
+        let existing = dir.path().join("existing");
+        let prior = Store::open_with(&existing, &schema, test_options(2)).unwrap();
+        prior
+            .append_json(&event(9, Some(9), "buy", None, "3.00"))
+            .unwrap();
+        prior.close().unwrap();
+        let existing_before = snapshot_tree(&existing);
+        let err = Store::rewrite_directory(&data, &existing).unwrap_err();
+        assert!(err.to_string().contains("already holds a store"), "{err}");
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(snapshot_tree(&existing), existing_before);
+
+        let dest = dir.path().join("unpublished");
+        REWRITE_FAIL_BEFORE_PUBLISH.with(|flag| flag.set(true));
+        let err = Store::rewrite_directory(&data, &dest).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("before the destination was published"),
+            "{err}"
+        );
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(
+            !dest.exists() || !directory_holds_store(&dest).unwrap(),
+            "a failed copy published a store"
+        );
+        let segment = fs::read(segment::data_path(&data, 1)).unwrap();
+        assert_eq!(
+            snapshot_tree(&data).get("seg-000001.dat").unwrap(),
+            &segment
+        );
+    }
+
+    #[test]
+    fn rewrite_directory_keeps_a_row_that_reserializes_past_the_ingest_cap() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        let empty = event(1, None, "click", Some(""), "1");
+        let note = "n".repeat(1024 * 1024 - empty.len());
+        let raw = event(1, None, "click", Some(&note), "1");
+        assert!(raw.len() <= 1024 * 1024, "fixture is {}", raw.len());
+        store.append_json(&raw).unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 1);
+        let rows = opened.query(i64::MIN, i64::MAX).unwrap();
+        let amount = &rows[0].values[6];
+        assert!(matches!(amount, Scalar::Decimal(_)), "{amount:?}");
+        opened.close().unwrap();
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+    }
+
+    #[test]
+    fn rewrite_directory_moves_files_into_an_existing_empty_directory() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, Some(2), "view", Some("a"), "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+        let expected = query_bytes(&data, &schema);
+
+        let dest = dir.path().join("mounted");
+        fs::create_dir(&dest).unwrap();
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(dest.join("schema.lock").is_file());
+        assert!(
+            fs::read_dir(&dest)
+                .unwrap()
+                .all(|entry| entry.unwrap().file_type().unwrap().is_file()),
+            "the private directory was left inside the destination"
+        );
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert_eq!(query_bytes(&dest, &schema), expected);
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+
+        let failed = dir.path().join("mounted-failed");
+        fs::create_dir(&failed).unwrap();
+        REWRITE_FAIL_BEFORE_PUBLISH.with(|flag| flag.set(true));
+        let err = Store::rewrite_directory(&data, &failed).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("before the destination was published"),
+            "{err}"
+        );
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(
+            !directory_has_entries(&failed).unwrap(),
+            "a failed rewrite left files in the existing destination"
+        );
+    }
+
+    #[test]
+    fn open_refuses_an_unfinished_rewrite_and_still_opens_segment_files() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        let staging = data.join("eventer-rewrite-1-1").join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("seg-000001.dat"), b"partial").unwrap();
+        let err = match Store::open(&data, &schema) {
+            Ok(_) => panic!("opened a directory that still has the rewrite marker"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unfinished rewrite"), "{err}");
+        assert!(!data.join("schema.lock").exists());
+        assert_eq!(
+            fs::read(staging.join("seg-000001.dat")).unwrap(),
+            b"partial"
+        );
+
+        let legacy = dir.path().join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("seg-000001.dat"), b"partial").unwrap();
+        let parsed = parse_schema(SCHEMA_JSON).unwrap();
+        schema_lock_action(&legacy, &parsed).unwrap();
+        assert!(legacy.join("schema.lock").is_file());
+        assert_eq!(fs::read(legacy.join("seg-000001.dat")).unwrap(), b"partial");
+
+        let fresh = dir.path().join("fresh");
+        let store = Store::open(&fresh, &schema).unwrap();
+        store.close().unwrap();
+        assert!(fresh.join("schema.lock").is_file());
+    }
+
+    #[test]
+    fn open_refuses_a_rewrite_marker_when_schema_lock_is_already_present() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let mut options = test_options(1);
+        options.segment_bytes = 1;
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        for ts in 1..=6 {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+            store.flush().unwrap();
+        }
+        store.close().unwrap();
+        let dest = dir.path().join("partial");
+        fs::create_dir(&dest).unwrap();
+        fs::copy(data.join("schema.lock"), dest.join("schema.lock")).unwrap();
+        fs::copy(data.join("seg-000001.dat"), dest.join("seg-000001.dat")).unwrap();
+        fs::write(dest.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        let before = snapshot_tree(&dest);
+        let err = match Store::open(&dest, &schema) {
+            Ok(_) => panic!("opened a directory that still has the rewrite marker"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unfinished rewrite"), "{err}");
+        assert_eq!(snapshot_tree(&dest), before);
+    }
+
+    #[test]
+    fn rewrite_directory_replaces_an_unfinished_attempt() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, Some(2), "view", Some("a"), "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let expected = query_bytes(&data, &schema);
+
+        let marker_only = dir.path().join("marker-only");
+        fs::create_dir(&marker_only).unwrap();
+        fs::write(marker_only.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        Store::rewrite_directory(&data, &marker_only).unwrap();
+        let opened = Store::open(&marker_only, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert_eq!(query_bytes(&marker_only, &schema), expected);
+        assert!(!marker_only.join(REWRITE_INCOMPLETE_MARKER).exists());
+
+        let partial = dir.path().join("partial");
+        fs::create_dir(&partial).unwrap();
+        fs::write(partial.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        fs::write(partial.join("seg-000001.dat"), b"leftover").unwrap();
+        let scratch = partial.join("eventer-rewrite-1-1").join("staging");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("seg-000001.dat"), b"scratch").unwrap();
+        Store::rewrite_directory(&data, &partial).unwrap();
+        let opened = Store::open(&partial, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert!(!partial.join("eventer-rewrite-1-1").exists());
+        assert!(!partial.join(REWRITE_INCOMPLETE_MARKER).exists());
+        assert_eq!(query_bytes(&partial, &schema), expected);
+
+        let finished = dir.path().join("finished");
+        Store::rewrite_directory(&data, &finished).unwrap();
+        let err = Store::rewrite_directory(&data, &finished).unwrap_err();
+        assert!(err.to_string().contains("already holds a store"), "{err}");
+
+        fs::write(finished.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        Store::rewrite_directory(&data, &finished).unwrap();
+        let opened = Store::open(&finished, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert!(!finished.join(REWRITE_INCOMPLETE_MARKER).exists());
+        assert_eq!(query_bytes(&finished, &schema), expected);
+    }
+
+    #[test]
+    fn rewrite_directory_puts_back_files_when_a_later_publish_rename_fails() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, Some(2), "view", Some("a"), "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+        let expected = query_bytes(&data, &schema);
+
+        let dest = dir.path().join("mounted");
+        fs::create_dir(&dest).unwrap();
+        // Allow the first file through, then fail before schema.lock moves.
+        REWRITE_FAIL_PUBLISH_RENAME_AFTER.with(|flag| flag.set(2));
+        let err = Store::rewrite_directory(&data, &dest).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("publish rename failed before the rewritten store was complete"),
+            "{err}"
+        );
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(
+            !directory_has_entries(&dest).unwrap(),
+            "a failed publish left files in the destination"
+        );
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert_eq!(query_bytes(&dest, &schema), expected);
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+    }
+
+    #[test]
+    fn scratch_dir_is_created_outside_the_source_when_temp_is_the_source() {
+        let dir = TempDir::new();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let destination = dir.path().join("destination");
+        let bases = vec![source.clone(), dir.path().to_path_buf()];
+        let created =
+            scratch_dir_in(&bases, "eventer-rewrite-test", &source, &destination).unwrap();
+        assert_eq!(created.parent(), Some(dir.path()));
+        assert!(!created.starts_with(&source));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "scratch directory is traversable by other users"
+            );
+        }
+        let _ = fs::remove_dir_all(&created);
+        assert!(!source.join("eventer-rewrite-test").exists());
+    }
+
+    #[test]
+    fn publish_across_devices_does_not_keep_a_precreated_sibling() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+        let dest = dir.path().join("rewritten");
+        let planted = dir
+            .path()
+            .join(format!(".rewritten-publish-{}", std::process::id()));
+        fs::create_dir(&planted).unwrap();
+        fs::write(planted.join("seg-000099.dat"), b"leftover").unwrap();
+
+        REWRITE_COPY_ACROSS_DEVICES.with(|flag| flag.set(true));
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(planted.join("seg-000099.dat").is_file());
+        assert!(!dest.join("seg-000099.dat").exists());
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 1);
+        opened.close().unwrap();
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        let _ = fs::remove_dir_all(&planted);
     }
 }

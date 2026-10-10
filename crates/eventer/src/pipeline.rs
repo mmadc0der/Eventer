@@ -23,6 +23,8 @@ type Ack = mpsc::Sender<Result<()>>;
 
 enum Cmd {
     Event { json: Vec<u8>, ack: Option<Ack> },
+    /// A row already decoded from a store. Skips JSON parsing and the ingest cap.
+    Row { row: Row, ack: Option<Ack> },
     Flush { ack: Ack },
     DropBefore { cutoff_ms: i64, ack: Ack },
     Shutdown { ack: mpsc::Sender<()> },
@@ -432,6 +434,14 @@ fn named(name: &str, f: impl FnOnce() + Send + 'static) -> Result<JoinHandle<()>
 }
 
 impl Pipeline {
+    /// Queue a decoded row. It does not pass through the JSON ingest size cap.
+    pub fn append_row(&self, row: Row) -> Result<()> {
+        let tx = self.sender()?;
+        tx.send(Cmd::Row { row, ack: None })
+            .map_err(|_| Error::Closed)?;
+        Ok(())
+    }
+
     pub fn append(&self, json: &[u8], durable: bool) -> Result<()> {
         let tx = self.sender()?;
         if durable {
@@ -559,6 +569,19 @@ fn dispatch_loop(rx: Receiver<Cmd>, parse_tx: Sender<Job>, enc_tx: Sender<Encode
             Cmd::Event { json, ack } => {
                 seq += 1;
                 if parse_tx.send(Job { seq, json, ack }).is_err() {
+                    break;
+                }
+            }
+            Cmd::Row { row, ack } => {
+                seq += 1;
+                if enc_tx
+                    .send(EncoderMsg::Parsed {
+                        seq,
+                        row: Ok(row),
+                        ack,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
