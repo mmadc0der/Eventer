@@ -1020,6 +1020,8 @@ mod tests {
                 "query_json_window offset={offset} limit={limit:?}: {json}"
             );
         }
+        let count = store.count(10, 20).unwrap_err();
+        assert!(matches!(count, Error::Corrupt(_)), "count: {count}");
         store.close().unwrap();
     }
 
@@ -1054,6 +1056,13 @@ mod tests {
             json.to_string()
                 .contains("query response size limit exceeded"),
             "{json}"
+        );
+        let count = store.count(10, 20).unwrap_err();
+        assert!(
+            count
+                .to_string()
+                .contains("query response size limit exceeded"),
+            "{count}"
         );
         store.close().unwrap();
     }
