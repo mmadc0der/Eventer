@@ -7,6 +7,9 @@
 //! millisecond range. Repeat `eq=field=value` to AND equality filters into the scan.
 //! `limit` keeps the first matching rows and `offset` skips matches before that.
 //! Omitting both returns the full match set.
+//! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
+//! with the caller's `before_ms`. A block is removed only when its maximum
+//! timestamp is strictly less than that cutoff.
 
 use std::sync::Arc;
 
@@ -16,7 +19,7 @@ use axum::extract::{Query, RawQuery, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use eventer::Predicate;
 use serde::Deserialize;
@@ -31,6 +34,7 @@ pub fn router(store: Arc<eventer::Store>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/events", get(get_events).post(post_event))
+        .route("/events/drop", post(post_drop))
         .with_state(AppState { store })
 }
 
@@ -86,6 +90,40 @@ fn ingest(store: &eventer::Store, body: &[u8]) -> eventer::Result<Ingest> {
         store.append_json_durable(body)?;
         Ok(Ingest::One)
     }
+}
+
+async fn post_drop(State(state): State<AppState>, body: Bytes) -> Response {
+    let cutoff = match parse_before_ms(&body) {
+        Ok(cutoff) => cutoff,
+        Err(response) => return *response,
+    };
+    let store = Arc::clone(&state.store);
+    let joined = tokio::task::spawn_blocking(move || store.drop_blocks_before(cutoff)).await;
+    match joined {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Ok(Err(err)) => error_response(&err),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "drop task failed"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `before_ms` is the caller's cutoff, a signed integer in the `i64` range.
+/// A missing field, a non-integer, a JSON array, or any value that is not an
+/// object is rejected here so the store is not touched.
+fn parse_before_ms(body: &[u8]) -> std::result::Result<i64, Box<Response>> {
+    let value: Value = serde_json::from_slice(body).map_err(|err| bad_request(&err.to_string()))?;
+    let Some(object) = value.as_object() else {
+        return Err(bad_request("drop body must be a JSON object"));
+    };
+    let Some(before) = object.get("before_ms") else {
+        return Err(bad_request("missing `before_ms`"));
+    };
+    before
+        .as_i64()
+        .ok_or_else(|| bad_request("`before_ms` must be a signed integer"))
 }
 
 fn first_byte(body: &[u8]) -> Option<u8> {
@@ -760,13 +798,214 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[tokio::test]
+    async fn post_drop_removes_blocks_older_than_the_caller_cutoff() {
+        let (root, schema, data) = temp_store("drop-blocks");
+        let options = store_options(1, eventer::StoreOptions::default().segment_bytes);
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options.clone()).unwrap());
+        let app = router(Arc::clone(&store));
+
+        for ts in [1000, 2000, 3000] {
+            let (status, body) = post_json(
+                &app,
+                "/events",
+                &format!(r#"{{"ts":{ts},"action":"click","amount":"1.00"}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let (status, body) = post_json(&app, "/events/drop", r#"{"before_ms":1000}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": true}));
+        assert_eq!(timestamps_of(&app, 0, 9000).await, vec![1000, 2000, 3000]);
+
+        let (status, body) = post_json(&app, "/events/drop", r#"{"before_ms":1001}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": true}));
+        assert_eq!(timestamps_of(&app, 0, 9000).await, vec![2000, 3000]);
+
+        store.close().unwrap();
+        let reopened = Arc::new(eventer::Store::open_with(&data, &schema, options).unwrap());
+        let app = router(Arc::clone(&reopened));
+        assert_eq!(timestamps_of(&app, 0, 9000).await, vec![2000, 3000]);
+        reopened.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn post_drop_keeps_an_older_row_that_shares_a_live_block() {
+        let (root, schema, data) = temp_store("drop-shared");
+        let options = store_options(2, eventer::StoreOptions::default().segment_bytes);
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+
+        let (status, body) = post_json(
+            &app,
+            "/events",
+            r#"[{"ts":1000,"action":"click","amount":"1.00"},{"ts":3000,"action":"view","amount":"2.00"}]"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (status, body) = post_json(&app, "/events/drop", r#"{"before_ms":2000}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": true}));
+        assert_eq!(timestamps_of(&app, 0, 9000).await, vec![1000, 3000]);
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn post_drop_deletes_files_when_every_block_in_a_segment_is_expired() {
+        let (root, schema, data) = temp_store("drop-segment");
+        let options = store_options(1, 1);
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+
+        for ts in [1000, 2000] {
+            let (status, body) = post_json(
+                &app,
+                "/events",
+                &format!(r#"{{"ts":{ts},"action":"click","amount":"1.00"}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let expired = ["seg-000001.dat", "seg-000001.idx", "seg-000001.zon"];
+        for name in expired {
+            assert!(
+                data.join(name).is_file(),
+                "segment 1 should have {name} before the drop"
+            );
+        }
+        let dict = data.join("seg-000001.dict");
+
+        let (status, body) = post_json(&app, "/events/drop", r#"{"before_ms":1001}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"ok": true}));
+        for name in expired {
+            assert!(
+                !data.join(name).exists(),
+                "expired segment file still present: {name}"
+            );
+        }
+        assert!(!dict.exists(), "expired segment dictionary still present");
+        assert!(data.join("seg-000002.dat").is_file());
+        assert_eq!(timestamps_of(&app, 0, 9000).await, vec![2000]);
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn post_drop_rejects_a_bad_body_and_leaves_rows_in_place() {
+        let (root, schema, data) = temp_store("drop-reject");
+        let options = store_options(1, eventer::StoreOptions::default().segment_bytes);
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+
+        let (status, body) = post_json(
+            &app,
+            "/events",
+            r#"{"ts":1000,"action":"click","amount":"1.00"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = post_json(
+            &app,
+            "/events",
+            r#"{"ts":2000,"action":"view","amount":"2.00"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let rejected = [
+            "{}",
+            r#"{"before_ms":1.5}"#,
+            r#"{"before_ms":"1000"}"#,
+            r#"{"before_ms":null}"#,
+            r#"{"before_ms":true}"#,
+            r#"{"before_ms":9223372036854775808}"#,
+            "[]",
+            r#"[{"before_ms":1000}]"#,
+            "1000",
+            "null",
+            "true",
+            "not json",
+        ];
+        for payload in rejected {
+            let (status, body) = post_json(&app, "/events/drop", payload).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{payload} -> {body}");
+            assert!(body.is_object(), "{payload} body {body}");
+            assert!(body.get("error").is_some(), "{payload}");
+            assert_eq!(timestamps_of(&app, 0, 9000).await, vec![1000, 2000]);
+        }
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn temp_store(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-{label}-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let data = root.join("data");
+        (root, schema, data)
+    }
+
+    fn store_options(block_rows: usize, segment_bytes: u64) -> eventer::StoreOptions {
+        eventer::StoreOptions {
+            block_rows,
+            segment_bytes,
+            linger: Duration::from_millis(1),
+            parser_threads: 1,
+            compress_threads: 1,
+            ..eventer::StoreOptions::default()
+        }
+    }
+
+    async fn timestamps_of(app: &Router, from: i64, to: i64) -> Vec<i64> {
+        query(app, &format!("/events?from={from}&to={to}"))
+            .await
+            .iter()
+            .map(|row| row["ts"].as_i64().unwrap())
+            .collect()
+    }
+
     async fn post(app: &Router, body: &str) -> (StatusCode, Value) {
+        post_json(app, "/events", body).await
+    }
+
+    async fn post_json(app: &Router, uri: &str, body: &str) -> (StatusCode, Value) {
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/events")
+                    .uri(uri)
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
