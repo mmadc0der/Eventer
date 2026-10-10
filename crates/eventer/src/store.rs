@@ -180,9 +180,11 @@ impl Store {
     ///
     /// `offset` skips that many matching rows. `limit` of `None` returns the rest,
     /// and `Some(0)` is an error. Time bounds and predicates are applied before
-    /// the skip. A contained block with no predicates is skipped only after its
-    /// payload row count matches the frame header and every payload timestamp
-    /// is inside the query. Once `limit` rows have been collected, later blocks
+    /// the skip. A contained block with no predicates is skipped only when the
+    /// remaining offset covers its row count, the payload row count matches the
+    /// frame header, and every payload timestamp is inside the query. A timestamp
+    /// outside the query leaves the skip count unchanged. Once `limit` rows have
+    /// been collected, later blocks
     /// are not read. Order is ingest order.
     pub fn query_window(
         &self,
@@ -230,10 +232,13 @@ impl Store {
             require_header_row_count(block.row_count, nrows)?;
             if resolved.is_empty()
                 && contained
-                && every_timestamp_in_range(&self.schema, &payload, from_ms, to_ms)?
-                && skip_whole_block(offset, block.row_count, &mut skipped)
+                && offset_covers_block(offset, skipped, block.row_count)
             {
-                continue;
+                if every_timestamp_in_range(&self.schema, &payload, from_ms, to_ms)?
+                    && skip_whole_block(offset, block.row_count, &mut skipped)
+                {
+                    continue;
+                }
             }
             if whole && rows_out.len() + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
@@ -348,10 +353,13 @@ impl Store {
             require_header_row_count(block.row_count, nrows)?;
             if resolved.is_empty()
                 && contained
-                && every_timestamp_in_range(&self.schema, &payload, from_ms, to_ms)?
-                && skip_whole_block(offset, block.row_count, &mut skipped)
+                && offset_covers_block(offset, skipped, block.row_count)
             {
-                continue;
+                if every_timestamp_in_range(&self.schema, &payload, from_ms, to_ms)?
+                    && skip_whole_block(offset, block.row_count, &mut skipped)
+                {
+                    continue;
+                }
             }
             if whole && row_count + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
@@ -608,6 +616,12 @@ fn every_timestamp_in_range(
     Ok(timestamps
         .iter()
         .all(|ts| *ts >= from_ms && *ts <= to_ms))
+}
+
+/// The remaining offset covers every row in the block, so a timestamp scan can decide a skip.
+fn offset_covers_block(offset: u64, skipped: u64, block_rows: u32) -> bool {
+    let block_rows = u64::from(block_rows);
+    block_rows > 0 && offset.saturating_sub(skipped) >= block_rows
 }
 
 /// Skip a block whose every row is a match when those rows fall entirely inside the offset.
