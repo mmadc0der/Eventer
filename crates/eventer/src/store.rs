@@ -559,12 +559,13 @@ impl Store {
     /// and does not put a store at `destination`. The rewritten store is written
     /// in a private directory and published after the flush. When `destination`
     /// does not exist yet, that directory is renamed into place. When
-    /// `destination` already exists, the private directory is created inside it
-    /// and the finished files are moved in after they are fsynced, with
-    /// `schema.lock` last. A crash during that move can leave segment files
-    /// in `destination` with no `schema.lock`. Opening that directory fails,
-    /// so the incomplete copy is not a store. A rename error moves the files
-    /// that already landed back out, leaving `destination` empty.
+    /// `destination` already exists, a marker file is created there before the
+    /// private directory. The finished files are moved in after they are
+    /// fsynced, with `schema.lock` last. The marker is removed only after that
+    /// lock is in place and the destination directory is fsynced. Opening the
+    /// destination while the marker is present fails and does not create
+    /// `schema.lock`. A rename or fsync error moves the published names back
+    /// and removes the marker, leaving `destination` empty.
     ///
     /// The report uses the same totals as [`Store::stats`]: `stored_data_bytes`
     /// is segment data plus dictionary sidecars, and `stored_index_bytes` is
@@ -622,6 +623,12 @@ impl Store {
         let source_bytes = directory_stored_bytes(&source_abs)?;
         let schema = schema::load_schema(&source_abs.join("schema.lock"))?;
         let destination_existed = destination_abs.exists();
+        let marker = if destination_existed {
+            write_rewrite_marker(&destination_abs)?;
+            Some(RemoveRewriteMarker::new(destination_abs.clone()))
+        } else {
+            None
+        };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(Error::io)?
@@ -656,6 +663,9 @@ impl Store {
                         ));
                     }
                     publish_directory(&staging, &destination_abs, destination_existed)?;
+                    if let Some(marker) = marker {
+                        marker.disarm();
+                    }
                     return Ok(RewriteReport {
                         source: source_bytes,
                         destination: destination_bytes,
@@ -1018,9 +1028,9 @@ fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
     let path = dir.join("schema.lock");
     let canonical = schema.canonical();
     if !path.exists() {
-        if directory_has_segment_data(dir)? {
+        if dir.join(REWRITE_INCOMPLETE_MARKER).is_file() {
             return Err(Error::corrupt(
-                "directory contains segment data but has no schema.lock",
+                "directory contains an unfinished rewrite and has no schema.lock",
             ));
         }
         write_schema_lock(&path, &canonical)?;
@@ -1130,24 +1140,50 @@ fn directory_has_entries(dir: &Path) -> Result<bool> {
     Ok(fs::read_dir(dir)?.next().is_some())
 }
 
-fn directory_has_segment_data(dir: &Path) -> Result<bool> {
-    if !dir.exists() {
-        return Ok(false);
+/// Present from the moment an existing destination starts a rewrite until
+/// `schema.lock` is in place and that directory has been fsynced.
+const REWRITE_INCOMPLETE_MARKER: &str = "eventer-rewrite.incomplete";
+
+fn write_rewrite_marker(dir: &Path) -> Result<()> {
+    let path = dir.join(REWRITE_INCOMPLETE_MARKER);
+    {
+        let mut file = fs::File::create(&path).map_err(Error::io)?;
+        file.write_all(b"incomplete\n").map_err(Error::io)?;
+        file.sync_all().map_err(Error::io)?;
     }
-    for entry in fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        let name = name.to_string_lossy();
-        let Some(rest) = name.strip_prefix("seg-") else {
-            continue;
-        };
-        let Some(id) = rest.strip_suffix(".dat") else {
-            continue;
-        };
-        if id.len() == 6 && id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Ok(true);
+    fsync_dir(dir)
+}
+
+fn remove_rewrite_marker(dir: &Path) -> Result<()> {
+    let path = dir.join(REWRITE_INCOMPLETE_MARKER);
+    if path.exists() {
+        fs::remove_file(&path).map_err(Error::io)?;
+        fsync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Deletes the rewrite marker unless [`RemoveRewriteMarker::disarm`] ran.
+struct RemoveRewriteMarker {
+    dir: Option<PathBuf>,
+}
+
+impl RemoveRewriteMarker {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir: Some(dir) }
+    }
+
+    fn disarm(mut self) {
+        self.dir.take();
+    }
+}
+
+impl Drop for RemoveRewriteMarker {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            let _ = remove_rewrite_marker(&dir);
         }
     }
-    Ok(false)
 }
 
 fn directory_holds_store(dir: &Path) -> Result<bool> {
@@ -1481,11 +1517,11 @@ fn fsync_file(path: &Path) -> Result<()> {
 }
 
 /// Move finished store files from `staging` into an existing `destination`.
-/// `schema.lock` is last. A crash before that rename leaves segment files
-/// without a lock, and [`Store::open`] refuses that directory. A rename
-/// error puts the files that already landed back into `staging`, so
-/// `destination` stays empty. `rename` of the staging directory itself is
-/// not used: onto a mount point it returns `EBUSY`.
+/// `schema.lock` is last. The incomplete-rewrite marker stays until that
+/// lock is in place and `destination` has been fsynced, then it is removed.
+/// A rename or fsync error puts the published names back into `staging` and
+/// removes the marker, so `destination` stays empty. `rename` of the staging
+/// directory itself is not used: onto a mount point it returns `EBUSY`.
 fn publish_into_existing_directory(staging: &Path, destination: &Path) -> Result<()> {
     let mut files = Vec::new();
     for entry in fs::read_dir(staging)? {
@@ -1534,19 +1570,30 @@ fn publish_into_existing_directory(staging: &Path, destination: &Path) -> Result
     let mut moved = Vec::new();
     for name in &files {
         if rewrite_publish_rename_should_fail() {
-            return rollback_published_files(&moved, staging, destination).and(Err(Error::io(
+            return abort_existing_publish(&moved, staging, destination).and(Err(Error::io(
                 "publish rename failed before the rewritten store was complete",
             )));
         }
         match fs::rename(staging.join(name), destination.join(name)) {
             Ok(()) => moved.push(name.clone()),
             Err(err) => {
-                return rollback_published_files(&moved, staging, destination)
-                    .and(Err(Error::io(err)));
+                return abort_existing_publish(&moved, staging, destination).and(Err(Error::io(err)));
             }
         }
     }
-    fsync_dir(destination)
+    if let Err(err) = fsync_dir(destination) {
+        return abort_existing_publish(&moved, staging, destination).and(Err(err));
+    }
+    remove_rewrite_marker(destination)
+}
+
+fn abort_existing_publish(
+    moved: &[std::ffi::OsString],
+    staging: &Path,
+    destination: &Path,
+) -> Result<()> {
+    rollback_published_files(moved, staging, destination)?;
+    remove_rewrite_marker(destination)
 }
 
 fn rollback_published_files(
@@ -4562,19 +4609,33 @@ mod tests {
     }
 
     #[test]
-    fn open_refuses_segment_data_without_a_schema_lock() {
+    fn open_refuses_an_unfinished_rewrite_and_still_opens_segment_files() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
         let data = dir.path().join("data");
         fs::create_dir(&data).unwrap();
-        fs::write(data.join("seg-000001.dat"), b"partial").unwrap();
+        fs::write(data.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        let staging = data.join("eventer-rewrite-1-1").join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("seg-000001.dat"), b"partial").unwrap();
         let err = match Store::open(&data, &schema) {
-            Ok(_) => panic!("opened a directory that has segment data and no schema.lock"),
+            Ok(_) => panic!("opened a directory that still has the rewrite marker"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("no schema.lock"), "{err}");
+        assert!(err.to_string().contains("unfinished rewrite"), "{err}");
         assert!(!data.join("schema.lock").exists());
-        assert_eq!(fs::read(data.join("seg-000001.dat")).unwrap(), b"partial");
+        assert_eq!(
+            fs::read(staging.join("seg-000001.dat")).unwrap(),
+            b"partial"
+        );
+
+        let legacy = dir.path().join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("seg-000001.dat"), b"partial").unwrap();
+        let parsed = parse_schema(SCHEMA_JSON).unwrap();
+        schema_lock_action(&legacy, &parsed).unwrap();
+        assert!(legacy.join("schema.lock").is_file());
+        assert_eq!(fs::read(legacy.join("seg-000001.dat")).unwrap(), b"partial");
 
         let fresh = dir.path().join("fresh");
         let store = Store::open(&fresh, &schema).unwrap();
