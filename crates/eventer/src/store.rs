@@ -614,28 +614,22 @@ impl Store {
         }
 
         let source_bytes = directory_stored_bytes(&source_abs)?;
-        let scratch = RemoveOnDrop::new(scratch_dir("eventer-rewrite")?);
+        let scratch = RemoveOnDrop::new(scratch_dir("eventer-rewrite", &source_abs, &destination_abs)?);
         let source_copy = scratch.path().join("source");
-        copy_dir_all(&source_abs, &source_copy)?;
+        copy_store_files(&source_abs, &source_copy)?;
 
         let opened = Store::open(&source_copy, source_copy.join("schema.lock"))?;
         let schema = opened.schema().clone();
-        let events = opened.events_in_ingest_order()?;
-        opened.close()?;
-        for event in &events {
-            value::parse_event(&schema, event)?;
-        }
 
         let staging = scratch.path().join("staging");
         let schema_file = scratch.path().join("schema.json");
         fs::write(&schema_file, schema.canonical())?;
         let destination_store = Store::open(&staging, &schema_file)?;
-        for event in &events {
-            destination_store.append_json(event)?;
-        }
+        let copied_rows = opened.append_decoded_blocks(&destination_store)?;
+        opened.close()?;
         destination_store.flush()?;
         let stats = destination_store.stats();
-        if stats.rows != events.len() as u64 {
+        if stats.rows != copied_rows {
             return Err(Error::corrupt(
                 "rewritten directory row count does not match the source",
             ));
@@ -760,8 +754,11 @@ impl Store {
             .unwrap_or_else(|err| err.into_inner())
     }
 
-    /// JSON for every stored row, in segment and block order.
-    fn events_in_ingest_order(&self) -> Result<Vec<Vec<u8>>> {
+    /// Decode one block at a time and queue those rows on `destination`.
+    ///
+    /// Rows stay as decoded values. They are not serialized back to JSON, so
+    /// the ingest size cap does not apply to a directory that already opened.
+    fn append_decoded_blocks(&self, destination: &Store) -> Result<u64> {
         let blocks: Vec<segment::BlockMeta> = {
             let catalog = self.catalog();
             catalog
@@ -771,16 +768,17 @@ impl Store {
                 .collect()
         };
         let mut dictionaries = HashMap::new();
-        let mut events = Vec::new();
+        let mut copied = 0u64;
         for block in &blocks {
             let payload = self.read_block_bytes(block, &mut dictionaries)?;
             let rows = crate::codec::decode_block(&self.schema, &payload)?;
             require_header_row_count(block.row_count, rows.len())?;
-            for row in &rows {
-                events.push(row_to_json_bytes(&self.schema, row)?);
+            for row in rows {
+                destination.pipeline.append_row(row)?;
+                copied += 1;
             }
         }
-        Ok(events)
+        Ok(copied)
     }
 }
 
@@ -1051,6 +1049,22 @@ fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
 #[cfg(test)]
 thread_local! {
     static REWRITE_FAIL_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REWRITE_COPY_ACROSS_DEVICES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn rewrite_should_copy_across_devices() -> bool {
+    #[cfg(test)]
+    {
+        REWRITE_COPY_ACROSS_DEVICES.with(|flag| {
+            let copy = flag.get();
+            flag.set(false);
+            copy
+        })
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 fn rewrite_should_fail_before_publish() -> bool {
@@ -1162,60 +1176,230 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || right.starts_with(left) || left.starts_with(right)
 }
 
-fn scratch_dir(prefix: &str) -> Result<PathBuf> {
+fn scratch_dir(prefix: &str, source: &Path, destination: &Path) -> Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(Error::io)?
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&path)?;
-    Ok(path)
+    let name = format!("{prefix}-{}-{nanos}", std::process::id());
+    let mut bases = vec![std::env::temp_dir()];
+    if let Some(parent) = destination.parent() {
+        if !parent.as_os_str().is_empty() {
+            bases.push(parent.to_path_buf());
+        }
+    }
+    if let Some(parent) = source.parent() {
+        if !parent.as_os_str().is_empty() {
+            bases.push(parent.to_path_buf());
+        }
+    }
+    scratch_dir_in(&bases, &name, source, destination)
+}
+
+fn scratch_dir_in(
+    bases: &[PathBuf],
+    name: &str,
+    source: &Path,
+    destination: &Path,
+) -> Result<PathBuf> {
+    let mut last_error = None;
+    for base in bases {
+        if !base.exists() {
+            continue;
+        }
+        let base = match base.canonicalize() {
+            Ok(path) => path,
+            Err(err) => {
+                last_error = Some(Error::io(err));
+                continue;
+            }
+        };
+        let path = base.join(&name);
+        if paths_overlap(&path, source) || paths_overlap(&path, destination) {
+            continue;
+        }
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => last_error = Some(Error::io(err)),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        Error::io(
+            "could not create a scratch directory outside the source and the destination",
+        )
+    }))
 }
 
 struct RemoveOnDrop {
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 impl RemoveOnDrop {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path: Some(path) }
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        self.path.as_deref().unwrap_or(Path::new(""))
+    }
+
+    fn disarm(&mut self) {
+        self.path.take();
     }
 }
 
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_dir_all(path);
+        }
     }
 }
 
-fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir_all(to)?;
+fn is_store_file(name: &str) -> bool {
+    if name == "schema.lock" {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("seg-") else {
+        return false;
+    };
+    let Some((id, ext)) = rest.split_once('.') else {
+        return false;
+    };
+    id.len() == 6
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(ext, "dat" | "idx" | "dict" | "zon")
+}
+
+/// Copy the flat segment files. Subdirectories are not walked.
+fn copy_store_files(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
-        let target = to.join(entry.file_name());
+        if file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_store_file(&name) {
+            continue;
+        }
         if file_type.is_symlink() {
             return Err(Error::io(format!(
                 "refusing to copy symlink {}",
                 entry.path().display()
             )));
         }
-        if file_type.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &target)?;
-        } else {
+        if !file_type.is_file() {
             return Err(Error::io(format!(
                 "unsupported file in store directory: {}",
                 entry.path().display()
             )));
         }
+        let target = to.join(entry.file_name());
+        fs::copy(entry.path(), &target)?;
     }
     Ok(())
+}
+
+fn fsync_dir(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(Error::io)
+}
+
+/// Copy store files into `to`, which must already exist and be empty.
+/// Each file and `to` itself are fsynced. An extra name in `to` is an error.
+fn copy_store_files_synced(from: &Path, to: &Path) -> Result<()> {
+    let mut copied = Vec::new();
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !is_store_file(&name) {
+            continue;
+        }
+        if file_type.is_symlink() {
+            return Err(Error::io(format!(
+                "refusing to copy symlink {}",
+                entry.path().display()
+            )));
+        }
+        if !file_type.is_file() {
+            return Err(Error::io(format!(
+                "unsupported file in store directory: {}",
+                entry.path().display()
+            )));
+        }
+        let target = to.join(&file_name);
+        if target.exists() {
+            return Err(Error::io(format!(
+                "publish directory already contains {}",
+                target.display()
+            )));
+        }
+        fs::copy(entry.path(), &target)?;
+        fs::File::options()
+            .write(true)
+            .open(&target)
+            .and_then(|file| file.sync_all())
+            .map_err(Error::io)?;
+        copied.push(file_name);
+    }
+    for entry in fs::read_dir(to)? {
+        let name = entry?.file_name();
+        if !copied.iter().any(|copied| copied == &name) {
+            return Err(Error::io(format!(
+                "publish directory contains {} which was not copied",
+                name.to_string_lossy()
+            )));
+        }
+    }
+    fsync_dir(to)
+}
+
+fn exclusive_publish_dir(destination: &Path) -> Result<PathBuf> {
+    let parent = destination.parent().filter(|parent| !parent.as_os_str().is_empty());
+    let parent = match parent {
+        Some(parent) => parent,
+        None => {
+            return Err(Error::io(format!(
+                "destination {} has no parent directory",
+                destination.display()
+            )))
+        }
+    };
+    let dest_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("store");
+    for _ in 0..8 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(Error::io)?
+            .as_nanos();
+        let sibling = parent.join(format!(
+            ".{dest_name}-publish-{}-{nanos}",
+            std::process::id()
+        ));
+        if paths_overlap(&sibling, destination) {
+            continue;
+        }
+        match fs::create_dir(&sibling) {
+            Ok(()) => return Ok(sibling),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(Error::io(err)),
+        }
+    }
+    Err(Error::io(
+        "could not create an exclusive directory to publish the rewritten store",
+    ))
 }
 
 fn publish_directory(staging: &Path, destination: &Path) -> Result<()> {
@@ -1224,24 +1408,23 @@ fn publish_directory(staging: &Path, destination: &Path) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
     }
-    match fs::rename(staging, destination) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
-            let sibling = destination.with_file_name(format!(
-                ".{}-publish-{}",
-                destination
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("store"),
-                std::process::id()
-            ));
-            let _cleanup = RemoveOnDrop::new(sibling.clone());
-            copy_dir_all(staging, &sibling)?;
-            fs::rename(&sibling, destination)?;
-            Ok(())
+    let cross_device = cfg!(test) && rewrite_should_copy_across_devices();
+    if !cross_device {
+        match fs::rename(staging, destination) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {}
+            Err(err) => return Err(Error::io(err)),
         }
-        Err(err) => Err(Error::io(err)),
     }
+    let sibling = exclusive_publish_dir(destination)?;
+    let mut cleanup = RemoveOnDrop::new(sibling.clone());
+    copy_store_files_synced(staging, &sibling)?;
+    if let Some(parent) = sibling.parent() {
+        fsync_dir(parent)?;
+    }
+    fs::rename(&sibling, destination)?;
+    cleanup.disarm();
+    Ok(())
 }
 
 fn write_schema_lock(path: &Path, canonical: &str) -> Result<()> {
@@ -4134,5 +4317,78 @@ mod tests {
             snapshot_tree(&data).get("seg-000001.dat").unwrap(),
             &segment
         );
+    }
+
+    #[test]
+    fn rewrite_directory_keeps_a_row_that_reserializes_past_the_ingest_cap() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        let empty = event(1, None, "click", Some(""), "1");
+        let note = "n".repeat(1024 * 1024 - empty.len());
+        let raw = event(1, None, "click", Some(&note), "1");
+        assert!(raw.len() <= 1024 * 1024, "fixture is {}", raw.len());
+        store.append_json(&raw).unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 1);
+        let rows = opened.query(i64::MIN, i64::MAX).unwrap();
+        let amount = &rows[0].values[6];
+        assert!(matches!(amount, Scalar::Decimal(_)), "{amount:?}");
+        opened.close().unwrap();
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+    }
+
+    #[test]
+    fn scratch_dir_is_created_outside_the_source_when_temp_is_the_source() {
+        let dir = TempDir::new();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let destination = dir.path().join("destination");
+        let bases = vec![source.clone(), dir.path().to_path_buf()];
+        let created = scratch_dir_in(&bases, "eventer-rewrite-test", &source, &destination).unwrap();
+        assert_eq!(created.parent(), Some(dir.path()));
+        assert!(!created.starts_with(&source));
+        let _ = fs::remove_dir_all(&created);
+        assert!(!source.join("eventer-rewrite-test").exists());
+    }
+
+    #[test]
+    fn publish_across_devices_does_not_keep_a_precreated_sibling() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+        let dest = dir.path().join("rewritten");
+        let planted = dir.path().join(format!(
+            ".rewritten-publish-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&planted).unwrap();
+        fs::write(planted.join("seg-000099.dat"), b"leftover").unwrap();
+
+        REWRITE_COPY_ACROSS_DEVICES.with(|flag| flag.set(true));
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(planted.join("seg-000099.dat").is_file());
+        assert!(!dest.join("seg-000099.dat").exists());
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 1);
+        opened.close().unwrap();
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        let _ = fs::remove_dir_all(&planted);
     }
 }
