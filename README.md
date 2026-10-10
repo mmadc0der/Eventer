@@ -56,7 +56,7 @@ mkdir -p data
 cargo run -p eventer-server -- --data ./data --schema examples/schema.json --bind 127.0.0.1:43123
 ```
 
-`POST /events` takes one JSON object and returns after that event is fsynced.
+`POST /events` takes one JSON object, or a JSON array of objects, and returns after that write is fsynced. An object responds with `{"ok":true}`. An array is validated in full before any row is queued, then stored with one fsync, and responds with `{"ok":true,"count":N}`. An empty array, or an array containing a value that is not an object or does not match the schema, is rejected and leaves the store unchanged.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:43123/events \
@@ -64,7 +64,7 @@ curl -sS -X POST http://127.0.0.1:43123/events \
   --data '{"ts":1700000000000,"user_id":7,"score":1.5,"ok":true,"action":"click","note":"demo","amount":"19.99","props":{"plan":"pro","flags":["a",1]}}'
 ```
 
-`GET /events?from=&to=` returns a JSON array. `from` and `to` are inclusive unix milliseconds. Repeat `eq=field=value` to keep rows where that column equals the value. Filters are AND-ed. Blocks the zone map can reject are not read; the rest are filtered while they are decoded.
+`GET /events?from=&to=` returns a JSON array. `from` and `to` are inclusive unix milliseconds. Repeat `eq=field=value` to keep rows where that column equals the value. Filters are AND-ed. Blocks the zone map can reject are not read; the rest are filtered while they are decoded. `limit` is a positive integer: the response is the first that many matching rows, in ingest order. `offset` is a non-negative integer and skips that many matching rows before `limit` is applied. `offset` without `limit` returns the rest, and an offset past the last match returns `[]`. Omitting both returns every match. `limit=0`, a negative limit, a negative offset, or a non-integer is status `400`.
 
 ```bash
 curl -sS 'http://127.0.0.1:43123/events?from=1700000000000&to=1700000000000'
@@ -129,8 +129,8 @@ Stored size was identical across the runs (394,005 data bytes, 49 blocks, one se
 
 ## Rust API
 
-`Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced; the HTTP `POST` uses it. `Store::query(from_ms, to_ms)` returns matching [`Row`] values in ingest order; use [`RowSerializable`] or [`row_to_json_bytes`] when you need the original JSON lexemes (including duplicate keys). `Store::query_json` returns the same data as one JSON array for HTTP.
+`Store::append_json` queues an event. `Store::flush` and `Store::query` make queued events durable and visible. `Store::append_json_durable` waits until that event's block is fsynced. `Store::append_json_batch_durable` parses every event before queueing any of them, then fsyncs the batch once. A one-object HTTP `POST` uses the single-event path. An array `POST` uses the batch path. `Store::query(from_ms, to_ms)` returns matching [`Row`] values in ingest order; use [`RowSerializable`] or [`row_to_json_bytes`] when you need the original JSON lexemes (including duplicate keys). `Store::query_json` returns the same data as one JSON array for HTTP.
 
-`Store::query_with_filter` adds equality predicates. Several predicates are AND-ed. `Predicate::Eq("type".into(), "assistant".into())` keeps one value. `Predicate::In` keeps any listed value. `Scalar::Null` matches null. The zone map skips a block that cannot contain those values. A block that is read, and whose filter column is a constant or dictionary that does not contain the value, is not fully decoded, so later text columns stay unread. The C equivalent is `eventer_query_filtered` for one string or text column.
+`Store::query_with_filter` adds equality predicates. Several predicates are AND-ed. `Predicate::Eq("type".into(), "assistant".into())` keeps one value. `Predicate::In` keeps any listed value. `Scalar::Null` matches null. The zone map skips a block that cannot contain those values. A block that is read, and whose filter column is a constant or dictionary that does not contain the value, is not fully decoded, so later text columns stay unread. The C equivalent is `eventer_query_filtered` for one string or text column. `Store::query_window` and `Store::query_json_window` apply the same filters, then skip `offset` matches and stop after `limit` rows. The HTTP `limit` and `offset` parameters use that path. The C query functions are unchanged.
 
 `Store::drop_blocks_before(cutoff_ms)` deletes blocks whose maximum timestamp is strictly less than `cutoff_ms`. The cutoff is an argument, not the newest timestamp stored, so one future event cannot expire the table. A block is kept or dropped as a whole: a row older than the cutoff stays when a later row in the same block is still inside the window. A segment file (`.dat`, `.idx`, `.zon`, and `.dict`) is removed only when every block in it is eligible. A mixed segment is rewritten by copying the surviving compressed frames unchanged and publishing that file with `rename`, so a crash leaves either the old segment or the new one. The segment dictionary stays when any surviving frame was compressed with it. After the call, a query no longer returns a row from a block whose maximum timestamp is below the cutoff, including after the directory is opened again. Rows that shared a kept block stay.

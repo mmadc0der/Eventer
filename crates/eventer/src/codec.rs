@@ -1267,7 +1267,7 @@ fn decode_column(
     Ok(column)
 }
 
-fn read_timestamp_column(schema: &Schema, bytes: &[u8]) -> Result<Vec<i64>> {
+pub(crate) fn read_timestamp_column(schema: &Schema, bytes: &[u8]) -> Result<Vec<i64>> {
     let nrows = block_row_count(bytes)?;
     let mut cursor = 4;
     for (index, field) in schema.fields.iter().enumerate() {

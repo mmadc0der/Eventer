@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::codec::{block_row_count, decode_rows_in_range_filtered, ColumnPredicate};
+use crate::codec::{
+    block_row_count, decode_rows_in_range_filtered, read_timestamp_column, ColumnPredicate,
+};
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, Schema};
@@ -128,6 +130,22 @@ impl Store {
         self.pipeline.append(json, true)
     }
 
+    /// Parse every event, queue the batch, and fsync it once.
+    ///
+    /// Each event is checked against the schema before any of them is queued.
+    /// An empty batch is an error and does not touch the pipeline. The writer
+    /// fsyncs when the last event's block is committed, so earlier events in the
+    /// same batch share that sync.
+    pub fn append_json_batch_durable(&self, events: &[impl AsRef<[u8]>]) -> Result<()> {
+        if events.is_empty() {
+            return Err(Error::event("event batch must not be empty"));
+        }
+        for event in events {
+            value::parse_event(&self.schema, event.as_ref())?;
+        }
+        self.pipeline.append_batch_durable(events)
+    }
+
     /// Force a partial block out and fsync it.
     pub fn flush(&self) -> Result<()> {
         self.pipeline.flush()
@@ -155,6 +173,30 @@ impl Store {
         to_ms: i64,
         predicates: &[Predicate],
     ) -> Result<Vec<Row>> {
+        self.query_window(from_ms, to_ms, predicates, 0, None)
+    }
+
+    /// Same match set as [`Store::query_with_filter`], then skip and limit.
+    ///
+    /// `offset` skips that many matching rows. `limit` of `None` returns the rest,
+    /// and `Some(0)` is an error. Time bounds and predicates are applied before
+    /// the skip. A contained block with no predicates is skipped only when the
+    /// remaining offset covers its row count, the payload row count matches the
+    /// frame header, and every payload timestamp is inside the query. A timestamp
+    /// outside the query leaves the skip count unchanged. Once `limit` rows have
+    /// been collected, later blocks
+    /// are not read. Order is ingest order.
+    pub fn query_window(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        offset: u64,
+        limit: Option<u64>,
+    ) -> Result<Vec<Row>> {
+        if limit == Some(0) {
+            return Err(Error::event("query limit must be a positive integer"));
+        }
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(Vec::new());
         };
@@ -162,19 +204,43 @@ impl Store {
         let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut rows_out = Vec::new();
         let mut response_bytes = 1usize;
+        let mut skipped = 0u64;
         let mut dictionaries = HashMap::new();
         for block in blocks {
+            if window_full(limit, rows_out.len()) {
+                break;
+            }
             if rows_out.len() >= MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(response_bytes)?;
             let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
-            if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
+            let whole = returns_whole_block(
+                resolved.is_empty(),
+                contained,
+                skipped,
+                offset,
+                limit,
+                rows_out.len(),
+                block.row_count,
+            );
+            if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
-            if resolved.is_empty() && contained && rows_out.len() + nrows > MAX_QUERY_ROWS {
+            require_header_row_count(block.row_count, nrows)?;
+            if resolved.is_empty()
+                && contained
+                && offset_covers_block(offset, skipped, block.row_count)
+            {
+                if every_timestamp_in_range(&self.schema, &payload, from_ms, to_ms)?
+                    && skip_whole_block(offset, block.row_count, &mut skipped)
+                {
+                    continue;
+                }
+            }
+            if whole && rows_out.len() + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
             let rows = decode_rows_in_range_filtered(
@@ -185,8 +251,17 @@ impl Store {
                 string_budget,
                 &resolved,
             )?;
+            let mut page_done = false;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
+                    match take_match(offset, limit, &mut skipped, rows_out.len()) {
+                        Take::Skip => continue,
+                        Take::Done => {
+                            page_done = true;
+                            break;
+                        }
+                        Take::Keep => {}
+                    }
                     if rows_out.len() >= MAX_QUERY_ROWS {
                         return Err(Error::event("query row limit exceeded"));
                     }
@@ -208,6 +283,9 @@ impl Store {
                     rows_out.push(row);
                 }
             }
+            if page_done {
+                break;
+            }
         }
         Ok(rows_out)
     }
@@ -224,6 +302,21 @@ impl Store {
         to_ms: i64,
         predicates: &[Predicate],
     ) -> Result<Vec<u8>> {
+        self.query_json_window(from_ms, to_ms, predicates, 0, None)
+    }
+
+    /// Same as [`Store::query_window`], encoded as one JSON array.
+    pub fn query_json_window(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        offset: u64,
+        limit: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        if limit == Some(0) {
+            return Err(Error::event("query limit must be a positive integer"));
+        }
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(b"[]".to_vec());
         };
@@ -232,19 +325,43 @@ impl Store {
         let mut out = Vec::from(b"[");
         let mut wrote = false;
         let mut row_count = 0usize;
+        let mut skipped = 0u64;
         let mut dictionaries = HashMap::new();
         for block in blocks {
+            if window_full(limit, row_count) {
+                break;
+            }
             if row_count >= MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(out.len())?;
             let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
-            if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
+            let whole = returns_whole_block(
+                resolved.is_empty(),
+                contained,
+                skipped,
+                offset,
+                limit,
+                row_count,
+                block.row_count,
+            );
+            if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
-            if resolved.is_empty() && contained && row_count + nrows > MAX_QUERY_ROWS {
+            require_header_row_count(block.row_count, nrows)?;
+            if resolved.is_empty()
+                && contained
+                && offset_covers_block(offset, skipped, block.row_count)
+            {
+                if every_timestamp_in_range(&self.schema, &payload, from_ms, to_ms)?
+                    && skip_whole_block(offset, block.row_count, &mut skipped)
+                {
+                    continue;
+                }
+            }
+            if whole && row_count + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
             let rows = decode_rows_in_range_filtered(
@@ -255,8 +372,17 @@ impl Store {
                 string_budget,
                 &resolved,
             )?;
+            let mut page_done = false;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
+                    match take_match(offset, limit, &mut skipped, row_count) {
+                        Take::Skip => continue,
+                        Take::Done => {
+                            page_done = true;
+                            break;
+                        }
+                        Take::Keep => {}
+                    }
                     if row_count >= MAX_QUERY_ROWS {
                         return Err(Error::event("query row limit exceeded"));
                     }
@@ -277,6 +403,9 @@ impl Store {
                     row_count += 1;
                     out.extend_from_slice(&row_bytes);
                 }
+            }
+            if page_done {
+                break;
             }
         }
         out.push(b']');
@@ -433,6 +562,97 @@ fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<Vec<C
         }
     }
     Ok(grouped)
+}
+
+enum Take {
+    Skip,
+    Keep,
+    Done,
+}
+
+fn window_full(limit: Option<u64>, emitted: usize) -> bool {
+    limit.is_some_and(|limit| emitted as u64 >= limit)
+}
+
+fn take_match(offset: u64, limit: Option<u64>, skipped: &mut u64, emitted: usize) -> Take {
+    if *skipped < offset {
+        *skipped += 1;
+        return Take::Skip;
+    }
+    if window_full(limit, emitted) {
+        Take::Done
+    } else {
+        Take::Keep
+    }
+}
+
+/// The frame header's uncompressed length is not covered by the payload CRC.
+/// Every read refuses a length above [`MAX_QUERY_BYTES`]. A block that will be
+/// returned in full also refuses a length the shrinking response budget cannot hold.
+fn block_exceeds_read_budget(uncompressed_len: u32, whole: bool, string_budget: usize) -> bool {
+    let declared = uncompressed_len as usize;
+    declared > MAX_QUERY_BYTES || (whole && declared > string_budget)
+}
+
+/// `block.row_count` is the frame header. The payload CRC does not cover it.
+fn require_header_row_count(header_rows: u32, payload_rows: usize) -> Result<()> {
+    if payload_rows != header_rows as usize {
+        return Err(Error::corrupt(
+            "block row count does not match the frame header",
+        ));
+    }
+    Ok(())
+}
+
+/// Index min/max can claim a block is inside the query while a payload timestamp is not.
+/// A null or undecodable timestamp is [`Error::Corrupt`], the same error a row decode returns.
+fn every_timestamp_in_range(
+    schema: &Schema,
+    payload: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<bool> {
+    let timestamps = read_timestamp_column(schema, payload)?;
+    Ok(timestamps.iter().all(|ts| *ts >= from_ms && *ts <= to_ms))
+}
+
+/// The remaining offset covers every row in the block, so a timestamp scan can decide a skip.
+fn offset_covers_block(offset: u64, skipped: u64, block_rows: u32) -> bool {
+    let block_rows = u64::from(block_rows);
+    block_rows > 0 && offset.saturating_sub(skipped) >= block_rows
+}
+
+/// Skip a block whose every row is a match when those rows fall entirely inside the offset.
+fn skip_whole_block(offset: u64, block_rows: u32, skipped: &mut u64) -> bool {
+    let block_rows = u64::from(block_rows);
+    if block_rows == 0 {
+        return false;
+    }
+    let remaining = offset.saturating_sub(*skipped);
+    if remaining >= block_rows {
+        *skipped += block_rows;
+        true
+    } else {
+        false
+    }
+}
+
+fn returns_whole_block(
+    unfiltered: bool,
+    contained: bool,
+    skipped: u64,
+    offset: u64,
+    limit: Option<u64>,
+    emitted: usize,
+    block_rows: u32,
+) -> bool {
+    if !unfiltered || !contained || skipped < offset {
+        return false;
+    }
+    match limit {
+        None => true,
+        Some(limit) => limit.saturating_sub(emitted as u64) >= u64::from(block_rows),
+    }
 }
 
 fn remaining_query_bytes(produced: usize) -> Result<usize> {
@@ -647,6 +867,237 @@ mod tests {
     }
 
     #[test]
+    fn query_window_skips_and_limits_in_ingest_order() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, action) in [
+            (10, "click"),
+            (20, "view"),
+            (30, "click"),
+            (40, "view"),
+            (50, "click"),
+        ] {
+            store
+                .append_json(&event(ts, Some(ts), action, None, "1.00"))
+                .unwrap();
+        }
+
+        let timestamps = |bytes: &[u8]| -> Vec<i64> {
+            serde_json::from_slice::<Vec<serde_json::Value>>(bytes)
+                .unwrap()
+                .into_iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect()
+        };
+
+        let all = store.query_json_window(10, 50, &[], 0, None).unwrap();
+        assert_eq!(timestamps(&all), vec![10, 20, 30, 40, 50]);
+        assert_eq!(
+            timestamps(&store.query_json_window(10, 50, &[], 0, Some(2)).unwrap()),
+            vec![10, 20]
+        );
+        assert_eq!(
+            timestamps(&store.query_json_window(10, 50, &[], 2, Some(2)).unwrap()),
+            vec![30, 40]
+        );
+        assert_eq!(
+            timestamps(&store.query_json_window(10, 50, &[], 4, None).unwrap()),
+            vec![50]
+        );
+        assert_eq!(
+            store.query_json_window(10, 50, &[], 5, None).unwrap(),
+            b"[]"
+        );
+        assert_eq!(
+            timestamps(&store.query_json_window(20, 40, &[], 0, Some(2)).unwrap()),
+            vec![20, 30]
+        );
+        let clicks = store
+            .query_json_window(
+                10,
+                50,
+                &[Predicate::Eq("action".into(), "click".into())],
+                0,
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(timestamps(&clicks), vec![10, 30]);
+        assert!(store
+            .query_json_window(10, 50, &[], 0, Some(0))
+            .unwrap_err()
+            .to_string()
+            .contains("positive integer"));
+
+        assert!(store.stats().blocks >= 3);
+        store.close().unwrap();
+
+        let reopened = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        assert_eq!(
+            timestamps(&reopened.query_json_window(10, 50, &[], 0, Some(2)).unwrap()),
+            vec![10, 20]
+        );
+        assert_eq!(
+            timestamps(&reopened.query_json_window(10, 50, &[], 2, Some(2)).unwrap()),
+            vec![30, 40]
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn window_rejects_a_header_row_count_the_payload_does_not_match() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(2);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        store
+            .append_json(&event(10, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(20, Some(2), "view", None, "1.00"))
+            .unwrap();
+        store.close().unwrap();
+
+        patch_block_header(&data, 1, None, Some(100));
+
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        for (offset, limit) in [(100, None), (0, None), (0, Some(1))] {
+            let rows = store.query_window(10, 20, &[], offset, limit).unwrap_err();
+            assert!(
+                matches!(rows, Error::Corrupt(_)),
+                "query_window offset={offset} limit={limit:?}: {rows}"
+            );
+            let json = store
+                .query_json_window(10, 20, &[], offset, limit)
+                .unwrap_err();
+            assert!(
+                matches!(json, Error::Corrupt(_)),
+                "query_json_window offset={offset} limit={limit:?}: {json}"
+            );
+        }
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn short_page_refuses_an_uncompressed_len_above_the_query_ceiling() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(2);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        store
+            .append_json(&event(10, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(20, Some(2), "view", None, "1.00"))
+            .unwrap();
+        store.close().unwrap();
+
+        patch_block_header(&data, 1, Some(u32::MAX), None);
+
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        let rows = store.query_window(10, 20, &[], 0, Some(1)).unwrap_err();
+        assert!(
+            rows.to_string()
+                .contains("query response size limit exceeded"),
+            "{rows}"
+        );
+        let json = store
+            .query_json_window(10, 20, &[], 0, Some(1))
+            .unwrap_err();
+        assert!(
+            json.to_string()
+                .contains("query response size limit exceeded"),
+            "{json}"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn window_does_not_skip_a_block_whose_index_range_hides_an_outside_timestamp() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(3);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        for ts in [10, 20, 30, 22] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.close().unwrap();
+
+        patch_index_minmax(&data, 1, 10, 20);
+
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        let timestamps = |bytes: &[u8]| -> Vec<i64> {
+            serde_json::from_slice::<Vec<serde_json::Value>>(bytes)
+                .unwrap()
+                .into_iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect()
+        };
+        let unpaged = timestamps(&store.query_json_window(10, 25, &[], 0, None).unwrap());
+        assert_eq!(unpaged, vec![10, 20, 22]);
+        assert_eq!(
+            timestamps(&store.query_json_window(10, 25, &[], 3, Some(1)).unwrap()),
+            Vec::<i64>::new()
+        );
+        let rows = store.query_window(10, 25, &[], 3, Some(1)).unwrap();
+        assert!(rows.is_empty());
+        store.close().unwrap();
+    }
+
+    /// Rewrite uncompressed length and row count in the index. A 12-byte frame
+    /// does not store them, and open keeps the index values for that frame.
+    fn patch_block_header(
+        dir: &Path,
+        segment_id: u32,
+        uncompressed_len: Option<u32>,
+        row_count: Option<u32>,
+    ) {
+        let data_path = segment::data_path(dir, segment_id);
+        let data = fs::read(&data_path).unwrap();
+        assert_eq!(&data[..4], segment::BLOCK_MAGIC);
+
+        let index_path = segment::index_path(dir, segment_id);
+        let stored = fs::read(&index_path).unwrap();
+        let mut index = if stored.len() >= 4 && stored[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+            zstd::bulk::decompress(&stored, 1024 * 1024).unwrap()
+        } else {
+            stored
+        };
+        assert_eq!(&index[..4], segment::INDEX_MAGIC);
+        let entry = segment::INDEX_HEADER_LEN;
+        if let Some(len) = uncompressed_len {
+            index[entry + 12..entry + 16].copy_from_slice(&len.to_le_bytes());
+        }
+        if let Some(rows) = row_count {
+            index[entry + 16..entry + 20].copy_from_slice(&rows.to_le_bytes());
+        }
+        fs::write(&index_path, &index).unwrap();
+    }
+
+    /// A 20-byte frame does not store min/max. Open keeps the index values when
+    /// the other header fields match, so a lying zone can hide an outside timestamp.
+    fn patch_index_minmax(dir: &Path, segment_id: u32, min_ts: i64, max_ts: i64) {
+        let index_path = segment::index_path(dir, segment_id);
+        let stored = fs::read(&index_path).unwrap();
+        let mut index = if stored.len() >= 4 && stored[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+            zstd::bulk::decompress(&stored, 1024 * 1024).unwrap()
+        } else {
+            stored
+        };
+        assert_eq!(&index[..4], segment::INDEX_MAGIC);
+        let entry = segment::INDEX_HEADER_LEN;
+        index[entry + 24..entry + 32].copy_from_slice(&min_ts.to_le_bytes());
+        index[entry + 32..entry + 40].copy_from_slice(&max_ts.to_le_bytes());
+        fs::write(&index_path, &index).unwrap();
+    }
+
+    #[test]
     fn reopening_rebuilds_a_truncated_index() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -713,7 +1164,8 @@ mod tests {
         assert_eq!(store.stats().index_bytes, index_on_disk);
         store.drop_blocks_before(i64::MIN).unwrap();
         assert_eq!(
-            store.stats().index_bytes, index_on_disk,
+            store.stats().index_bytes,
+            index_on_disk,
             "a no-op retention pass still counts the compressed index"
         );
         store.close().unwrap();
@@ -1522,6 +1974,48 @@ mod tests {
     }
 
     #[test]
+    fn magicless_segment_reopens_and_returns_every_row() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let mut options = test_options(8);
+        options.zstd_level = 3;
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let rows = 24i64;
+        for ts in 0..rows {
+            store
+                .append_json(&event(ts, Some(ts), "click", Some("hello"), "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        store.close().unwrap();
+
+        let data_file = segment::data_path(&data, 1);
+        let payloads = compressed_payloads(&data_file);
+        assert!(!payloads.is_empty());
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| payload.len() < 4 || payload[..4] != [0x28, 0xB5, 0x2F, 0xFD]),
+            "new payloads omit the zstd magic"
+        );
+        let kinds = block_kinds(&data_file);
+        assert!(kinds
+            .iter()
+            .all(|(magic, _, _)| magic == segment::BLOCK_MAGIC));
+
+        let reopened = Store::open_with(&data, &schema, options).unwrap();
+        let got = reopened.query(0, rows).unwrap();
+        assert_eq!(got.len(), rows as usize);
+        assert_eq!(row_value(&reopened, &got[0])["action"], "click");
+        assert_eq!(
+            row_value(&reopened, got.last().unwrap())["user_id"],
+            rows - 1
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn legacy_segment_without_dictionary_round_trips() {
         let dir = TempDir::new();
         let schema_path = write_schema(dir.path());
@@ -1801,6 +2295,13 @@ mod tests {
                 .iter()
                 .all(|(magic, _, _)| magic == segment::BLOCK_MAGIC_DICT),
             "training-sample blocks must be EVBD after one flush: {kinds:?}"
+        );
+        let payloads = compressed_payloads(&data_file);
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| payload.len() < 4 || payload[..4] != [0x28, 0xB5, 0x2F, 0xFD]),
+            "new EVBD payloads are magicless zstd frames"
         );
         let dict_file = segment::dictionary_path(&data, 1);
         let dict_len = fs::metadata(&dict_file).unwrap().len();
