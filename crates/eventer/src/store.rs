@@ -544,6 +544,134 @@ impl Store {
         self.pipeline.drop_blocks_before(cutoff_ms)
     }
 
+    /// Copy `source` into `destination` with the current encoder, then flush once.
+    ///
+    /// `source` is an existing store directory (`schema.lock` plus its segment
+    /// files). `destination` must not already exist, or it must be an empty
+    /// directory. The call reads every row in ingest order, including rows
+    /// written before a column was appended, and appends them through the
+    /// default pipeline. A `json` column is written back as the original field
+    /// text. The destination schema is the source schema.
+    ///
+    /// The source directory is only read. A rejected event, a full disk, or a
+    /// crash before the destination is published leaves those files in place
+    /// and does not put a store at `destination`. The copy is written aside and
+    /// renamed into `destination` after the flush. A crash during that rename
+    /// can leave `destination` incomplete; opening that incomplete directory
+    /// does not mark the copy successful.
+    ///
+    /// The report uses the same totals as [`Store::stats`]: `stored_data_bytes`
+    /// is segment data plus dictionary sidecars, and `stored_index_bytes` is
+    /// sparse indexes plus zone files. `data_bytes_change` is
+    /// `(source − destination) / source` for data bytes, and
+    /// `stored_bytes_change` is that ratio for data plus index. A source total
+    /// of zero reports a change of `0.0`. A directory that is already in the
+    /// current format is still copied.
+    ///
+    /// Queued events still sitting in a live [`Store`] are not on disk yet.
+    /// Flush that store before calling this if those rows should be copied.
+    pub fn rewrite_directory(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<RewriteReport> {
+        let source = source.as_ref();
+        let destination = destination.as_ref();
+        if !source.is_dir() {
+            return Err(Error::io(format!(
+                "source {} is not a directory",
+                source.display()
+            )));
+        }
+        if !source.join("schema.lock").is_file() {
+            return Err(Error::schema(
+                "source directory has no schema.lock; this is not a store directory",
+            ));
+        }
+        if destination.exists() {
+            if !destination.is_dir() {
+                return Err(Error::io(format!(
+                    "destination {} is not a directory",
+                    destination.display()
+                )));
+            }
+            if directory_holds_store(destination)? {
+                return Err(Error::event(
+                    "destination already holds a store; refusing to replace it",
+                ));
+            }
+            if directory_has_entries(destination)? {
+                return Err(Error::event(
+                    "destination directory is not empty; refusing to publish a store into it",
+                ));
+            }
+        }
+        let source_abs = source.canonicalize().map_err(Error::io)?;
+        let destination_abs = anchor_path(destination)?;
+        if paths_overlap(&source_abs, &destination_abs) {
+            return Err(Error::event(
+                "source and destination directories must be separate",
+            ));
+        }
+
+        let source_bytes = directory_stored_bytes(&source_abs)?;
+        let scratch = RemoveOnDrop::new(scratch_dir("eventer-rewrite")?);
+        let source_copy = scratch.path().join("source");
+        copy_dir_all(&source_abs, &source_copy)?;
+
+        let opened = Store::open(&source_copy, source_copy.join("schema.lock"))?;
+        let schema = opened.schema().clone();
+        let events = opened.events_in_ingest_order()?;
+        opened.close()?;
+        for event in &events {
+            value::parse_event(&schema, event)?;
+        }
+
+        let staging = scratch.path().join("staging");
+        let schema_file = scratch.path().join("schema.json");
+        fs::write(&schema_file, schema.canonical())?;
+        let destination_store = Store::open(&staging, &schema_file)?;
+        for event in &events {
+            destination_store.append_json(event)?;
+        }
+        destination_store.flush()?;
+        let stats = destination_store.stats();
+        if stats.rows != events.len() as u64 {
+            return Err(Error::corrupt(
+                "rewritten directory row count does not match the source",
+            ));
+        }
+        destination_store.close()?;
+        let destination_bytes = directory_stored_bytes(&staging)?;
+        if destination_bytes.stored_data_bytes != stats.data_bytes
+            || destination_bytes.stored_index_bytes != stats.index_bytes
+        {
+            return Err(Error::corrupt(
+                "rewritten directory file sizes do not match the flushed store",
+            ));
+        }
+        if rewrite_should_fail_before_publish() {
+            return Err(Error::io(
+                "rewrite failed before the destination was published",
+            ));
+        }
+        publish_directory(&staging, &destination_abs)?;
+
+        Ok(RewriteReport {
+            source: source_bytes,
+            destination: destination_bytes,
+            data_bytes_change: relative_change(
+                source_bytes.stored_data_bytes,
+                destination_bytes.stored_data_bytes,
+            ),
+            stored_bytes_change: relative_change_sum(
+                source_bytes.stored_data_bytes,
+                source_bytes.stored_index_bytes,
+                destination_bytes.stored_data_bytes,
+                destination_bytes.stored_index_bytes,
+            ),
+        })
+    }
+
     /// File sizes from the last committed batch. Call [`Store::flush`] first for a stable view.
     pub fn stats(&self) -> Stats {
         let catalog = self.catalog();
@@ -631,6 +759,48 @@ impl Store {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
     }
+
+    /// JSON for every stored row, in segment and block order.
+    fn events_in_ingest_order(&self) -> Result<Vec<Vec<u8>>> {
+        let blocks: Vec<segment::BlockMeta> = {
+            let catalog = self.catalog();
+            catalog
+                .segments
+                .iter()
+                .flat_map(|segment| segment.blocks.iter().cloned())
+                .collect()
+        };
+        let mut dictionaries = HashMap::new();
+        let mut events = Vec::new();
+        for block in &blocks {
+            let payload = self.read_block_bytes(block, &mut dictionaries)?;
+            let rows = crate::codec::decode_block(&self.schema, &payload)?;
+            require_header_row_count(block.row_count, rows.len())?;
+            for row in &rows {
+                events.push(row_to_json_bytes(&self.schema, row)?);
+            }
+        }
+        Ok(events)
+    }
+}
+
+/// Data and index bytes, using the same split as [`Stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredBytes {
+    pub stored_data_bytes: u64,
+    pub stored_index_bytes: u64,
+}
+
+/// Sizes before and after [`Store::rewrite_directory`].
+///
+/// `data_bytes_change` and `stored_bytes_change` are
+/// `(source − destination) / source`. A zero source total is `0.0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RewriteReport {
+    pub source: StoredBytes,
+    pub destination: StoredBytes,
+    pub data_bytes_change: f64,
+    pub stored_bytes_change: f64,
 }
 
 impl Drop for Store {
@@ -875,6 +1045,202 @@ fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
     match schema::schema_evolution(&locked, schema)? {
         schema::SchemaEvolution::Unchanged => Ok(SchemaLockAction::Ready),
         schema::SchemaEvolution::Appended { .. } => Ok(SchemaLockAction::Rewrite),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REWRITE_FAIL_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn rewrite_should_fail_before_publish() -> bool {
+    #[cfg(test)]
+    {
+        REWRITE_FAIL_BEFORE_PUBLISH.with(|flag| {
+            let fail = flag.get();
+            flag.set(false);
+            fail
+        })
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn relative_change(source: u64, destination: u64) -> f64 {
+    if source == 0 {
+        0.0
+    } else {
+        (source as f64 - destination as f64) / source as f64
+    }
+}
+
+fn relative_change_sum(
+    source_a: u64,
+    source_b: u64,
+    destination_a: u64,
+    destination_b: u64,
+) -> f64 {
+    let source = u128::from(source_a) + u128::from(source_b);
+    let destination = u128::from(destination_a) + u128::from(destination_b);
+    if source == 0 {
+        0.0
+    } else {
+        (source as f64 - destination as f64) / source as f64
+    }
+}
+
+fn directory_has_entries(dir: &Path) -> Result<bool> {
+    Ok(fs::read_dir(dir)?.next().is_some())
+}
+
+fn directory_holds_store(dir: &Path) -> Result<bool> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    if dir.join("schema.lock").exists() {
+        return Ok(true);
+    }
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("seg-") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Segment `.dat` and `.dict` files are data. `.idx` and `.zon` files are the index.
+fn directory_stored_bytes(dir: &Path) -> Result<StoredBytes> {
+    let mut stored_data_bytes = 0u64;
+    let mut stored_index_bytes = 0u64;
+    if dir.exists() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let len = entry.metadata()?.len();
+            if name.ends_with(".dat") || name.ends_with(".dict") {
+                stored_data_bytes += len;
+            } else if name.ends_with(".idx") || name.ends_with(".zon") {
+                stored_index_bytes += len;
+            }
+        }
+    }
+    Ok(StoredBytes {
+        stored_data_bytes,
+        stored_index_bytes,
+    })
+}
+
+fn anchor_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path.canonicalize().map_err(Error::io);
+    }
+    let name = path.file_name().ok_or_else(|| {
+        Error::io(format!(
+            "destination {} has no directory name",
+            path.display()
+        ))
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = match parent {
+        Some(parent) => parent.canonicalize().map_err(Error::io)?,
+        None => std::env::current_dir().map_err(Error::io)?,
+    };
+    Ok(parent.join(name))
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || right.starts_with(left) || left.starts_with(right)
+}
+
+fn scratch_dir(prefix: &str) -> Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(Error::io)?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+struct RemoveOnDrop {
+    path: PathBuf,
+}
+
+impl RemoveOnDrop {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if file_type.is_symlink() {
+            return Err(Error::io(format!(
+                "refusing to copy symlink {}",
+                entry.path().display()
+            )));
+        }
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &target)?;
+        } else {
+            return Err(Error::io(format!(
+                "unsupported file in store directory: {}",
+                entry.path().display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn publish_directory(staging: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    match fs::rename(staging, destination) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            let sibling = destination.with_file_name(format!(
+                ".{}-publish-{}",
+                destination
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("store"),
+                std::process::id()
+            ));
+            let _cleanup = RemoveOnDrop::new(sibling.clone());
+            copy_dir_all(staging, &sibling)?;
+            fs::rename(&sibling, destination)?;
+            Ok(())
+        }
+        Err(err) => Err(Error::io(err)),
     }
 }
 
@@ -3374,5 +3740,399 @@ mod tests {
         assert!(!segment::dictionary_path(&data, 1).exists());
         assert!(!segment::data_path(&data, 1).exists());
         reopened.close().unwrap();
+    }
+
+    fn snapshot_tree(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fn walk(dir: &Path, prefix: &str, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+            let mut entries: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let rel = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{}", entry.file_name().to_string_lossy())
+                };
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, &rel, out);
+                } else {
+                    out.insert(rel, fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        if dir.exists() {
+            walk(dir, "", &mut out);
+        }
+        out
+    }
+
+    fn frame_v20(compressed: &[u8], uncompressed_len: u32, row_count: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(segment::BLOCK_HEADER_LEN_V20 + compressed.len());
+        out.extend_from_slice(segment::BLOCK_MAGIC);
+        out.extend_from_slice(&uncompressed_len.to_le_bytes());
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&row_count.to_le_bytes());
+        out.extend_from_slice(&crc32fast::hash(compressed).to_le_bytes());
+        out.extend_from_slice(compressed);
+        out
+    }
+
+    fn seal_rows(schema: &Schema, rows: &[Row]) -> crate::codec::EncodedBlock {
+        crate::codec::encode_block(schema, rows).unwrap()
+    }
+
+    fn install_schema_lock(dir: &Path, text: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let schema = parse_schema(text).unwrap();
+        fs::write(dir.join("schema.lock"), schema.canonical()).unwrap();
+    }
+
+    fn assert_change(report: &RewriteReport) {
+        let data = relative_change(
+            report.source.stored_data_bytes,
+            report.destination.stored_data_bytes,
+        );
+        let total = relative_change_sum(
+            report.source.stored_data_bytes,
+            report.source.stored_index_bytes,
+            report.destination.stored_data_bytes,
+            report.destination.stored_index_bytes,
+        );
+        assert_eq!(report.data_bytes_change, data);
+        assert_eq!(report.stored_bytes_change, total);
+    }
+
+    fn query_bytes(dir: &Path, schema: &Path) -> Vec<Vec<u8>> {
+        let store = Store::open(dir, schema).unwrap();
+        let rows = store.query(i64::MIN, i64::MAX).unwrap();
+        let bytes = rows
+            .iter()
+            .map(|row| row_to_json_bytes(store.schema(), row).unwrap())
+            .collect();
+        store.close().unwrap();
+        bytes
+    }
+
+    #[test]
+    fn rewrite_directory_turns_a_36_byte_segment_into_the_current_format() {
+        let dir = TempDir::new();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let data = dir.path().join("data");
+        install_schema_lock(&data, SCHEMA_JSON);
+        let rows: Vec<Row> = (0..5)
+            .map(|ts| {
+                crate::value::parse_event(&schema, &event(ts, Some(ts), "click", None, "1.00"))
+                    .unwrap()
+            })
+            .collect();
+        let encoded = seal_rows(&schema, &rows);
+        let compressed = zstd::bulk::compress(&encoded.bytes, 3).unwrap();
+        assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        let framed = segment::frame_block_v1(
+            &compressed,
+            encoded.bytes.len() as u32,
+            encoded.row_count,
+            encoded.min_ts,
+            encoded.max_ts,
+            false,
+        )
+        .unwrap();
+        fs::write(segment::data_path(&data, 1), &framed).unwrap();
+        assert!(segment::frames_in(&framed)[0].header_len == segment::BLOCK_HEADER_LEN_V1);
+        assert!(!crate::zone::zone_path(&data, 1).exists());
+        assert!(!segment::dictionary_path(&data, 1).exists());
+        let before = snapshot_tree(&data);
+        let expected: Vec<_> = rows
+            .iter()
+            .map(|row| row_to_json_bytes(&schema, row).unwrap())
+            .collect();
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before, "source files changed");
+        assert_eq!(
+            report.source,
+            directory_stored_bytes(&data).unwrap(),
+            "source report does not match the directory"
+        );
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        assert_change(&report);
+        assert!(
+            report.data_bytes_change > 0.0
+                || report.destination.stored_data_bytes <= report.source.stored_data_bytes
+        );
+
+        let schema_file = data.join("schema.lock");
+        let got = query_bytes(&dest, &schema_file);
+        assert_eq!(got, expected);
+        let reopened = query_bytes(&dest, &schema_file);
+        assert_eq!(reopened, expected);
+        let dest_bytes = fs::read(segment::data_path(&dest, 1)).unwrap();
+        let frames = segment::frames_in(&dest_bytes);
+        assert!(!frames.is_empty());
+        assert!(frames
+            .iter()
+            .all(|frame| frame.header_len == segment::BLOCK_HEADER_LEN));
+        let opened = Store::open(&dest, &schema_file).unwrap();
+        assert_eq!(opened.stats().rows, 5);
+        assert_eq!(
+            opened.stats().data_bytes,
+            report.destination.stored_data_bytes
+        );
+        assert_eq!(
+            opened.stats().index_bytes,
+            report.destination.stored_index_bytes
+        );
+        opened.close().unwrap();
+    }
+
+    #[test]
+    fn rewrite_directory_copies_mixed_headers_without_touching_the_source() {
+        let dir = TempDir::new();
+        let schema = parse_schema(SCHEMA_JSON).unwrap();
+        let data = dir.path().join("data");
+        install_schema_lock(&data, SCHEMA_JSON);
+        let blocks: Vec<Vec<Row>> = (0..3)
+            .map(|block| {
+                (0..2)
+                    .map(|row| {
+                        let ts = block * 10 + row;
+                        crate::value::parse_event(
+                            &schema,
+                            &event(ts, Some(ts), "click", Some("n"), "1.00"),
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+        let encoded: Vec<_> = blocks.iter().map(|rows| seal_rows(&schema, rows)).collect();
+        let magic36 = zstd::bulk::compress(&encoded[0].bytes, 3).unwrap();
+        let frame36 = segment::frame_block_v1(
+            &magic36,
+            encoded[0].bytes.len() as u32,
+            encoded[0].row_count,
+            encoded[0].min_ts,
+            encoded[0].max_ts,
+            false,
+        )
+        .unwrap();
+        let magic20 = zstd::bulk::compress(&encoded[1].bytes, 1).unwrap();
+        let frame20 = frame_v20(
+            &magic20,
+            encoded[1].bytes.len() as u32,
+            encoded[1].row_count,
+        );
+        let dict = vec![0x5Au8; 128];
+        let mut compressor = segment::block_compressor(3, &dict).unwrap();
+        let magicless = compressor.compress(&encoded[2].bytes).unwrap();
+        assert!(magicless.len() < 4 || magicless[..4] != [0x28, 0xB5, 0x2F, 0xFD]);
+        let frame12 = segment::frame_block(&magicless, true).unwrap();
+        assert_eq!(frame12.len(), segment::BLOCK_HEADER_LEN + magicless.len());
+        assert_eq!(&frame12[..4], segment::BLOCK_MAGIC_DICT);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&frame36);
+        bytes.extend_from_slice(&frame20);
+        bytes.extend_from_slice(&frame12);
+        fs::write(segment::data_path(&data, 1), &bytes).unwrap();
+        segment::write_dictionary(&data, 1, &dict).unwrap();
+        let frames = segment::frames_in(&bytes);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].header_len, segment::BLOCK_HEADER_LEN_V1);
+        assert_eq!(frames[1].header_len, segment::BLOCK_HEADER_LEN_V20);
+        assert_eq!(frames[2].header_len, segment::BLOCK_HEADER_LEN);
+        assert_eq!(frames[2].magic, *segment::BLOCK_MAGIC_DICT);
+        let before = snapshot_tree(&data);
+        let expected: Vec<_> = blocks
+            .iter()
+            .flatten()
+            .map(|row| row_to_json_bytes(&schema, row).unwrap())
+            .collect();
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(report.source, directory_stored_bytes(&data).unwrap());
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        assert_change(&report);
+        let schema_file = data.join("schema.lock");
+        assert_eq!(query_bytes(&dest, &schema_file), expected);
+        let reopened = Store::open(&dest, &schema_file).unwrap();
+        assert_eq!(reopened.query(i64::MIN, i64::MAX).unwrap().len(), 6);
+        reopened.close().unwrap();
+        assert_eq!(query_bytes(&dest, &schema_file), expected);
+    }
+
+    #[test]
+    fn rewrite_directory_keeps_json_field_text_and_appended_nulls() {
+        let dir = TempDir::new();
+        let text = r#"{
+            "timestamp_field": "ts",
+            "fields": [
+                {"name": "ts", "type": "timestamp"},
+                {"name": "props", "type": "json"}
+            ]
+        }"#;
+        let schema_path = dir.path().join("schema.json");
+        fs::write(&schema_path, text).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema_path, test_options(4)).unwrap();
+        let raw = br#"{"ts":5,"props":{"a":1,"a":2,"b":{"z":1,"z":3}}}"#;
+        store.append_json(raw).unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+
+        let wide = r#"{
+            "timestamp_field": "ts",
+            "fields": [
+                {"name": "ts", "type": "timestamp"},
+                {"name": "props", "type": "json"},
+                {"name": "region", "type": "string"}
+            ]
+        }"#;
+        let wide_path = dir.path().join("wide.json");
+        fs::write(&wide_path, wide).unwrap();
+        let store = Store::open_with(&data, &wide_path, test_options(4)).unwrap();
+        store
+            .append_json(br#"{"ts":9,"props":[1,2,3],"region":"us"}"#)
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let expected = query_bytes(&data, &wide_path);
+        let before = snapshot_tree(&data);
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(
+            report.source.stored_data_bytes,
+            directory_stored_bytes(&data).unwrap().stored_data_bytes
+        );
+        assert_eq!(
+            report.source.stored_index_bytes,
+            directory_stored_bytes(&data).unwrap().stored_index_bytes
+        );
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        assert_change(&report);
+        let got = query_bytes(&dest, &wide_path);
+        assert_eq!(got, expected);
+        assert!(got[0]
+            .windows(br#"{"a":1,"a":2,"b":{"z":1,"z":3}}"#.len())
+            .any(|window| window == br#"{"a":1,"a":2,"b":{"z":1,"z":3}}"#));
+        let reopened = Store::open(&dest, &wide_path).unwrap();
+        let rows = reopened.query(i64::MIN, i64::MAX).unwrap();
+        assert_eq!(rows.len(), 2);
+        match &rows[0].values[1] {
+            Scalar::Json(text) => assert_eq!(text, r#"{"a":1,"a":2,"b":{"z":1,"z":3}}"#),
+            other => panic!("expected json text, got {other:?}"),
+        }
+        assert!(row_value(&reopened, &rows[0])["region"].is_null());
+        assert_eq!(row_value(&reopened, &rows[1])["region"], "us");
+        assert_eq!(
+            fs::read_to_string(dest.join("schema.lock")).unwrap(),
+            reopened.schema().canonical()
+        );
+        reopened.close().unwrap();
+        assert_eq!(query_bytes(&dest, &wide_path), expected);
+    }
+
+    #[test]
+    fn rewrite_directory_of_a_current_store_reports_directory_totals() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, StoreOptions::default()).unwrap();
+        for ts in 0..8 {
+            store
+                .append_json(&event(ts, Some(ts), "click", Some("hello"), "19.99"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let stats = store.stats();
+        store.close().unwrap();
+        let expected = query_bytes(&data, &schema);
+        let before = snapshot_tree(&data);
+
+        let dest = dir.path().join("rewritten");
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(report.source.stored_data_bytes, stats.data_bytes);
+        assert_eq!(report.source.stored_index_bytes, stats.index_bytes);
+        assert_eq!(report.source, directory_stored_bytes(&data).unwrap());
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(
+            opened.stats().data_bytes,
+            report.destination.stored_data_bytes
+        );
+        assert_eq!(
+            opened.stats().index_bytes,
+            report.destination.stored_index_bytes
+        );
+        assert_eq!(opened.stats().rows, 8);
+        opened.close().unwrap();
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+        assert_change(&report);
+        assert_eq!(query_bytes(&dest, &schema), expected);
+        assert_eq!(query_bytes(&dest, &schema), query_bytes(&data, &schema));
+    }
+
+    #[test]
+    fn rewrite_directory_failure_leaves_the_source_segment_in_place() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, Some(2), "view", Some("a"), "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+
+        let blocked = dir.path().join("not-a-directory");
+        fs::write(&blocked, b"file").unwrap();
+        let err = Store::rewrite_directory(&data, &blocked).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(fs::read(&blocked).unwrap(), b"file");
+
+        let existing = dir.path().join("existing");
+        let prior = Store::open_with(&existing, &schema, test_options(2)).unwrap();
+        prior
+            .append_json(&event(9, Some(9), "buy", None, "3.00"))
+            .unwrap();
+        prior.close().unwrap();
+        let existing_before = snapshot_tree(&existing);
+        let err = Store::rewrite_directory(&data, &existing).unwrap_err();
+        assert!(err.to_string().contains("already holds a store"), "{err}");
+        assert_eq!(snapshot_tree(&data), before);
+        assert_eq!(snapshot_tree(&existing), existing_before);
+
+        let dest = dir.path().join("unpublished");
+        REWRITE_FAIL_BEFORE_PUBLISH.with(|flag| flag.set(true));
+        let err = Store::rewrite_directory(&data, &dest).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("before the destination was published"),
+            "{err}"
+        );
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(
+            !dest.exists() || !directory_holds_store(&dest).unwrap(),
+            "a failed copy published a store"
+        );
+        let segment = fs::read(segment::data_path(&data, 1)).unwrap();
+        assert_eq!(
+            snapshot_tree(&data).get("seg-000001.dat").unwrap(),
+            &segment
+        );
     }
 }
