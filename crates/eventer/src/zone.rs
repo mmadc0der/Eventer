@@ -7,7 +7,9 @@
 //!
 //! Strings and text use the exact distinct set when it is small, and a bloom
 //! filter otherwise. A bloom hit can be wrong; a miss is not. Numbers use an
-//! inclusive min/max. Floats and JSON stay unpruned. Segments written before
+//! inclusive min/max, which also rejects a range whose lower bound is above the
+//! max or whose upper bound is below the min, including exclusive bounds.
+//! Floats and JSON stay unpruned. Segments written before
 //! zone maps existed are summarized once on open and the summary is kept.
 //!
 //! The bytes on disk are still that zone file: `EVZN` header, then each block's
@@ -25,7 +27,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::codec::{decode_block, ColumnPredicate};
+use crate::codec::{decode_block, ColumnPredicate, RangeFilter};
 use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{self, BlockMeta};
@@ -145,11 +147,34 @@ pub(crate) fn from_rows(schema: &Schema, rows: &[Row]) -> BlockZone {
 ///
 /// A `false` result means the payload cannot contain a matching row. A `true`
 /// result can still be a bloom false positive, so the block is decoded as usual.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn may_match(zone: &BlockZone, predicates: &[ColumnPredicate]) -> bool {
+    may_match_ranges(zone, predicates, &[])
+}
+
+/// Equality predicates and numeric ranges. A false result means the payload
+/// cannot contain a matching row.
+///
+/// An `i64` or `i128` zone whose max is below a lower bound, or whose min is
+/// above an upper bound, does not match. Exclusive bounds use `<=` and `>=`.
+/// [`ColumnZone::Unknown`] (float and JSON) is not a skip. [`ColumnZone::AllNull`]
+/// fails every range, because nulls do not match one. A missing column is null.
+pub(crate) fn may_match_ranges(
+    zone: &BlockZone,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+) -> bool {
     for predicate in predicates {
         match zone.columns.get(predicate.index) {
             Some(column) if !column.may_contain(&predicate.allowed) => return false,
             Some(_) | None => {}
+        }
+    }
+    for range in ranges {
+        match zone.columns.get(range.index) {
+            Some(column) if !column.may_contain_range(range) => return false,
+            None => return false,
+            Some(_) => {}
         }
     }
     true
@@ -389,6 +414,67 @@ impl ColumnZone {
             },
         }
     }
+
+    fn may_contain_range(&self, range: &RangeFilter) -> bool {
+        match self {
+            ColumnZone::Unknown => true,
+            ColumnZone::AllNull => false,
+            ColumnZone::I64 { min, max, .. } => {
+                ordered_range_overlaps(*min, *max, range, bound_i64)
+            }
+            ColumnZone::I128 { min, max, .. } => {
+                ordered_range_overlaps(*min, *max, range, bound_i128)
+            }
+            ColumnZone::Bool { .. } | ColumnZone::Exact { .. } | ColumnZone::Bloom { .. } => true,
+        }
+    }
+}
+
+fn bound_i64(value: &Scalar) -> Option<i64> {
+    match value {
+        Scalar::Int(value) | Scalar::Timestamp(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn bound_i128(value: &Scalar) -> Option<i128> {
+    match value {
+        Scalar::Decimal(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn ordered_range_overlaps<T: Ord + Copy>(
+    min: T,
+    max: T,
+    range: &RangeFilter,
+    bound: impl Fn(&Scalar) -> Option<T>,
+) -> bool {
+    if let Some(lower) = &range.lower {
+        let Some(cutoff) = bound(&lower.value) else {
+            return true;
+        };
+        if lower.inclusive {
+            if max < cutoff {
+                return false;
+            }
+        } else if max <= cutoff {
+            return false;
+        }
+    }
+    if let Some(upper) = &range.upper {
+        let Some(cutoff) = bound(&upper.value) else {
+            return true;
+        };
+        if upper.inclusive {
+            if min > cutoff {
+                return false;
+            }
+        } else if min >= cutoff {
+            return false;
+        }
+    }
+    true
 }
 
 fn build_from_payloads(
@@ -1055,6 +1141,45 @@ mod tests {
         assert!(may_match(
             &zone,
             &[pred(&schema, "score", Scalar::Float(99.0))]
+        ));
+        let user = schema
+            .fields
+            .iter()
+            .position(|field| field.name == "user_id")
+            .unwrap();
+        let amount = schema
+            .fields
+            .iter()
+            .position(|field| field.name == "amount")
+            .unwrap();
+        let score = schema
+            .fields
+            .iter()
+            .position(|field| field.name == "score")
+            .unwrap();
+        let above = |index, value| crate::codec::RangeFilter {
+            index,
+            lower: Some(crate::codec::RangeEnd {
+                inclusive: false,
+                value,
+            }),
+            upper: None,
+        };
+        assert!(!may_match_ranges(
+            &zone,
+            &[],
+            &[above(user, Scalar::Int(2))]
+        ));
+        assert!(may_match_ranges(&zone, &[], &[above(user, Scalar::Int(1))]));
+        assert!(!may_match_ranges(
+            &zone,
+            &[],
+            &[above(amount, Scalar::Decimal(900))]
+        ));
+        assert!(may_match_ranges(
+            &zone,
+            &[],
+            &[above(score, Scalar::Float(100.0))]
         ));
         let encoded = encode_zone(&zone);
         let decoded = decode_zone(&encoded, schema.fields.len() as u16).unwrap();
