@@ -883,7 +883,7 @@ fn scalar_encoded_upper_bound(ty: FieldType, scalar: &Scalar) -> usize {
 }
 
 fn compress_loop(rx: Receiver<CompIn>, tx: Sender<CompOut>, level: i32, publish: Arc<DictPublish>) {
-    let mut plain = zstd::bulk::Compressor::new(level).ok();
+    let mut plain = segment::block_compressor(level, &[]).ok();
     let mut with_dict: Option<(Arc<Vec<u8>>, zstd::bulk::Compressor<'static>)> = None;
     while let Ok(msg) = rx.recv() {
         let out = match msg {
@@ -925,7 +925,7 @@ fn compress_block(
             .as_ref()
             .is_some_and(|(existing, _)| Arc::ptr_eq(existing, dict));
         if !installed {
-            match zstd::bulk::Compressor::with_dictionary(level, dict) {
+            match segment::block_compressor(level, dict) {
                 Ok(compressor) => *with_dict = Some((Arc::clone(dict), compressor)),
                 Err(err) => {
                     return CompOut::Skip {
@@ -1133,7 +1133,7 @@ impl Disk {
             poison,
             retention,
             publish,
-            plain: zstd::bulk::Compressor::new(level).ok(),
+            plain: segment::block_compressor(level, &[]).ok(),
             dict_compressor: None,
             dict: None,
             segment_epoch: 0,
@@ -1358,8 +1358,7 @@ impl Disk {
                 .as_ref()
                 .is_some_and(|(existing, _)| Arc::ptr_eq(existing, dict));
             if !installed {
-                let compressor =
-                    zstd::bulk::Compressor::with_dictionary(self.level, dict).map_err(Error::io)?;
+                let compressor = segment::block_compressor(self.level, dict).map_err(Error::io)?;
                 self.dict_compressor = Some((Arc::clone(dict), compressor));
             }
             self.dict_compressor
