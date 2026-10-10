@@ -9,8 +9,9 @@
 //! Omitting both returns the full match set.
 //! `GET /events/count` returns `{"count":N}` for that same range and filters.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
-//! with the caller's `before_ms`. A block is removed only when its maximum
-//! timestamp is strictly less than that cutoff.
+//! with the caller's `before_ms`. The request `Content-Type` must be
+//! `application/json`, with an optional `charset=utf-8`. A block is removed
+//! only when its maximum timestamp is strictly less than that cutoff.
 
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::{Query, RawQuery, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -94,7 +95,14 @@ fn ingest(store: &eventer::Store, body: &[u8]) -> eventer::Result<Ingest> {
     }
 }
 
-async fn post_drop(State(state): State<AppState>, body: Bytes) -> Response {
+async fn post_drop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = require_json_content_type(headers.get(CONTENT_TYPE)) {
+        return *response;
+    }
     let cutoff = match parse_before_ms(&body) {
         Ok(cutoff) => cutoff,
         Err(response) => return *response,
@@ -110,6 +118,40 @@ async fn post_drop(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response(),
     }
+}
+
+/// The media type itself must be `application/json`. `charset=utf-8` is the
+/// only optional parameter. A missing header or any other type, including
+/// `text/plain` and `application/jsonp`, is rejected before the body is parsed.
+fn require_json_content_type(
+    header: Option<&HeaderValue>,
+) -> std::result::Result<(), Box<Response>> {
+    let Some(value) = header else {
+        return Err(bad_request("Content-Type must be application/json"));
+    };
+    let Ok(text) = value.to_str() else {
+        return Err(bad_request("Content-Type must be application/json"));
+    };
+    let mut parts = text.split(';');
+    let media = parts.next().unwrap_or("").trim();
+    if !media.eq_ignore_ascii_case("application/json") {
+        return Err(bad_request("Content-Type must be application/json"));
+    }
+    for param in parts {
+        let param = param.trim();
+        if param.is_empty() {
+            continue;
+        }
+        let Some((name, raw_value)) = param.split_once('=') else {
+            return Err(bad_request("Content-Type must be application/json"));
+        };
+        let charset = raw_value.trim().trim_matches('"');
+        if !name.trim().eq_ignore_ascii_case("charset") || !charset.eq_ignore_ascii_case("utf-8")
+        {
+            return Err(bad_request("Content-Type must be application/json"));
+        }
+    }
+    Ok(())
 }
 
 /// `before_ms` is the caller's cutoff, a signed integer in the `i64` range.
@@ -1012,6 +1054,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_drop_rejects_a_non_json_content_type_and_leaves_rows_in_place() {
+        let (root, schema, data) = temp_store("drop-content-type");
+        let options = store_options(1, eventer::StoreOptions::default().segment_bytes);
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+
+        for ts in [1000, 2000] {
+            let (status, body) = post_json(
+                &app,
+                "/events",
+                &format!(r#"{{"ts":{ts},"action":"click","amount":"1.00"}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let cutoff = r#"{"before_ms":9223372036854775807}"#;
+        for content_type in [None, Some("text/plain"), Some("application/jsonp")] {
+            let mut builder = Request::builder().method("POST").uri("/events/drop");
+            if let Some(content_type) = content_type {
+                builder = builder.header("content-type", content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::from(cutoff.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{content_type:?}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body.get("error").is_some(), "{content_type:?} body {body}");
+            assert_eq!(timestamps_of(&app, 0, 9000).await, vec![1000, 2000]);
+        }
+
+        let (status, body) = post_with_type(
+            &app,
+            "/events/drop",
+            "application/json; charset=utf-8",
+            r#"{"before_ms":1000}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(timestamps_of(&app, 0, 9000).await, vec![1000, 2000]);
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn count_matches_unpaged_get_and_rejects_page_params() {
         let (root, schema, data) = temp_store("count");
         let options = store_options(
@@ -1130,13 +1221,22 @@ mod tests {
     }
 
     async fn post_json(app: &Router, uri: &str, body: &str) -> (StatusCode, Value) {
+        post_with_type(app, uri, "application/json", body).await
+    }
+
+    async fn post_with_type(
+        app: &Router,
+        uri: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (StatusCode, Value) {
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(uri)
-                    .header("content-type", "application/json")
+                    .header("content-type", content_type)
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
