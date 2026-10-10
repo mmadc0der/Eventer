@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::segment::{
     self, frame_block, read_dictionary, ActiveSegment, BlockMeta, Catalog, BLOCK_HEADER_LEN,
-    BLOCK_HEADER_LEN_V1, DICT_MAX_BYTES, DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX,
+    BLOCK_HEADER_LEN_V1, BLOCK_HEADER_LEN_V20, DICT_MAX_BYTES, DICT_SAMPLE_CHUNK, DICT_SAMPLE_MAX,
 };
 use crate::value::{parse_event, Row, Scalar};
 use crate::zone::{self, BlockZone};
@@ -987,12 +987,7 @@ fn compress_block(
             acks: block.acks,
             error,
         },
-        Ok((compressed, used_dict)) => match frame_block(
-            &compressed,
-            block.raw.len() as u32,
-            block.row_count,
-            used_dict,
-        ) {
+        Ok((compressed, used_dict)) => match frame_block(&compressed, used_dict) {
             Ok(framed) => CompOut::Block(BlockOut {
                 seq: block.seq,
                 compressed_len: compressed.len() as u32,
@@ -1047,6 +1042,8 @@ fn frame_header_len(block: &BlockMeta, end: Option<u64>) -> u64 {
         .saturating_sub(u64::from(block.compressed_len));
     if header == BLOCK_HEADER_LEN_V1 as u64 {
         BLOCK_HEADER_LEN_V1 as u64
+    } else if header == BLOCK_HEADER_LEN_V20 as u64 {
+        BLOCK_HEADER_LEN_V20 as u64
     } else {
         BLOCK_HEADER_LEN as u64
     }
@@ -1409,12 +1406,7 @@ impl Disk {
         if compressed.len() > u32::MAX as usize {
             return Err(Error::event("compressed block does not fit in u32"));
         }
-        let framed = frame_block(
-            &compressed,
-            item.uncompressed_len,
-            item.row_count,
-            dict.is_some(),
-        )?;
+        let framed = frame_block(&compressed, dict.is_some())?;
         Ok((framed, compressed.len() as u32))
     }
 
