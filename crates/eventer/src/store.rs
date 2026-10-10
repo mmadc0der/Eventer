@@ -178,9 +178,9 @@ impl Store {
     ///
     /// `offset` skips that many matching rows. `limit` of `None` returns the rest,
     /// and `Some(0)` is an error. Time bounds and predicates are applied before
-    /// the skip. A block that sits entirely inside the range and has no predicates
-    /// can be skipped from its row count without reading the payload. Once `limit`
-    /// rows have been collected, later blocks are not read. Order is ingest order.
+    /// the skip. A contained block with no predicates is skipped only after its
+    /// payload row count matches the frame header. Once `limit` rows have been
+    /// collected, later blocks are not read. Order is ingest order.
     pub fn query_window(
         &self,
         from_ms: i64,
@@ -210,12 +210,6 @@ impl Store {
             }
             let string_budget = remaining_query_bytes(response_bytes)?;
             let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
-            if resolved.is_empty()
-                && contained
-                && skip_whole_block(offset, block.row_count, &mut skipped)
-            {
-                continue;
-            }
             let whole = returns_whole_block(
                 resolved.is_empty(),
                 contained,
@@ -225,11 +219,18 @@ impl Store {
                 rows_out.len(),
                 block.row_count,
             );
-            if whole && block.uncompressed_len as usize > string_budget {
+            if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
+            require_header_row_count(block.row_count, nrows)?;
+            if resolved.is_empty()
+                && contained
+                && skip_whole_block(offset, block.row_count, &mut skipped)
+            {
+                continue;
+            }
             if whole && rows_out.len() + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
@@ -326,12 +327,6 @@ impl Store {
             }
             let string_budget = remaining_query_bytes(out.len())?;
             let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
-            if resolved.is_empty()
-                && contained
-                && skip_whole_block(offset, block.row_count, &mut skipped)
-            {
-                continue;
-            }
             let whole = returns_whole_block(
                 resolved.is_empty(),
                 contained,
@@ -341,11 +336,18 @@ impl Store {
                 row_count,
                 block.row_count,
             );
-            if whole && block.uncompressed_len as usize > string_budget {
+            if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
+            require_header_row_count(block.row_count, nrows)?;
+            if resolved.is_empty()
+                && contained
+                && skip_whole_block(offset, block.row_count, &mut skipped)
+            {
+                continue;
+            }
             if whole && row_count + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
@@ -569,6 +571,24 @@ fn take_match(offset: u64, limit: Option<u64>, skipped: &mut u64, emitted: usize
     } else {
         Take::Keep
     }
+}
+
+/// The frame header's uncompressed length is not covered by the payload CRC.
+/// Every read refuses a length above [`MAX_QUERY_BYTES`]. A block that will be
+/// returned in full also refuses a length the shrinking response budget cannot hold.
+fn block_exceeds_read_budget(uncompressed_len: u32, whole: bool, string_budget: usize) -> bool {
+    let declared = uncompressed_len as usize;
+    declared > MAX_QUERY_BYTES || (whole && declared > string_budget)
+}
+
+/// `block.row_count` is the frame header. The payload CRC does not cover it.
+fn require_header_row_count(header_rows: u32, payload_rows: usize) -> Result<()> {
+    if payload_rows != header_rows as usize {
+        return Err(Error::corrupt(
+            "block row count does not match the frame header",
+        ));
+    }
+    Ok(())
 }
 
 /// Skip a block whose every row is a match when those rows fall entirely inside the offset.
@@ -892,6 +912,113 @@ mod tests {
             vec![30, 40]
         );
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn window_rejects_a_header_row_count_the_payload_does_not_match() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(2);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        store
+            .append_json(&event(10, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(20, Some(2), "view", None, "1.00"))
+            .unwrap();
+        store.close().unwrap();
+
+        patch_block_header(&data, 1, None, Some(100));
+
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        for (offset, limit) in [(100, None), (0, None), (0, Some(1))] {
+            let rows = store.query_window(10, 20, &[], offset, limit).unwrap_err();
+            assert!(
+                matches!(rows, Error::Corrupt(_)),
+                "query_window offset={offset} limit={limit:?}: {rows}"
+            );
+            let json = store
+                .query_json_window(10, 20, &[], offset, limit)
+                .unwrap_err();
+            assert!(
+                matches!(json, Error::Corrupt(_)),
+                "query_json_window offset={offset} limit={limit:?}: {json}"
+            );
+        }
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn short_page_refuses_an_uncompressed_len_above_the_query_ceiling() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(2);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        store
+            .append_json(&event(10, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(20, Some(2), "view", None, "1.00"))
+            .unwrap();
+        store.close().unwrap();
+
+        patch_block_header(&data, 1, Some(u32::MAX), None);
+
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        let rows = store.query_window(10, 20, &[], 0, Some(1)).unwrap_err();
+        assert!(
+            rows.to_string()
+                .contains("query response size limit exceeded"),
+            "{rows}"
+        );
+        let json = store
+            .query_json_window(10, 20, &[], 0, Some(1))
+            .unwrap_err();
+        assert!(
+            json.to_string()
+                .contains("query response size limit exceeded"),
+            "{json}"
+        );
+        store.close().unwrap();
+    }
+
+    /// Rewrite the first frame header and the matching index entry. The payload
+    /// CRC does not cover these fields, and open keeps them when the index matches.
+    fn patch_block_header(
+        dir: &Path,
+        segment_id: u32,
+        uncompressed_len: Option<u32>,
+        row_count: Option<u32>,
+    ) {
+        let data_path = segment::data_path(dir, segment_id);
+        let mut data = fs::read(&data_path).unwrap();
+        assert_eq!(&data[..4], segment::BLOCK_MAGIC);
+        if let Some(len) = uncompressed_len {
+            data[4..8].copy_from_slice(&len.to_le_bytes());
+        }
+        if let Some(rows) = row_count {
+            data[12..16].copy_from_slice(&rows.to_le_bytes());
+        }
+        fs::write(&data_path, &data).unwrap();
+
+        let index_path = segment::index_path(dir, segment_id);
+        let stored = fs::read(&index_path).unwrap();
+        let mut index = if stored.len() >= 4 && stored[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+            zstd::bulk::decompress(&stored, 1024 * 1024).unwrap()
+        } else {
+            stored
+        };
+        assert_eq!(&index[..4], segment::INDEX_MAGIC);
+        let entry = segment::INDEX_HEADER_LEN;
+        if let Some(len) = uncompressed_len {
+            index[entry + 12..entry + 16].copy_from_slice(&len.to_le_bytes());
+        }
+        if let Some(rows) = row_count {
+            index[entry + 16..entry + 20].copy_from_slice(&rows.to_le_bytes());
+        }
+        fs::write(&index_path, &index).unwrap();
     }
 
     #[test]
