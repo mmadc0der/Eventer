@@ -2,7 +2,7 @@
 
 Append-only store for JSON events. A typed schema fixes the columns. Rows are packed into columnar blocks, compressed with zstd, and written to segment files. A sparse index records each block's minimum and maximum timestamp so a time-range read can skip blocks that cannot match. A zone map next to that index records equality stats for each column, so a filtered read can skip a block whose payload cannot contain the value.
 
-The library is both an rlib and a cdylib (`libeventer.so` / `eventer.dll`) with a small C API. `eventer-server` links the rlib and serves two routes.
+The library is both an rlib and a cdylib (`libeventer.so` / `eventer.dll`) with a small C API. `eventer-server` links the rlib and serves the HTTP routes.
 
 ## Layout
 
@@ -76,6 +76,14 @@ curl -sS --get 'http://127.0.0.1:43123/events' \
   --data-urlencode 'eq=action=click'
 ```
 
+`POST /events/drop` deletes blocks whose maximum timestamp is strictly less than a caller-supplied cutoff. The body is `{"before_ms": N}` where `N` is a signed integer in the `i64` range. The response is `{"ok":true}`. `N` is not taken from the newest stored timestamp, so one future event cannot expire the table. A cutoff equal to a block's maximum keeps that block. A row older than `N` stays when a later row in the same block is still inside the window. A segment's `.dat`, `.idx`, `.zon`, and `.dict` files are removed only when every block in that segment is eligible. A missing `before_ms`, a non-integer, a JSON array, or a value that is not an object is status `400` and leaves the store unchanged.
+
+```bash
+curl -sS -X POST http://127.0.0.1:43123/events/drop \
+  -H 'content-type: application/json' \
+  --data '{"before_ms":1700000000000}'
+```
+
 `GET /health` returns `{"status":"ok"}`. The server listens on localhost and has no authentication. Point it at a directory used by only one process.
 
 ## C API
@@ -137,4 +145,4 @@ Stored size was identical across the runs (394,005 data bytes, 49 blocks, one se
 
 `Store::count` and `Store::count_with_filter` return how many rows the matching unpaged query would. They do not build a JSON array. A block with no predicates counts timestamps only.
 
-`Store::drop_blocks_before(cutoff_ms)` deletes blocks whose maximum timestamp is strictly less than `cutoff_ms`. The cutoff is an argument, not the newest timestamp stored, so one future event cannot expire the table. A block is kept or dropped as a whole: a row older than the cutoff stays when a later row in the same block is still inside the window. A segment file (`.dat`, `.idx`, `.zon`, and `.dict`) is removed only when every block in it is eligible. A mixed segment is rewritten by copying the surviving compressed frames unchanged and publishing that file with `rename`, so a crash leaves either the old segment or the new one. The segment dictionary stays when any surviving frame was compressed with it. After the call, a query no longer returns a row from a block whose maximum timestamp is below the cutoff, including after the directory is opened again. Rows that shared a kept block stay.
+`Store::drop_blocks_before(cutoff_ms)` deletes blocks whose maximum timestamp is strictly less than `cutoff_ms`. The cutoff is an argument, not the newest timestamp stored, so one future event cannot expire the table. A block is kept or dropped as a whole: a row older than the cutoff stays when a later row in the same block is still inside the window. A segment file (`.dat`, `.idx`, `.zon`, and `.dict`) is removed only when every block in it is eligible. A mixed segment is rewritten by copying the surviving compressed frames unchanged and publishing that file with `rename`, so a crash leaves either the old segment or the new one. The segment dictionary stays when any surviving frame was compressed with it. After the call, a query no longer returns a row from a block whose maximum timestamp is below the cutoff, including after the directory is opened again. Rows that shared a kept block stay. `POST /events/drop` is that call with `before_ms` as the cutoff.
