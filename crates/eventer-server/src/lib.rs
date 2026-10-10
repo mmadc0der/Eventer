@@ -8,6 +8,8 @@
 //! `limit` keeps the first matching rows and `offset` skips matches before that.
 //! Omitting both returns the full match set.
 //! `GET /events/count` returns `{"count":N}` for that same range and filters.
+//! `GET /events/histogram?from=&to=&bucket_ms=N` returns one count per epoch-aligned
+//! bucket that intersects that inclusive range.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
 //! with the caller's `before_ms`. The request `Content-Type` must be
 //! `application/json`, with an optional `charset=utf-8`. A block is removed
@@ -36,6 +38,7 @@ pub fn router(store: Arc<eventer::Store>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/events/count", get(count_events))
+        .route("/events/histogram", get(histogram_events))
         .route("/events", get(get_events).post(post_event))
         .route("/events/drop", post(post_drop))
         .with_state(AppState { store })
@@ -238,7 +241,7 @@ async fn count_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
-    if let Err(response) = reject_page_params(raw) {
+    if let Err(response) = reject_page_params(raw, "/events/count") {
         return *response;
     }
     let from = match parse_bound(params.from, "from") {
@@ -274,7 +277,124 @@ async fn count_events(
     }
 }
 
-fn reject_page_params(query: &str) -> std::result::Result<(), Box<Response>> {
+async fn histogram_events(
+    State(state): State<AppState>,
+    Query(params): Query<RangeParams>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let raw = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_page_params(raw, "/events/histogram") {
+        return *response;
+    }
+    let bucket_ms = match bucket_ms_param(raw) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let from = match parse_bound(params.from, "from") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let to = match parse_bound(params.to, "to") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    if let Err(response) = reject_wide_histogram(from, to, bucket_ms) {
+        return *response;
+    }
+    let specs = match eq_specs(raw) {
+        Ok(specs) => specs,
+        Err(response) => return *response,
+    };
+    let mut predicates = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        match parse_eq(state.store.schema(), spec) {
+            Ok(predicate) => predicates.push(predicate),
+            Err(response) => return *response,
+        }
+    }
+    let store = Arc::clone(&state.store);
+    let joined = tokio::task::spawn_blocking(move || {
+        store.histogram_with_filter(from, to, bucket_ms, &predicates)
+    })
+    .await;
+    match joined {
+        Ok(Ok(buckets)) => {
+            let body = serde_json::json!({
+                "buckets": buckets
+                    .into_iter()
+                    .map(|bucket| serde_json::json!({
+                        "start_ms": bucket.start_ms,
+                        "count": bucket.count,
+                    }))
+                    .collect::<Vec<_>>()
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Ok(Err(err)) => error_response(&err),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "histogram task failed"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Refuse a span that would emit more than [`eventer::MAX_HISTOGRAM_BUCKETS`]
+/// before the store is asked to read anything.
+fn reject_wide_histogram(
+    from: i64,
+    to: i64,
+    bucket_ms: i64,
+) -> std::result::Result<(), Box<Response>> {
+    if from > to {
+        return Ok(());
+    }
+    let width = i128::from(bucket_ms);
+    let first = i128::from(from).div_euclid(width) * width;
+    let last = i128::from(to).div_euclid(width) * width;
+    let buckets = (last - first) / width + 1;
+    if buckets > i128::from(eventer::MAX_HISTOGRAM_BUCKETS as u32) {
+        return Err(bad_request("histogram would emit more than 4096 buckets"));
+    }
+    if i64::try_from(first).is_err() {
+        return Err(bad_request("histogram bucket start is outside i64"));
+    }
+    Ok(())
+}
+
+fn bucket_ms_param(query: &str) -> std::result::Result<i64, Box<Response>> {
+    let mut found = None;
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = pair.split_once('=') else {
+                if percent_decode(pair, "bucket_ms")? == "bucket_ms" {
+                    return Err(bad_request("`bucket_ms` must be a positive integer"));
+                }
+                continue;
+            };
+            if percent_decode(key, "bucket_ms")? != "bucket_ms" {
+                continue;
+            }
+            if found.is_some() {
+                return Err(bad_request("`bucket_ms` was given more than once"));
+            }
+            let value = percent_decode(value, "bucket_ms")?;
+            let parsed = value
+                .parse::<i64>()
+                .map_err(|_| bad_request("`bucket_ms` must be a positive integer"))?;
+            if parsed <= 0 {
+                return Err(bad_request("`bucket_ms` must be a positive integer"));
+            }
+            found = Some(parsed);
+        }
+    }
+    found.ok_or_else(|| bad_request("missing `bucket_ms` query parameter"))
+}
+
+fn reject_page_params(query: &str, route: &str) -> std::result::Result<(), Box<Response>> {
     if query.is_empty() {
         return Ok(());
     }
@@ -286,7 +406,7 @@ fn reject_page_params(query: &str) -> std::result::Result<(), Box<Response>> {
         let key = percent_decode(key, "query")?;
         if key == "limit" || key == "offset" {
             return Err(bad_request(&format!(
-                "`{key}` is not a parameter of /events/count"
+                "`{key}` is not a parameter of {route}"
             )));
         }
     }
@@ -1168,6 +1288,154 @@ mod tests {
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[tokio::test]
+    async fn histogram_buckets_match_count_and_reject_a_wide_span() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-histogram-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = eventer::StoreOptions {
+            block_rows: 2,
+            linger: Duration::from_millis(1),
+            parser_threads: 1,
+            compress_threads: 1,
+            ..eventer::StoreOptions::default()
+        };
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+
+        for (ts, action) in [(1000, "click"), (2000, "view"), (3000, "click")] {
+            let (status, _) = post(&app, &format!(r#"{{"ts":{ts},"action":"{action}"}}"#)).await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let fine = get_json(&app, "/events/histogram?from=1000&to=3000&bucket_ms=1000").await;
+        assert_eq!(fine.0, StatusCode::OK);
+        assert_eq!(
+            fine.1,
+            json!({
+                "buckets": [
+                    {"start_ms": 1000, "count": 1},
+                    {"start_ms": 2000, "count": 1},
+                    {"start_ms": 3000, "count": 1}
+                ]
+            })
+        );
+
+        let wide = get_json(&app, "/events/histogram?from=1000&to=3000&bucket_ms=2000").await;
+        assert_eq!(wide.0, StatusCode::OK);
+        assert_eq!(
+            wide.1,
+            json!({
+                "buckets": [
+                    {"start_ms": 0, "count": 1},
+                    {"start_ms": 2000, "count": 2}
+                ]
+            })
+        );
+
+        let gapped = get_json(&app, "/events/histogram?from=1000&to=5000&bucket_ms=1000").await;
+        assert_eq!(gapped.0, StatusCode::OK);
+        let buckets = gapped.1["buckets"].as_array().unwrap();
+        assert!(buckets.iter().any(|bucket| bucket["count"] == 0));
+        let sum: i64 = buckets
+            .iter()
+            .map(|bucket| bucket["count"].as_i64().unwrap())
+            .sum();
+        let counted = get_json(&app, "/events/count?from=1000&to=5000").await;
+        assert_eq!(sum, counted.1["count"].as_i64().unwrap());
+
+        let filtered = get_json(
+            &app,
+            "/events/histogram?from=1000&to=3000&bucket_ms=1000&eq=action=missing",
+        )
+        .await;
+        assert_eq!(filtered.0, StatusCode::OK);
+        let filtered_sum: i64 = filtered.1["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bucket| bucket["count"].as_i64().unwrap())
+            .sum();
+        let filtered_count =
+            get_json(&app, "/events/count?from=1000&to=3000&eq=action=missing").await;
+        assert_eq!(filtered_sum, 0);
+        assert_eq!(filtered_sum, filtered_count.1["count"].as_i64().unwrap());
+        assert_eq!(filtered.1["buckets"].as_array().unwrap().len(), 3);
+
+        let clicks = get_json(
+            &app,
+            "/events/histogram?from=1000&to=3000&bucket_ms=1000&eq=action=click",
+        )
+        .await;
+        assert_eq!(clicks.0, StatusCode::OK);
+        assert_eq!(
+            clicks.1,
+            json!({
+                "buckets": [
+                    {"start_ms": 1000, "count": 1},
+                    {"start_ms": 2000, "count": 0},
+                    {"start_ms": 3000, "count": 1}
+                ]
+            })
+        );
+
+        for uri in [
+            "/events/histogram?from=1000&to=3000",
+            "/events/histogram?from=1000&to=3000&bucket_ms=0",
+            "/events/histogram?from=1000&to=3000&bucket_ms=-1",
+            "/events/histogram?from=1000&to=3000&bucket_ms=1.5",
+            "/events/histogram?from=1000&to=3000&bucket_ms=nope",
+            "/events/histogram?from=0&to=4096&bucket_ms=1",
+            &format!("/events/histogram?from={}&to={}&bucket_ms=1000", i64::MIN, i64::MIN),
+            "/events/histogram?from=1000&to=3000&bucket_ms=1000&limit=1",
+            "/events/histogram?from=1000&to=3000&bucket_ms=1000&offset=0",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(body.get("buckets").is_none(), "{uri}");
+            assert!(body["error"].is_string(), "{uri}");
+        }
+
+        let below = get_json(
+            &app,
+            &format!("/events/histogram?from={}&to={}&bucket_ms=1000", i64::MIN, i64::MIN),
+        )
+        .await;
+        assert_eq!(below.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            below.1["error"],
+            json!("histogram bucket start is outside i64")
+        );
+
+        let after = get_json(&app, "/events/count?from=1000&to=3000").await;
+        assert_eq!(after.0, StatusCode::OK);
+        assert_eq!(after.1, json!({"count": 3}));
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
 
     fn temp_store(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let nanos = SystemTime::now()

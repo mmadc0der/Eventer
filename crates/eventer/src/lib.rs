@@ -12,6 +12,8 @@
 //! [`Store::count_with_filter`](store::Store::count_with_filter) counts those
 //! rows without building the JSON array. A block with no predicates reads
 //! timestamps only.
+//! [`Store::histogram_with_filter`](store::Store::histogram_with_filter) counts
+//! the same rows into fixed epoch-aligned time buckets.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares
@@ -30,7 +32,7 @@ mod zone;
 
 pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
-pub use store::{Predicate, Stats, Store, StoreOptions};
+pub use store::{HistogramBucket, Predicate, Stats, Store, StoreOptions, MAX_HISTOGRAM_BUCKETS};
 pub use value::{scalar_from_literal, Scalar};
 
 /// Uncompressed size of each column for one block, including its null bitmap.
