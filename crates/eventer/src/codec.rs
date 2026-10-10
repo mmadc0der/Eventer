@@ -441,19 +441,62 @@ fn encode_column(out: &mut Vec<u8>, ty: FieldType, rows: &[Row], index: usize) -
     Ok(())
 }
 
+/// Null flags. `0` is no nulls. `1` is the full present bitmap. `3` is one
+/// period of that bitmap: a period byte, then `ceil(period / 8)` pattern
+/// bytes in the same bit order. Row `i` uses bit `i % period`.
+const NULL_PERIOD: u8 = 3;
+/// Bool kinds. `0` is empty, `1` is a constant, `2` is the full bitmap.
+/// `4` is one period of the present values, same layout as a null period.
+const BOOL_PERIOD: u8 = 4;
+const MAX_BITMAP_PERIOD: usize = 32;
+
 fn write_nulls(out: &mut Vec<u8>, nulls: &[bool]) {
     if nulls.iter().all(|is_null| !is_null) {
         out.push(0);
         return;
     }
+    // Flag 1 stores a present bit, so the period is taken over those bits.
+    let present: Vec<bool> = nulls.iter().map(|is_null| !is_null).collect();
+    if let Some(period) = repeating_bit_period(&present) {
+        out.push(NULL_PERIOD);
+        out.push(period as u8);
+        out.extend_from_slice(&pack_present_bits(&present[..period]));
+        return;
+    }
     out.push(1);
-    let mut bitmap = vec![0u8; nulls.len().div_ceil(8)];
-    for (index, is_null) in nulls.iter().enumerate() {
-        if !is_null {
+    out.extend_from_slice(&pack_present_bits(&present));
+}
+
+fn pack_present_bits(present: &[bool]) -> Vec<u8> {
+    let mut bitmap = vec![0u8; present.len().div_ceil(8)];
+    for (index, is_present) in present.iter().enumerate() {
+        if *is_present {
             bitmap[index / 8] |= 1 << (index % 8);
         }
     }
-    out.extend_from_slice(&bitmap);
+    bitmap
+}
+
+/// Smallest `period` in `1..=32` such that bit `i` equals bit `i % period`,
+/// and only when `2 + ceil(period / 8)` is strictly shorter than the full
+/// bitmap framing `1 + ceil(len / 8)`. A longer multiple cannot be smaller.
+fn repeating_bit_period(bits: &[bool]) -> Option<usize> {
+    let count = bits.len();
+    let full_len = 1 + count.div_ceil(8);
+    if full_len <= 3 || count < 2 {
+        return None;
+    }
+    let max_period = MAX_BITMAP_PERIOD.min(count - 1);
+    for period in 1..=max_period {
+        if (period..count).all(|index| bits[index] == bits[index % period]) {
+            let periodic_len = 2 + period.div_ceil(8);
+            if periodic_len < full_len {
+                return Some(period);
+            }
+            return None;
+        }
+    }
+    None
 }
 
 /// Integer kind bytes. Kinds 0–6 are the original empty, constant, and
@@ -904,14 +947,13 @@ fn encode_bools(values: &[Option<bool>]) -> Vec<u8> {
     if present.iter().all(|value| *value == present[0]) {
         return vec![1, u8::from(present[0])];
     }
-    let mut out = vec![2];
-    let mut bitmap = vec![0u8; present.len().div_ceil(8)];
-    for (index, value) in present.iter().enumerate() {
-        if *value {
-            bitmap[index / 8] |= 1 << (index % 8);
-        }
+    if let Some(period) = repeating_bit_period(&present) {
+        let mut out = vec![BOOL_PERIOD, period as u8];
+        out.extend_from_slice(&pack_present_bits(&present[..period]));
+        return out;
     }
-    out.extend_from_slice(&bitmap);
+    let mut out = vec![2];
+    out.extend_from_slice(&pack_present_bits(&present));
     out
 }
 
@@ -1581,6 +1623,10 @@ fn skip_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<()> {
             let _ = read_exact(bytes, cursor, count.div_ceil(8))?;
             Ok(())
         }
+        BOOL_PERIOD => {
+            let _ = read_bitmap_period(bytes, cursor)?;
+            Ok(())
+        }
         _ => Err(Error::corrupt(format!("unknown bool encoding {kind}"))),
     }
 }
@@ -1713,8 +1759,28 @@ fn read_present(bytes: &[u8], cursor: &mut usize, nrows: usize) -> Result<Option
             }
             Ok(Some(present))
         }
+        NULL_PERIOD => Ok(Some(expand_bitmap_period(bytes, cursor, nrows)?)),
         _ => Err(Error::corrupt(format!("unknown null flag {flags}"))),
     }
+}
+
+fn read_bitmap_period<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<(usize, &'a [u8])> {
+    let period = read_u8(bytes, cursor)? as usize;
+    if period == 0 || period > MAX_BITMAP_PERIOD {
+        return Err(Error::corrupt("bitmap period is invalid"));
+    }
+    let pattern = read_exact(bytes, cursor, period.div_ceil(8))?;
+    Ok((period, pattern))
+}
+
+fn expand_bitmap_period(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<bool>> {
+    let (period, pattern) = read_bitmap_period(bytes, cursor)?;
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let bit = index % period;
+        out.push(pattern[bit / 8] & (1 << (bit % 8)) != 0);
+    }
+    Ok(out)
 }
 
 fn decode_i64s(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<i64>> {
@@ -1904,6 +1970,7 @@ fn decode_bools(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<bo
             }
             Ok(out)
         }
+        BOOL_PERIOD => expand_bitmap_period(bytes, cursor, count),
         _ => Err(Error::corrupt(format!("unknown bool encoding {kind}"))),
     }
 }
@@ -2614,11 +2681,7 @@ mod tests {
         let nrows = block_row_count(bytes).unwrap();
         let mut cursor = 4;
         skip_column(FieldType::Timestamp, bytes, &mut cursor, nrows, true).unwrap();
-        let null_flag = bytes[cursor];
-        cursor += 1;
-        if null_flag == 1 {
-            cursor += nrows.div_ceil(8);
-        }
+        let _ = read_present(bytes, &mut cursor, nrows).unwrap();
         bytes[cursor]
     }
 
@@ -4292,6 +4355,242 @@ mod tests {
             .to_string()
             .contains("period"));
         assert!(skip_f64s(&bad_period, &mut 0, 6).is_err());
+    }
+
+    #[test]
+    fn repeating_null_bitmap_stores_one_period() {
+        let nulls: Vec<bool> = (0..64).map(|index| index % 4 == 0).collect();
+        let mut out = Vec::new();
+        write_nulls(&mut out, &nulls);
+        // Present bits of one period: row 0 null, then three present rows.
+        assert_eq!(out, vec![NULL_PERIOD, 4, 0b0000_1110]);
+        let mut cursor = 0;
+        let present = read_present(&out, &mut cursor, nulls.len())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor, out.len());
+        for (index, is_null) in nulls.iter().enumerate() {
+            assert_eq!(present[index], !is_null);
+        }
+
+        // Period 9 crosses into a second pattern byte.
+        let wide: Vec<bool> = (0..40).map(|index| index % 9 == 8).collect();
+        let mut out = Vec::new();
+        write_nulls(&mut out, &wide);
+        assert_eq!(out[0], NULL_PERIOD);
+        assert_eq!(out[1], 9);
+        assert_eq!(out.len(), 4);
+        let mut cursor = 0;
+        let present = read_present(&out, &mut cursor, wide.len())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor, out.len());
+        for (index, is_null) in wide.iter().enumerate() {
+            assert_eq!(present[index], !is_null);
+        }
+
+        let all_null = vec![true; 40];
+        let mut out = Vec::new();
+        write_nulls(&mut out, &all_null);
+        assert_eq!(out, vec![NULL_PERIOD, 1, 0]);
+        let mut cursor = 0;
+        let present = read_present(&out, &mut cursor, all_null.len())
+            .unwrap()
+            .unwrap();
+        assert!(present.iter().all(|is_present| !is_present));
+    }
+
+    #[test]
+    fn null_period_stays_full_when_it_does_not_shrink() {
+        let tied: Vec<bool> = (0..16).map(|index| index % 2 == 0).collect();
+        let mut out = Vec::new();
+        write_nulls(&mut out, &tied);
+        assert_eq!(out[0], 1);
+        assert_eq!(out.len(), 1 + 16_usize.div_ceil(8));
+
+        let mut irregular = vec![false; 40];
+        for index in [0, 1, 3, 8, 17, 39] {
+            irregular[index] = true;
+        }
+        let mut out = Vec::new();
+        write_nulls(&mut out, &irregular);
+        assert_eq!(out[0], 1);
+
+        // Smallest cycle is 33, past the period cap, so the full bitmap stays.
+        let capped: Vec<bool> = (0..80).map(|index| index % 33 == 0).collect();
+        let mut out = Vec::new();
+        write_nulls(&mut out, &capped);
+        assert_eq!(out[0], 1);
+        assert_eq!(out.len(), 1 + 80_usize.div_ceil(8));
+        let mut cursor = 0;
+        let present = read_present(&out, &mut cursor, capped.len())
+            .unwrap()
+            .unwrap();
+        for (index, is_null) in capped.iter().enumerate() {
+            assert_eq!(present[index], !is_null);
+        }
+
+        let mut none = Vec::new();
+        write_nulls(&mut none, &[false; 40]);
+        assert_eq!(none, vec![0]);
+    }
+
+    #[test]
+    fn repeating_bool_bitmap_stores_one_period() {
+        let values: Vec<Option<bool>> = (0..64).map(|index| Some(index % 2 == 0)).collect();
+        let encoded = encode_bools(&values);
+        assert_eq!(encoded, vec![BOOL_PERIOD, 2, 0b0000_0001]);
+        let mut cursor = 0;
+        let decoded = decode_bools(&encoded, &mut cursor, values.len()).unwrap();
+        assert_eq!(cursor, encoded.len());
+        assert_eq!(
+            decoded,
+            values.iter().copied().flatten().collect::<Vec<_>>()
+        );
+        let mut skip = 0;
+        skip_bools(&encoded, &mut skip, values.len()).unwrap();
+        assert_eq!(skip, encoded.len());
+
+        let constant = vec![Some(true); 64];
+        assert_eq!(encode_bools(&constant), vec![1, 1]);
+        assert_eq!(encode_bools(&[]), vec![0]);
+
+        // 16 alternating values tie the full bitmap, so kind 2 stays.
+        let tied: Vec<Option<bool>> = (0..16).map(|index| Some(index % 2 == 0)).collect();
+        let encoded = encode_bools(&tied);
+        assert_eq!(encoded[0], 2);
+        assert_eq!(encoded.len(), 1 + 16_usize.div_ceil(8));
+
+        let noisy: Vec<Option<bool>> = (0..40)
+            .map(|index| Some(index % 7 == 0 || index % 5 == 0))
+            .collect();
+        assert_eq!(encode_bools(&noisy)[0], 2);
+    }
+
+    #[test]
+    fn legacy_null_bitmap_and_bool_bitmap_still_decode() {
+        let nulls: Vec<bool> = (0..64).map(|index| index % 4 == 0).collect();
+        let present_bits: Vec<bool> = nulls.iter().map(|is_null| !is_null).collect();
+        let mut legacy = vec![1];
+        legacy.extend_from_slice(&pack_present_bits(&present_bits));
+        let mut cursor = 0;
+        let present = read_present(&legacy, &mut cursor, nulls.len())
+            .unwrap()
+            .unwrap();
+        assert_eq!(present, present_bits);
+
+        let values: Vec<bool> = (0..64).map(|index| index % 2 == 0).collect();
+        let mut legacy = vec![2];
+        legacy.extend_from_slice(&pack_present_bits(&values));
+        let mut cursor = 0;
+        assert_eq!(
+            decode_bools(&legacy, &mut cursor, values.len()).unwrap(),
+            values
+        );
+        let mut skip = 0;
+        skip_bools(&legacy, &mut skip, values.len()).unwrap();
+        assert_eq!(skip, legacy.len());
+    }
+
+    #[test]
+    fn bitmap_period_rejects_a_bad_period() {
+        for bad in [0u8, 33, 255] {
+            let nulls = vec![NULL_PERIOD, bad, 0];
+            assert!(read_present(&nulls, &mut 0, 64)
+                .unwrap_err()
+                .to_string()
+                .contains("period"));
+            let bools = vec![BOOL_PERIOD, bad, 0];
+            assert!(decode_bools(&bools, &mut 0, 64).is_err());
+            assert!(skip_bools(&bools, &mut 0, 64).is_err());
+        }
+        let truncated = vec![NULL_PERIOD, 32];
+        assert!(read_present(&truncated, &mut 0, 64).is_err());
+        assert!(decode_bools(&truncated, &mut 0, 64).is_err());
+    }
+
+    #[test]
+    fn periodic_null_and_bool_columns_reopen() {
+        let schema = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "note", "type": "text"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for index in 0..64i64 {
+            let mut obj = serde_json::json!({
+                "ts": 1_000 + index,
+                "ok": index % 2 == 0,
+            });
+            if index % 4 != 0 {
+                obj["note"] = serde_json::json!("n");
+            }
+            rows.push(parse_event(&schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap());
+        }
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let mut cursor = 4;
+        skip_column(
+            FieldType::Timestamp,
+            &encoded.bytes,
+            &mut cursor,
+            rows.len(),
+            true,
+        )
+        .unwrap();
+        let ok_at = cursor;
+        assert_eq!(encoded.bytes[cursor], 0, "ok has no nulls");
+        let _ = read_present(&encoded.bytes, &mut cursor, rows.len()).unwrap();
+        assert_eq!(encoded.bytes[cursor], BOOL_PERIOD);
+        cursor = ok_at;
+        skip_column(
+            FieldType::Bool,
+            &encoded.bytes,
+            &mut cursor,
+            rows.len(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(encoded.bytes[cursor], NULL_PERIOD);
+        assert_eq!(encoded.bytes[cursor + 1], 4);
+
+        let decoded = decode_block(&schema, &encoded.bytes).unwrap();
+        for (left, right) in rows.iter().zip(decoded.iter()) {
+            assert_eq!(left.values, right.values);
+        }
+        let trues = decode_rows_in_range_filtered(
+            &schema,
+            &encoded.bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[ColumnPredicate {
+                index: 1,
+                allowed: vec![Scalar::Bool(true)],
+            }],
+        )
+        .unwrap();
+        assert_eq!(trues.len(), 32);
+        assert!(trues.iter().all(|row| row.values[1] == Scalar::Bool(true)));
+        let missing = decode_rows_in_range_filtered(
+            &schema,
+            &encoded.bytes,
+            i64::MIN,
+            i64::MAX,
+            usize::MAX,
+            &[ColumnPredicate {
+                index: 2,
+                allowed: vec![Scalar::Null],
+            }],
+        )
+        .unwrap();
+        assert_eq!(missing.len(), 16);
+        assert!(missing.iter().all(|row| row.values[2] == Scalar::Null));
     }
 
     #[test]
