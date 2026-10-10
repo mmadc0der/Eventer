@@ -356,6 +356,9 @@ fn reject_wide_histogram(
     if buckets > i128::from(eventer::MAX_HISTOGRAM_BUCKETS as u32) {
         return Err(bad_request("histogram would emit more than 4096 buckets"));
     }
+    if i64::try_from(first).is_err() {
+        return Err(bad_request("histogram bucket start is outside i64"));
+    }
     Ok(())
 }
 
@@ -1404,6 +1407,7 @@ mod tests {
             "/events/histogram?from=1000&to=3000&bucket_ms=1.5",
             "/events/histogram?from=1000&to=3000&bucket_ms=nope",
             "/events/histogram?from=0&to=4096&bucket_ms=1",
+            &format!("/events/histogram?from={}&to={}&bucket_ms=1000", i64::MIN, i64::MIN),
             "/events/histogram?from=1000&to=3000&bucket_ms=1000&limit=1",
             "/events/histogram?from=1000&to=3000&bucket_ms=1000&offset=0",
         ] {
@@ -1412,6 +1416,17 @@ mod tests {
             assert!(body.get("buckets").is_none(), "{uri}");
             assert!(body["error"].is_string(), "{uri}");
         }
+
+        let below = get_json(
+            &app,
+            &format!("/events/histogram?from={}&to={}&bucket_ms=1000", i64::MIN, i64::MIN),
+        )
+        .await;
+        assert_eq!(below.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            below.1["error"],
+            json!("histogram bucket start is outside i64")
+        );
 
         let after = get_json(&app, "/events/count?from=1000&to=3000").await;
         assert_eq!(after.0, StatusCode::OK);

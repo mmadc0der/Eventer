@@ -790,6 +790,11 @@ fn histogram_span(from_ms: i64, to_ms: i64, bucket_ms: i64) -> Result<Option<His
     if buckets > i128::from(MAX_HISTOGRAM_BUCKETS as u32) {
         return Err(Error::event("histogram would emit more than 4096 buckets"));
     }
+    // Later starts sit between `first_start` and `floor(to / bucket_ms) * bucket_ms`,
+    // and that last start is always `<= to`, so a representable first start is enough.
+    if i64::try_from(first_start).is_err() {
+        return Err(Error::event("histogram bucket start is outside i64"));
+    }
     let buckets =
         usize::try_from(buckets).map_err(|_| Error::event("histogram bucket overflow"))?;
     Ok(Some(HistogramSpan {
@@ -2182,6 +2187,13 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         let err = store.histogram(0, 4096, 1).unwrap_err();
         assert!(err.to_string().contains("4096"), "{err}");
+        let unrepresentable = store.histogram(i64::MIN, i64::MIN, 1000).unwrap_err();
+        assert!(
+            unrepresentable
+                .to_string()
+                .contains("histogram bucket start is outside i64"),
+            "{unrepresentable}"
+        );
         assert!(store.count(1000, 1000).is_err());
         store.close().unwrap();
     }
