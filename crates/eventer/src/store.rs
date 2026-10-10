@@ -1102,8 +1102,8 @@ mod tests {
         store.close().unwrap();
     }
 
-    /// Rewrite the first frame header and the matching index entry. The payload
-    /// CRC does not cover these fields, and open keeps them when the index matches.
+    /// Rewrite uncompressed length and row count in the index. A 12-byte frame
+    /// does not store them, and open keeps the index values for that frame.
     fn patch_block_header(
         dir: &Path,
         segment_id: u32,
@@ -1111,15 +1111,8 @@ mod tests {
         row_count: Option<u32>,
     ) {
         let data_path = segment::data_path(dir, segment_id);
-        let mut data = fs::read(&data_path).unwrap();
+        let data = fs::read(&data_path).unwrap();
         assert_eq!(&data[..4], segment::BLOCK_MAGIC);
-        if let Some(len) = uncompressed_len {
-            data[4..8].copy_from_slice(&len.to_le_bytes());
-        }
-        if let Some(rows) = row_count {
-            data[12..16].copy_from_slice(&rows.to_le_bytes());
-        }
-        fs::write(&data_path, &data).unwrap();
 
         let index_path = segment::index_path(dir, segment_id);
         let stored = fs::read(&index_path).unwrap();
@@ -2586,8 +2579,14 @@ mod tests {
         let mut off = 0usize;
         let mut out = Vec::new();
         for frame in segment::frames_in(&data) {
+            let compressed_at = if frame.header_len == segment::BLOCK_HEADER_LEN {
+                off + 4
+            } else {
+                off + 8
+            };
             let compressed_len =
-                u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+                u32::from_le_bytes(data[compressed_at..compressed_at + 4].try_into().unwrap())
+                    as usize;
             let start = off + frame.header_len;
             let end = start + compressed_len;
             assert!(end <= data.len());
