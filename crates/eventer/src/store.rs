@@ -440,7 +440,12 @@ impl Store {
         let mut total = 0u64;
         let mut dictionaries = HashMap::new();
         for block in blocks {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
+                return Err(Error::event("query response size limit exceeded"));
+            }
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let nrows = block_row_count(&payload)?;
+            require_header_row_count(block.row_count, nrows)?;
             let matched =
                 count_rows_in_range_filtered(&self.schema, &payload, from_ms, to_ms, &resolved)?;
             total = total
@@ -1956,6 +1961,76 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         assert_eq!(store.count_with_filter(0, 10_000, &predicates).unwrap(), 32);
         assert!(store.query(victim.min_ts, victim.max_ts).is_err());
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn count_refuses_an_uncompressed_len_above_the_query_ceiling() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(2);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        store
+            .append_json(&event(10, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(20, Some(2), "view", None, "1.00"))
+            .unwrap();
+        store.close().unwrap();
+
+        patch_block_header(&data, 1, Some(u32::MAX), None);
+
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        let click = [Predicate::Eq("action".into(), "click".into())];
+        for (label, err) in [
+            ("count", store.count(10, 20).unwrap_err()),
+            (
+                "count_with_filter",
+                store.count_with_filter(10, 20, &click).unwrap_err(),
+            ),
+        ] {
+            assert!(
+                err.to_string()
+                    .contains("query response size limit exceeded"),
+                "{label}: {err}"
+            );
+        }
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn count_rejects_a_header_row_count_the_payload_does_not_match() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(3);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        for ts in [10, 20, 30, 40, 50] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.close().unwrap();
+
+        patch_block_header(&data, 1, None, Some(100));
+
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        let click = [Predicate::Eq("action".into(), "click".into())];
+        for (label, err) in [
+            ("count", store.count(10, 50).unwrap_err()),
+            (
+                "count_with_filter",
+                store.count_with_filter(10, 50, &click).unwrap_err(),
+            ),
+        ] {
+            assert!(matches!(err, Error::Corrupt(_)), "{label}: {err}");
+            assert!(
+                err.to_string()
+                    .contains("block row count does not match the frame header"),
+                "{label}: {err}"
+            );
+        }
         store.close().unwrap();
     }
 
