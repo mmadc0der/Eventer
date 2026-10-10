@@ -5,9 +5,12 @@
 //! queued, then queued together so the batch shares one fsync.
 //! `GET /events?from=&to=` returns a JSON array of events in that inclusive
 //! millisecond range. Repeat `eq=field=value` to AND equality filters into the scan.
+//! Repeat `gt`, `ge`, `lt`, and `le` as `field=value` to AND numeric ranges.
+//! `gt` and `lt` are exclusive. `ge` and `le` are inclusive.
 //! `limit` keeps the first matching rows and `offset` skips matches before that.
 //! Omitting both returns the full match set.
-//! `GET /events/count` returns `{"count":N}` for that same range and filters.
+//! `GET /events/count` and `GET /events/histogram` use that same range and those
+//! same filters. `limit` and `offset` are rejected on both.
 //! `GET /events/histogram?from=&to=&bucket_ms=N` returns one count per epoch-aligned
 //! bucket that intersects that inclusive range.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
@@ -98,11 +101,7 @@ fn ingest(store: &eventer::Store, body: &[u8]) -> eventer::Result<Ingest> {
     }
 }
 
-async fn post_drop(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn post_drop(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(response) = require_json_content_type(headers.get(CONTENT_TYPE)) {
         return *response;
     }
@@ -149,8 +148,7 @@ fn require_json_content_type(
             return Err(bad_request("Content-Type must be application/json"));
         };
         let charset = raw_value.trim().trim_matches('"');
-        if !name.trim().eq_ignore_ascii_case("charset") || !charset.eq_ignore_ascii_case("utf-8")
-        {
+        if !name.trim().eq_ignore_ascii_case("charset") || !charset.eq_ignore_ascii_case("utf-8") {
             return Err(bad_request("Content-Type must be application/json"));
         }
     }
@@ -199,21 +197,14 @@ async fn get_events(
         Err(response) => return *response,
     };
     let raw_query = raw.as_deref().unwrap_or("");
-    let specs = match eq_specs(raw_query) {
-        Ok(specs) => specs,
-        Err(response) => return *response,
-    };
     let (offset, limit) = match page_params(raw_query) {
         Ok(page) => page,
         Err(response) => return *response,
     };
-    let mut predicates = Vec::with_capacity(specs.len());
-    for spec in &specs {
-        match parse_eq(state.store.schema(), spec) {
-            Ok(predicate) => predicates.push(predicate),
-            Err(response) => return *response,
-        }
-    }
+    let predicates = match parse_filters(state.store.schema(), raw_query) {
+        Ok(predicates) => predicates,
+        Err(response) => return *response,
+    };
     let store = Arc::clone(&state.store);
     let joined = tokio::task::spawn_blocking(move || {
         store.query_json_window(from, to, &predicates, offset, limit)
@@ -252,17 +243,10 @@ async fn count_events(
         Ok(value) => value,
         Err(response) => return *response,
     };
-    let specs = match eq_specs(raw) {
-        Ok(specs) => specs,
+    let predicates = match parse_filters(state.store.schema(), raw) {
+        Ok(predicates) => predicates,
         Err(response) => return *response,
     };
-    let mut predicates = Vec::with_capacity(specs.len());
-    for spec in &specs {
-        match parse_eq(state.store.schema(), spec) {
-            Ok(predicate) => predicates.push(predicate),
-            Err(response) => return *response,
-        }
-    }
     let store = Arc::clone(&state.store);
     let joined =
         tokio::task::spawn_blocking(move || store.count_with_filter(from, to, &predicates)).await;
@@ -301,17 +285,10 @@ async fn histogram_events(
     if let Err(response) = reject_wide_histogram(from, to, bucket_ms) {
         return *response;
     }
-    let specs = match eq_specs(raw) {
-        Ok(specs) => specs,
+    let predicates = match parse_filters(state.store.schema(), raw) {
+        Ok(predicates) => predicates,
         Err(response) => return *response,
     };
-    let mut predicates = Vec::with_capacity(specs.len());
-    for spec in &specs {
-        match parse_eq(state.store.schema(), spec) {
-            Ok(predicate) => predicates.push(predicate),
-            Err(response) => return *response,
-        }
-    }
     let store = Arc::clone(&state.store);
     let joined = tokio::task::spawn_blocking(move || {
         store.histogram_with_filter(from, to, bucket_ms, &predicates)
@@ -523,6 +500,96 @@ fn percent_decode(input: &str, what: &str) -> std::result::Result<String, Box<Re
 
 fn bad_request(message: &str) -> Box<Response> {
     Box::new((StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response())
+}
+
+fn parse_filters(
+    schema: &eventer::Schema,
+    query: &str,
+) -> std::result::Result<Vec<Predicate>, Box<Response>> {
+    let mut predicates = Vec::new();
+    for spec in eq_specs(query)? {
+        predicates.push(parse_eq(schema, &spec)?);
+    }
+    for (op, spec) in cmp_specs(query)? {
+        predicates.push(parse_cmp(schema, op, &spec)?);
+    }
+    Ok(predicates)
+}
+
+fn cmp_specs(query: &str) -> std::result::Result<Vec<(eventer::CmpOp, String)>, Box<Response>> {
+    let mut specs = Vec::new();
+    if query.is_empty() {
+        return Ok(specs);
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = pair.split_once('=') else {
+            let key = percent_decode(pair, "query")?;
+            if cmp_op(&key).is_some() {
+                return Err(bad_request(&format!("`{key}` must be field=value")));
+            }
+            continue;
+        };
+        let key = percent_decode(key, "query")?;
+        let Some(op) = cmp_op(&key) else {
+            continue;
+        };
+        specs.push((op, percent_decode(value, &key)?));
+    }
+    Ok(specs)
+}
+
+fn cmp_op(key: &str) -> Option<eventer::CmpOp> {
+    match key {
+        "gt" => Some(eventer::CmpOp::Gt),
+        "ge" => Some(eventer::CmpOp::Ge),
+        "lt" => Some(eventer::CmpOp::Lt),
+        "le" => Some(eventer::CmpOp::Le),
+        _ => None,
+    }
+}
+
+fn parse_cmp(
+    schema: &eventer::Schema,
+    op: eventer::CmpOp,
+    spec: &str,
+) -> std::result::Result<Predicate, Box<Response>> {
+    let op_name = match op {
+        eventer::CmpOp::Gt => "gt",
+        eventer::CmpOp::Ge => "ge",
+        eventer::CmpOp::Lt => "lt",
+        eventer::CmpOp::Le => "le",
+    };
+    let Some((name, literal)) = spec.split_once('=') else {
+        return Err(bad_request(&format!("`{op_name}` must be field=value")));
+    };
+    if name.is_empty() {
+        return Err(bad_request(&format!("`{op_name}` is missing a field name")));
+    }
+    if literal.is_empty() {
+        return Err(bad_request(&format!("`{op_name}` is missing a value")));
+    }
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(bad_request(&format!("unknown filter field `{name}`")));
+    };
+    if matches!(
+        field.ty,
+        eventer::FieldType::Bool
+            | eventer::FieldType::String
+            | eventer::FieldType::Text
+            | eventer::FieldType::Json
+    ) {
+        return Err(bad_request(&format!(
+            "`{op_name}` does not apply to {} column `{name}`",
+            field.ty.name()
+        )));
+    }
+    match eventer::scalar_from_literal(field.ty, literal) {
+        Ok(scalar) => Ok(Predicate::Cmp(name.to_string(), op, scalar)),
+        Err(err) => Err(Box::new(error_response(&err))),
+    }
 }
 
 fn parse_eq(schema: &eventer::Schema, spec: &str) -> std::result::Result<Predicate, Box<Response>> {
@@ -1201,7 +1268,11 @@ mod tests {
                 .oneshot(builder.body(Body::from(cutoff.to_string())).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{content_type:?}");
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{content_type:?}"
+            );
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(body.get("error").is_some(), "{content_type:?} body {body}");
@@ -1407,7 +1478,11 @@ mod tests {
             "/events/histogram?from=1000&to=3000&bucket_ms=1.5",
             "/events/histogram?from=1000&to=3000&bucket_ms=nope",
             "/events/histogram?from=0&to=4096&bucket_ms=1",
-            &format!("/events/histogram?from={}&to={}&bucket_ms=1000", i64::MIN, i64::MIN),
+            &format!(
+                "/events/histogram?from={}&to={}&bucket_ms=1000",
+                i64::MIN,
+                i64::MIN
+            ),
             "/events/histogram?from=1000&to=3000&bucket_ms=1000&limit=1",
             "/events/histogram?from=1000&to=3000&bucket_ms=1000&offset=0",
         ] {
@@ -1419,7 +1494,11 @@ mod tests {
 
         let below = get_json(
             &app,
-            &format!("/events/histogram?from={}&to={}&bucket_ms=1000", i64::MIN, i64::MIN),
+            &format!(
+                "/events/histogram?from={}&to={}&bucket_ms=1000",
+                i64::MIN,
+                i64::MIN
+            ),
         )
         .await;
         assert_eq!(below.0, StatusCode::BAD_REQUEST);
@@ -1436,6 +1515,154 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[tokio::test]
+    async fn range_filters_agree_across_routes_and_reject_bad_bounds() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-range-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "text"},
+                    {"name": "amount", "type": "decimal", "scale": 2},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = eventer::StoreOptions {
+            block_rows: 8,
+            linger: Duration::from_millis(1),
+            parser_threads: 1,
+            compress_threads: 1,
+            ..eventer::StoreOptions::default()
+        };
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        for (ts, user, amount, score) in [
+            (1000i64, Some(1i64), "1.00", 1.0),
+            (2000, Some(5), "5.00", 5.0),
+            (3000, Some(9), "9.00", 9.0),
+            (4000, None, "5.00", 0.0),
+        ] {
+            let user_field = match user {
+                Some(user) => format!(r#""user_id":{user},"#),
+                None => String::new(),
+            };
+            let body = format!(
+                r#"{{"ts":{ts},{user_field}"score":{score},"ok":{},"action":"click","amount":"{amount}","props":{{"n":1}}}}"#,
+                user.is_some()
+            );
+            let (status, _) = post(&app, &body).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let user_ids = |rows: Vec<Value>| {
+            rows.into_iter()
+                .map(|row| row["user_id"].as_i64())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            user_ids(query(&app, "/events?from=1000&to=4000&ge=user_id=5").await),
+            vec![Some(5), Some(9)]
+        );
+        assert_eq!(
+            user_ids(query(&app, "/events?from=1000&to=4000&gt=user_id=5").await),
+            vec![Some(9)]
+        );
+        assert_eq!(
+            user_ids(query(&app, "/events?from=1000&to=4000&le=user_id=5").await),
+            vec![Some(1), Some(5)]
+        );
+        assert_eq!(
+            user_ids(query(&app, "/events?from=1000&to=4000&lt=user_id=5").await),
+            vec![Some(1)]
+        );
+
+        let amounts = query(&app, "/events?from=1000&to=4000&lt=amount=5.00").await;
+        assert!(amounts.iter().all(|row| row["amount"] == "1.00"));
+        assert_eq!(amounts.len(), 1);
+        let scores = query(&app, "/events?from=1000&to=4000&gt=score=5").await;
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0]["score"].as_f64(), Some(9.0));
+
+        let rows = query(
+            &app,
+            "/events?from=1000&to=4000&ge=user_id=5&eq=action=click",
+        )
+        .await;
+        let counted = get_json(
+            &app,
+            "/events/count?from=1000&to=4000&ge=user_id=5&eq=action=click",
+        )
+        .await;
+        assert_eq!(counted.0, StatusCode::OK);
+        assert_eq!(counted.1["count"], json!(rows.len()));
+        let buckets = get_json(
+            &app,
+            "/events/histogram?from=1000&to=4000&bucket_ms=1000&ge=user_id=5&eq=action=click",
+        )
+        .await;
+        assert_eq!(buckets.0, StatusCode::OK);
+        let sum: i64 = buckets.1["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bucket| bucket["count"].as_i64().unwrap())
+            .sum();
+        assert_eq!(sum, rows.len() as i64);
+
+        let page = query(
+            &app,
+            "/events?from=1000&to=4000&ge=user_id=5&limit=1&offset=1",
+        )
+        .await;
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["user_id"], 9);
+
+        for uri in [
+            "/events?from=1000&to=4000&gt=ok=true",
+            "/events?from=1000&to=4000&gt=action=a",
+            "/events?from=1000&to=4000&gt=note=a",
+            "/events?from=1000&to=4000&gt=props=1",
+            "/events?from=1000&to=4000&gt=missing=1",
+            "/events?from=1000&to=4000&gt=user_id",
+            "/events?from=1000&to=4000&gt=user_id=",
+            "/events?from=1000&to=4000&gt=user_id=nope",
+            "/events?from=1000&to=4000&gt=score=inf",
+            "/events?from=1000&to=4000&lt=amount=5.000",
+            "/events/count?from=1000&to=4000&ge=user_id=5&limit=1",
+            "/events/histogram?from=1000&to=4000&bucket_ms=1000&ge=user_id=5&offset=0",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+            assert!(body.get("error").is_some(), "{uri}");
+        }
+        assert_eq!(
+            query(&app, "/events?from=1000&to=4000").await.len(),
+            4,
+            "a rejected range does not change the stored rows"
+        );
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
 
     fn temp_store(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let nanos = SystemTime::now()
