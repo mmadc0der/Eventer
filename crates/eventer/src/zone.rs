@@ -11,13 +11,14 @@
 //! zone maps existed are summarized once on open and the summary is kept.
 //!
 //! The bytes on disk are still that zone file: `EVZN` header, then each block's
-//! length, checksum, and column records. The whole file is replaced by a plain
-//! zstd frame when the frame is strictly smaller, and left raw otherwise. A
-//! batch append rewrites the segment's zone file instead of appending a frame
-//! onto a raw prefix. Readers decompress a zstd magic with a bounded output
-//! size, then parse the zone file. A raw file still loads. A corrupt or
-//! truncated frame is rebuilt from payloads, the same path a corrupt raw file
-//! already takes.
+//! length and column records, then one crc32 of the bytes before that trailer.
+//! Version 1 files, which stored a crc32 in front of every record, still load.
+//! The whole file is replaced by a plain zstd frame when the frame is strictly
+//! smaller, and left raw otherwise. A batch append rewrites the segment's zone
+//! file instead of appending a frame onto a raw prefix. Readers decompress a
+//! zstd magic with a bounded output size, then parse the zone file. A raw file
+//! still loads. A corrupt or truncated frame, or a trailer that does not match,
+//! is rebuilt from payloads, the same path a corrupt raw file already takes.
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -31,8 +32,12 @@ use crate::segment::{self, BlockMeta};
 use crate::value::{Row, Scalar};
 
 const ZONE_MAGIC: &[u8; 4] = b"EVZN";
-const ZONE_VERSION: u16 = 1;
+/// A crc32 sits in front of every record. Still loaded; new files use version 2.
+const ZONE_VERSION_V1: u16 = 1;
+/// Each record is a length and a payload. One crc32 covers the image before the trailer.
+const ZONE_VERSION: u16 = 2;
 const ZONE_HEADER_LEN: usize = 16;
+const ZONE_TRAILER_LEN: usize = 4;
 /// Plain zstd frame magic. Distinct from [`ZONE_MAGIC`].
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Level 1. The zone file is small and rewritten as a whole at the end of a batch.
@@ -196,12 +201,14 @@ pub(crate) fn append_zones(
         Err(err) => return Err(err.into()),
     };
     let mut raw = match existing_plain(&path)? {
-        Some(raw) if header_matches(&raw, schema_crc, field_count) => raw,
-        _ => header(schema_crc, field_count).to_vec(),
+        Some(plain) => v2_prefix_for_append(&plain, schema_crc, field_count)
+            .unwrap_or_else(|| header(schema_crc, field_count).to_vec()),
+        None => header(schema_crc, field_count).to_vec(),
     };
     for zone in zones {
         write_record(&mut raw, zone)?;
     }
+    seal_zone_image(&mut raw);
     let after = persist_zone_bytes(&path, &raw, sync)?;
     Ok(after as i64 - before as i64)
 }
@@ -471,17 +478,86 @@ fn decompress_zone_frame(frame: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn header_matches(bytes: &[u8], schema_crc: u32, field_count: u16) -> bool {
-    if bytes.len() < ZONE_HEADER_LEN || &bytes[0..4] != ZONE_MAGIC {
-        return false;
+fn read_zone_header(bytes: &[u8]) -> Result<(u16, u32, u16)> {
+    if bytes.len() < ZONE_HEADER_LEN {
+        return Err(Error::corrupt("truncated zone map"));
+    }
+    if &bytes[0..4] != ZONE_MAGIC {
+        return Err(Error::corrupt("zone map magic mismatch"));
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    if version != ZONE_VERSION {
-        return false;
-    }
     let stored_crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let stored_fields = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
-    stored_crc == schema_crc && stored_fields == field_count
+    Ok((version, stored_crc, stored_fields))
+}
+
+fn require_known_zone(bytes: &[u8], expect_crc: u32, field_count: u16) -> Result<u16> {
+    let (version, stored_crc, stored_fields) = read_zone_header(bytes)?;
+    if version != ZONE_VERSION_V1 && version != ZONE_VERSION {
+        return Err(Error::corrupt(format!(
+            "unsupported zone map version {version}"
+        )));
+    }
+    if stored_crc != expect_crc || stored_fields != field_count {
+        return Err(Error::corrupt("zone map does not match the schema"));
+    }
+    Ok(version)
+}
+
+/// Version 2 body, with the trailer removed after it matches.
+fn v2_body(bytes: &[u8]) -> Result<&[u8]> {
+    if bytes.len() < ZONE_HEADER_LEN + ZONE_TRAILER_LEN {
+        return Err(Error::corrupt("truncated zone map"));
+    }
+    let split = bytes.len() - ZONE_TRAILER_LEN;
+    let (body, trailer) = bytes.split_at(split);
+    let expect = u32::from_le_bytes(trailer.try_into().unwrap());
+    if crc32fast::hash(body) != expect {
+        return Err(Error::corrupt("zone map checksum mismatch"));
+    }
+    Ok(body)
+}
+
+fn record_payloads(body: &[u8], version: u16) -> Result<Vec<&[u8]>> {
+    let mut cursor = ZONE_HEADER_LEN;
+    let mut payloads = Vec::new();
+    while cursor < body.len() {
+        let (payload, next) = if version == ZONE_VERSION_V1 {
+            if body.len() - cursor < 8 {
+                return Err(Error::corrupt("truncated zone map record"));
+            }
+            let len = u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let crc = u32::from_le_bytes(body[cursor + 4..cursor + 8].try_into().unwrap());
+            let start = cursor + 8;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| Error::corrupt("zone map record length overflow"))?;
+            if end > body.len() {
+                return Err(Error::corrupt("truncated zone map record"));
+            }
+            let payload = &body[start..end];
+            if crc32fast::hash(payload) != crc {
+                return Err(Error::corrupt("zone map record checksum mismatch"));
+            }
+            (payload, end)
+        } else {
+            if body.len() - cursor < 4 {
+                return Err(Error::corrupt("truncated zone map record"));
+            }
+            let len = u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let start = cursor + 4;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| Error::corrupt("zone map record length overflow"))?;
+            if end > body.len() {
+                return Err(Error::corrupt("truncated zone map record"));
+            }
+            (&body[start..end], end)
+        };
+        payloads.push(payload);
+        cursor = next;
+    }
+    Ok(payloads)
 }
 
 fn parse_zone_file(
@@ -490,52 +566,47 @@ fn parse_zone_file(
     field_count: u16,
     block_count: usize,
 ) -> Result<Vec<BlockZone>> {
-    if bytes.len() < ZONE_HEADER_LEN {
-        return Err(Error::corrupt("truncated zone map"));
-    }
-    if &bytes[0..4] != ZONE_MAGIC {
-        return Err(Error::corrupt("zone map magic mismatch"));
-    }
-    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    if version != ZONE_VERSION {
-        return Err(Error::corrupt(format!(
-            "unsupported zone map version {version}"
-        )));
-    }
-    let stored_crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    let stored_fields = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
-    if stored_crc != expect_crc || stored_fields != field_count {
-        return Err(Error::corrupt("zone map does not match the schema"));
-    }
-    let mut cursor = ZONE_HEADER_LEN;
-    let mut zones = Vec::with_capacity(block_count);
-    while cursor < bytes.len() {
-        if bytes.len() - cursor < 8 {
-            return Err(Error::corrupt("truncated zone map record"));
-        }
-        let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let crc = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-        cursor += 4;
-        let end = cursor
-            .checked_add(len)
-            .ok_or_else(|| Error::corrupt("zone map record length overflow"))?;
-        if end > bytes.len() {
-            return Err(Error::corrupt("truncated zone map record"));
-        }
-        let payload = &bytes[cursor..end];
-        if crc32fast::hash(payload) != crc {
-            return Err(Error::corrupt("zone map record checksum mismatch"));
-        }
-        zones.push(decode_zone(payload, field_count)?);
-        cursor = end;
-    }
-    if zones.len() != block_count {
+    let version = require_known_zone(bytes, expect_crc, field_count)?;
+    let body = if version == ZONE_VERSION {
+        v2_body(bytes)?
+    } else {
+        bytes
+    };
+    let payloads = record_payloads(body, version)?;
+    if payloads.len() != block_count {
         return Err(Error::corrupt(
             "zone map block count does not match the segment",
         ));
     }
+    let mut zones = Vec::with_capacity(block_count);
+    for payload in payloads {
+        zones.push(decode_zone(payload, field_count)?);
+    }
     Ok(zones)
+}
+
+/// Bytes of a version-2 image with the trailer not yet written.
+///
+/// A matching version-2 file keeps its body. A version-1 file is rewritten
+/// without the per-record crc32s. A checksum failure returns `None` so the
+/// caller starts a new image instead of appending onto a torn one.
+fn v2_prefix_for_append(plain: &[u8], schema_crc: u32, field_count: u16) -> Option<Vec<u8>> {
+    let version = require_known_zone(plain, schema_crc, field_count).ok()?;
+    let body = if version == ZONE_VERSION {
+        v2_body(plain).ok()?
+    } else {
+        plain
+    };
+    let payloads = record_payloads(body, version).ok()?;
+    if version == ZONE_VERSION {
+        return Some(body.to_vec());
+    }
+    let mut raw = header(schema_crc, field_count).to_vec();
+    for payload in payloads {
+        raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        raw.extend_from_slice(payload);
+    }
+    Some(raw)
 }
 
 /// Write zone records for the blocks that survive retention.
@@ -570,7 +641,7 @@ pub(crate) fn stage_kept_zones(
     } else {
         None
     };
-    let raw = match raw {
+    let mut raw = match raw {
         Some(raw) => raw,
         None => {
             let mut raw = header(schema_crc, field_count).to_vec();
@@ -582,6 +653,7 @@ pub(crate) fn stage_kept_zones(
             raw
         }
     };
+    seal_zone_image(&mut raw);
     // The caller renames `tmp` onto the zone path, so the bytes here are the
     // stored form, including a plain zstd frame when that frame is smaller.
     let stored = compress_zone_if_smaller(&raw);
@@ -601,6 +673,7 @@ fn write_zone_file(
     for zone in zones {
         write_record(&mut raw, zone)?;
     }
+    seal_zone_image(&mut raw);
     persist_zone_bytes(path, &raw, true)?;
     Ok(())
 }
@@ -620,56 +693,31 @@ fn persist_zone_bytes(path: &Path, raw: &[u8], sync: bool) -> Result<u64> {
     Ok(stored.len() as u64)
 }
 
-/// Each item is one on-disk record, including its length and checksum prefix.
+/// Each item is one version-2 record: a length prefix and the payload.
 fn split_zone_records(
     bytes: &[u8],
     expect_crc: u32,
     field_count: u16,
     block_count: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    if bytes.len() < ZONE_HEADER_LEN {
-        return Err(Error::corrupt("truncated zone map"));
-    }
-    if &bytes[0..4] != ZONE_MAGIC {
-        return Err(Error::corrupt("zone map magic mismatch"));
-    }
-    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    if version != ZONE_VERSION {
-        return Err(Error::corrupt(format!(
-            "unsupported zone map version {version}"
-        )));
-    }
-    let stored_crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    let stored_fields = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
-    if stored_crc != expect_crc || stored_fields != field_count {
-        return Err(Error::corrupt("zone map does not match the schema"));
-    }
-    let mut cursor = ZONE_HEADER_LEN;
-    let mut records = Vec::with_capacity(block_count);
-    while cursor < bytes.len() {
-        if bytes.len() - cursor < 8 {
-            return Err(Error::corrupt("truncated zone map record"));
-        }
-        let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        let end = cursor
-            .checked_add(8)
-            .and_then(|start| start.checked_add(len))
-            .ok_or_else(|| Error::corrupt("zone map record length overflow"))?;
-        if end > bytes.len() {
-            return Err(Error::corrupt("truncated zone map record"));
-        }
-        let payload = &bytes[cursor + 8..end];
-        let crc = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
-        if crc32fast::hash(payload) != crc {
-            return Err(Error::corrupt("zone map record checksum mismatch"));
-        }
-        records.push(bytes[cursor..end].to_vec());
-        cursor = end;
-    }
-    if records.len() != block_count {
+    let version = require_known_zone(bytes, expect_crc, field_count)?;
+    let body = if version == ZONE_VERSION {
+        v2_body(bytes)?
+    } else {
+        bytes
+    };
+    let payloads = record_payloads(body, version)?;
+    if payloads.len() != block_count {
         return Err(Error::corrupt(
             "zone map block count does not match the segment",
         ));
+    }
+    let mut records = Vec::with_capacity(block_count);
+    for payload in payloads {
+        let mut record = Vec::with_capacity(4 + payload.len());
+        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        record.extend_from_slice(payload);
+        records.push(record);
     }
     Ok(records)
 }
@@ -683,11 +731,14 @@ fn header(schema_crc: u32, field_count: u16) -> [u8; ZONE_HEADER_LEN] {
     out
 }
 
+fn seal_zone_image(raw: &mut Vec<u8>) {
+    let crc = crc32fast::hash(raw);
+    raw.extend_from_slice(&crc.to_le_bytes());
+}
+
 fn write_record(out: &mut impl Write, zone: &BlockZone) -> Result<()> {
     let payload = encode_zone(zone);
-    let crc = crc32fast::hash(&payload);
     out.write_all(&(payload.len() as u32).to_le_bytes())?;
-    out.write_all(&crc.to_le_bytes())?;
     out.write_all(&payload)?;
     Ok(())
 }
@@ -907,6 +958,26 @@ fn bit_is_set(bits: &[u8], bit: u64) -> bool {
         .is_some_and(|slot| slot & (1 << (bit % 8)) != 0)
 }
 
+/// Version-1 image of a version-2 plain file, for readers of the old layout.
+#[cfg(test)]
+pub(crate) fn legacy_v1_image(v2_plain: &[u8]) -> Result<Vec<u8>> {
+    let (version, _, _) = read_zone_header(v2_plain)?;
+    if version != ZONE_VERSION {
+        return Err(Error::corrupt("expected a version-2 zone image"));
+    }
+    let body = v2_body(v2_plain)?;
+    let payloads = record_payloads(body, ZONE_VERSION)?;
+    let mut out = v2_plain[..ZONE_HEADER_LEN].to_vec();
+    out[4..6].copy_from_slice(&ZONE_VERSION_V1.to_le_bytes());
+    for payload in payloads {
+        let crc = crc32fast::hash(payload);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(payload);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,6 +1131,15 @@ mod tests {
 
         let raw = decompress_zone_frame(&stored).unwrap();
         assert!(stored.len() < raw.len());
+        assert_eq!(
+            u16::from_le_bytes(raw[4..6].try_into().unwrap()),
+            ZONE_VERSION
+        );
+        let split = raw.len() - ZONE_TRAILER_LEN;
+        assert_eq!(
+            crc32fast::hash(&raw[..split]),
+            u32::from_le_bytes(raw[split..].try_into().unwrap())
+        );
         fs::write(&path, &raw).unwrap();
         let from_raw = read_zone_file(&path, crc, fields, zones.len())
             .unwrap()
@@ -1085,6 +1165,7 @@ mod tests {
         );
         let mut raw = header(schema_crc(&schema), field_count(&schema).unwrap()).to_vec();
         write_record(&mut raw, &zone).unwrap();
+        seal_zone_image(&mut raw);
         let stored = compress_zone_if_smaller(&raw);
         assert!(stored.len() <= raw.len());
         if stored.len() == raw.len() {
@@ -1099,5 +1180,151 @@ mod tests {
         } else {
             assert_eq!(stored_tiny, tiny);
         }
+    }
+
+    #[test]
+    fn version1_zone_file_loads_and_a_bad_record_crc_still_fails() {
+        let schema = schema();
+        let crc = schema_crc(&schema);
+        let fields = field_count(&schema).unwrap();
+        let zone = from_rows(
+            &schema,
+            &[row(
+                &schema,
+                r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":1.5}"#,
+            )],
+        );
+        let zones = vec![zone.clone(), zone];
+        let mut raw = header(crc, fields).to_vec();
+        for zone in &zones {
+            write_record(&mut raw, zone).unwrap();
+        }
+        seal_zone_image(&mut raw);
+        let v1 = legacy_v1_image(&raw).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(v1[4..6].try_into().unwrap()),
+            ZONE_VERSION_V1
+        );
+        assert!(v1.len() > raw.len() - ZONE_TRAILER_LEN);
+
+        let dir = std::env::temp_dir().join(format!(
+            "eventer-zone-v1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = zone_path(&dir, 1);
+        fs::write(&path, &v1).unwrap();
+        let loaded = read_zone_file(&path, crc, fields, zones.len())
+            .unwrap()
+            .expect("version-1 zone file");
+        assert_eq!(loaded, zones);
+
+        let mut bad = v1.clone();
+        bad[ZONE_HEADER_LEN + 4] ^= 0xff;
+        let err = parse_zone_file(&bad, crc, fields, zones.len()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("zone map record checksum mismatch"),
+            "{err}"
+        );
+        fs::write(&path, &bad).unwrap();
+        assert!(read_zone_file(&path, crc, fields, zones.len())
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn version2_trailer_mismatch_rejects_the_image() {
+        let schema = schema();
+        let crc = schema_crc(&schema);
+        let fields = field_count(&schema).unwrap();
+        let zone = from_rows(
+            &schema,
+            &[row(
+                &schema,
+                r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":1.5}"#,
+            )],
+        );
+        let mut raw = header(crc, fields).to_vec();
+        write_record(&mut raw, &zone).unwrap();
+        seal_zone_image(&mut raw);
+        let loaded = parse_zone_file(&raw, crc, fields, 1).unwrap();
+        assert_eq!(loaded, vec![zone.clone()]);
+        assert!(matches!(loaded[0].columns[6], ColumnZone::Unknown));
+
+        let mut flipped = raw.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0xff;
+        let err = parse_zone_file(&flipped, crc, fields, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("zone map checksum mismatch"),
+            "{err}"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "eventer-zone-v2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = zone_path(&dir, 1);
+        fs::write(&path, &flipped).unwrap();
+        assert!(read_zone_file(&path, crc, fields, 1).unwrap().is_none());
+
+        append_zones(&dir, 1, crc, fields, &[zone.clone()], true).unwrap();
+        let appended = read_zone_file(&path, crc, fields, 1)
+            .unwrap()
+            .expect("append replaces a torn image");
+        assert_eq!(appended, vec![zone]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appending_to_a_version1_file_keeps_the_old_records() {
+        let schema = schema();
+        let crc = schema_crc(&schema);
+        let fields = field_count(&schema).unwrap();
+        let first = from_rows(
+            &schema,
+            &[row(
+                &schema,
+                r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":1.5}"#,
+            )],
+        );
+        let second = from_rows(
+            &schema,
+            &[row(
+                &schema,
+                r#"{"ts":20,"user_id":2,"ok":false,"action":"view","note":"b","amount":"2.00","score":1.5}"#,
+            )],
+        );
+        let mut image = header(crc, fields).to_vec();
+        write_record(&mut image, &first).unwrap();
+        seal_zone_image(&mut image);
+        let v1 = legacy_v1_image(&image).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "eventer-zone-append-v1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(zone_path(&dir, 1), &v1).unwrap();
+        append_zones(&dir, 1, crc, fields, &[second.clone()], true).unwrap();
+        let loaded = read_zone_file(&zone_path(&dir, 1), crc, fields, 2)
+            .unwrap()
+            .expect("version-1 records survive an append");
+        assert_eq!(loaded, vec![first, second]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

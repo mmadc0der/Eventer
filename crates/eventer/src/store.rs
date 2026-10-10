@@ -2164,6 +2164,76 @@ mod tests {
         reopened.close().unwrap();
     }
 
+    #[test]
+    fn version1_zone_opens_and_a_flipped_trailer_is_rebuilt() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(4);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let count = 12i64;
+        for ts in 0..count {
+            store
+                .append_json(&event(ts, Some(ts), "click", Some("note"), "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let expected: Vec<_> = store
+            .query(0, count)
+            .unwrap()
+            .iter()
+            .map(|row| row_value(&store, row))
+            .collect();
+        assert_eq!(expected.len(), count as usize);
+        store.close().unwrap();
+
+        let zone_file = crate::zone::zone_path(&data, 1);
+        let stored = fs::read(&zone_file).unwrap();
+        let plain = if stored.len() >= 4 && stored[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+            zstd::stream::decode_all(stored.as_slice()).unwrap()
+        } else {
+            stored
+        };
+        assert_eq!(&plain[..4], b"EVZN");
+        assert_eq!(u16::from_le_bytes(plain[4..6].try_into().unwrap()), 2);
+        let split = plain.len() - 4;
+        assert_eq!(
+            crc32fast::hash(&plain[..split]),
+            u32::from_le_bytes(plain[split..].try_into().unwrap())
+        );
+
+        let v1 = crate::zone::legacy_v1_image(&plain).unwrap();
+        fs::write(&zone_file, &v1).unwrap();
+        let reopened = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let rows: Vec<_> = reopened
+            .query(0, count)
+            .unwrap()
+            .iter()
+            .map(|row| row_value(&reopened, row))
+            .collect();
+        assert_eq!(rows, expected);
+        assert_eq!(
+            fs::read(&zone_file).unwrap(),
+            v1,
+            "a version-1 zone file is left in place"
+        );
+        reopened.close().unwrap();
+
+        let mut flipped = plain.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0xff;
+        fs::write(&zone_file, &flipped).unwrap();
+        let rebuilt = Store::open_with(&data, &schema, options).unwrap();
+        let rows: Vec<_> = rebuilt
+            .query(0, count)
+            .unwrap()
+            .iter()
+            .map(|row| row_value(&rebuilt, row))
+            .collect();
+        assert_eq!(rows, expected);
+        rebuilt.close().unwrap();
+    }
+
     fn dir_suffix_bytes(dir: &Path, suffix: &str) -> u64 {
         fs::read_dir(dir)
             .unwrap()
