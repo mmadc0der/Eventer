@@ -298,6 +298,106 @@ fn decode_rows(
     Ok(rows)
 }
 
+/// Count rows in `from_ms..=to_ms` that match every predicate.
+///
+/// An empty predicate list reads the timestamp column and nothing after it.
+/// When every payload timestamp is inside the range, that count is the block's
+/// row count. A timestamp outside the range is left out even if the sparse
+/// index min/max sit inside the range. A null or undecodable timestamp returns
+/// the same [`Error::Corrupt`](crate::Error) as a row decode.
+///
+/// Predicates decode the timestamp column and the predicate columns. Columns
+/// after the last of those are not read. Columns between them are skipped, not
+/// turned into values.
+pub(crate) fn count_rows_in_range_filtered(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+) -> Result<u64> {
+    if from_ms > to_ms || predicates.iter().any(|pred| pred.allowed.is_empty()) {
+        return Ok(0);
+    }
+    if predicates.is_empty() {
+        let timestamps = read_timestamp_column(schema, bytes)?;
+        return Ok(timestamps
+            .into_iter()
+            .filter(|ts| *ts >= from_ms && *ts <= to_ms)
+            .count() as u64);
+    }
+    let nrows = block_row_count(bytes)?;
+    let last_needed = predicates
+        .iter()
+        .map(|pred| pred.index)
+        .fold(schema.timestamp_index, usize::max);
+    let mut cursor = 4usize;
+    let mut mask = vec![true; nrows];
+    let mut budget = usize::MAX;
+    for index in 0..=last_needed {
+        let field = &schema.fields[index];
+        if column_was_not_stored(bytes, cursor) {
+            if index <= schema.timestamp_index {
+                return Err(Error::corrupt("timestamp column is missing"));
+            }
+            for rest in index..=last_needed {
+                if let Some(predicate) = predicates.iter().find(|pred| pred.index == rest) {
+                    let nulls = vec![Scalar::Null; nrows];
+                    apply_eq(&mut mask, &nulls, &predicate.allowed);
+                }
+            }
+            break;
+        }
+        let predicate = predicates.iter().find(|pred| pred.index == index);
+        let is_timestamp = index == schema.timestamp_index;
+        if is_timestamp || predicate.is_some() {
+            if is_timestamp && timestamp_range_misses(bytes, cursor, nrows, from_ms, to_ms)? {
+                skip_column(field.ty, bytes, &mut cursor, nrows, true)?;
+                mask.fill(false);
+                continue;
+            }
+            if let Some(predicate) = predicate {
+                if matches!(
+                    field.ty,
+                    FieldType::String | FieldType::Text | FieldType::Json
+                ) {
+                    let spans =
+                        read_text_spans(bytes, &mut cursor, nrows, field.ty == FieldType::Json)?;
+                    mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
+                    continue;
+                } else if column_misses(field.ty, bytes, cursor, nrows, &predicate.allowed)? {
+                    skip_column(field.ty, bytes, &mut cursor, nrows, is_timestamp)?;
+                    mask.fill(false);
+                    continue;
+                }
+            }
+            let values = decode_column(field.ty, bytes, &mut cursor, nrows, &mask, &mut budget)?;
+            if is_timestamp {
+                for (row, value) in values.iter().enumerate() {
+                    match value {
+                        Scalar::Timestamp(ts) => {
+                            if mask[row] && (*ts < from_ms || *ts > to_ms) {
+                                mask[row] = false;
+                            }
+                        }
+                        _ => {
+                            return Err(Error::corrupt(
+                                "timestamp column is null or the wrong type",
+                            ))
+                        }
+                    }
+                }
+            }
+            if let Some(predicate) = predicate {
+                apply_eq(&mut mask, &values, &predicate.allowed);
+            }
+        } else {
+            skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+        }
+    }
+    Ok(mask.iter().filter(|keep| **keep).count() as u64)
+}
+
 fn encode_column(out: &mut Vec<u8>, ty: FieldType, rows: &[Row], index: usize) -> Result<()> {
     let mut nulls = Vec::with_capacity(rows.len());
     for row in rows {
@@ -4491,5 +4591,79 @@ mod tests {
         .unwrap();
         assert_eq!(missing.len(), 16);
         assert!(missing.iter().all(|row| row.values[2] == Scalar::Null));
+    }
+
+    #[test]
+    fn count_uses_timestamps_and_leaves_later_columns_unread() {
+        let schema = schema();
+        let rows: Vec<Row> = [10i64, 20, 30]
+            .into_iter()
+            .enumerate()
+            .map(|(index, ts)| {
+                parse_event(
+                    &schema,
+                    format!(
+                        r#"{{"ts":{ts},"user_id":{index},"score":1.5,"ok":true,"action":"click","note":"n","amount":"1.00"}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let nrows = block_row_count(&encoded.bytes).unwrap();
+        let mut cursor = 4;
+        skip_column(
+            FieldType::Timestamp,
+            &encoded.bytes,
+            &mut cursor,
+            nrows,
+            true,
+        )
+        .unwrap();
+        let mut torn = encoded.bytes[..cursor].to_vec();
+        torn.extend_from_slice(&[0xff, 0xff, 0xff]);
+        assert!(decode_block(&schema, &torn).is_err());
+        assert_eq!(
+            count_rows_in_range_filtered(&schema, &torn, 10, 30, &[]).unwrap(),
+            3
+        );
+        assert_eq!(
+            count_rows_in_range_filtered(&schema, &torn, 15, 25, &[]).unwrap(),
+            1
+        );
+
+        let mut cursor = 4;
+        skip_column(
+            FieldType::Timestamp,
+            &encoded.bytes,
+            &mut cursor,
+            nrows,
+            true,
+        )
+        .unwrap();
+        skip_column(FieldType::Int, &encoded.bytes, &mut cursor, nrows, false).unwrap();
+        let mut pred_torn = encoded.bytes[..cursor].to_vec();
+        pred_torn.extend_from_slice(&[0xff, 0xff]);
+        let user = [ColumnPredicate {
+            index: 1,
+            allowed: vec![Scalar::Int(1)],
+        }];
+        assert!(
+            decode_rows_in_range_filtered(&schema, &pred_torn, 0, 100, usize::MAX, &user).is_err()
+        );
+        assert_eq!(
+            count_rows_in_range_filtered(&schema, &pred_torn, 0, 100, &user).unwrap(),
+            1
+        );
+
+        let mut null_row = rows[0].clone();
+        null_row.values[0] = Scalar::Null;
+        let null_block = encode_block(&schema, &[null_row]).unwrap();
+        let row_err = decode_block(&schema, &null_block.bytes).unwrap_err();
+        let count_err =
+            count_rows_in_range_filtered(&schema, &null_block.bytes, 0, 100, &[]).unwrap_err();
+        assert_eq!(row_err.to_string(), count_err.to_string());
+        assert!(count_err.to_string().contains("timestamp column is null"));
     }
 }
