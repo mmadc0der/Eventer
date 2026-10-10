@@ -553,12 +553,13 @@ impl Store {
     /// default pipeline. A `json` column is written back as the original field
     /// text. The destination schema is the source schema.
     ///
-    /// The source directory is only read. A rejected event, a full disk, or a
+    /// The source directory is only read. Nothing in it is truncated, and no
+    /// index or zone file is written there. A rejected event, a full disk, or a
     /// crash before the destination is published leaves those files in place
-    /// and does not put a store at `destination`. The copy is written aside and
-    /// renamed into `destination` after the flush. A crash during that rename
-    /// can leave `destination` incomplete; opening that incomplete directory
-    /// does not mark the copy successful.
+    /// and does not put a store at `destination`. The rewritten store is written
+    /// aside and renamed into `destination` after the flush. A crash during that
+    /// rename can leave `destination` incomplete; opening that incomplete
+    /// directory does not mark the copy successful.
     ///
     /// The report uses the same totals as [`Store::stats`]: `stored_data_bytes`
     /// is segment data plus dictionary sidecars, and `stored_index_bytes` is
@@ -614,56 +615,57 @@ impl Store {
         }
 
         let source_bytes = directory_stored_bytes(&source_abs)?;
-        let scratch = RemoveOnDrop::new(scratch_dir("eventer-rewrite", &source_abs, &destination_abs)?);
-        let source_copy = scratch.path().join("source");
-        copy_store_files(&source_abs, &source_copy)?;
-
-        let opened = Store::open(&source_copy, source_copy.join("schema.lock"))?;
-        let schema = opened.schema().clone();
-
-        let staging = scratch.path().join("staging");
-        let schema_file = scratch.path().join("schema.json");
-        fs::write(&schema_file, schema.canonical())?;
-        let destination_store = Store::open(&staging, &schema_file)?;
-        let copied_rows = opened.append_decoded_blocks(&destination_store)?;
-        opened.close()?;
-        destination_store.flush()?;
-        let stats = destination_store.stats();
-        if stats.rows != copied_rows {
-            return Err(Error::corrupt(
-                "rewritten directory row count does not match the source",
-            ));
+        let schema = schema::load_schema(&source_abs.join("schema.lock"))?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(Error::io)?
+            .as_nanos();
+        let scratch_name = format!("eventer-rewrite-{}-{nanos}", std::process::id());
+        let bases = scratch_bases(&source_abs, &destination_abs);
+        let mut last_error = None;
+        for base in &bases {
+            let Some(created) = scratch_dir_in(std::slice::from_ref(base), &scratch_name, &source_abs, &destination_abs)
+                .map(Some)
+                .or_else(|err| {
+                    last_error = Some(err);
+                    Ok::<Option<PathBuf>, Error>(None)
+                })?
+            else {
+                continue;
+            };
+            let scratch = RemoveOnDrop::new(created);
+            match write_rewritten_store(scratch.path(), &source_abs, &schema) {
+                Ok((staging, destination_bytes)) => {
+                    if rewrite_should_fail_before_publish() {
+                        return Err(Error::io(
+                            "rewrite failed before the destination was published",
+                        ));
+                    }
+                    publish_directory(&staging, &destination_abs)?;
+                    return Ok(RewriteReport {
+                        source: source_bytes,
+                        destination: destination_bytes,
+                        data_bytes_change: relative_change(
+                            source_bytes.stored_data_bytes,
+                            destination_bytes.stored_data_bytes,
+                        ),
+                        stored_bytes_change: relative_change_sum(
+                            source_bytes.stored_data_bytes,
+                            source_bytes.stored_index_bytes,
+                            destination_bytes.stored_data_bytes,
+                            destination_bytes.stored_index_bytes,
+                        ),
+                    });
+                }
+                Err(err) if is_no_space(&err) => {
+                    last_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
         }
-        destination_store.close()?;
-        let destination_bytes = directory_stored_bytes(&staging)?;
-        if destination_bytes.stored_data_bytes != stats.data_bytes
-            || destination_bytes.stored_index_bytes != stats.index_bytes
-        {
-            return Err(Error::corrupt(
-                "rewritten directory file sizes do not match the flushed store",
-            ));
-        }
-        if rewrite_should_fail_before_publish() {
-            return Err(Error::io(
-                "rewrite failed before the destination was published",
-            ));
-        }
-        publish_directory(&staging, &destination_abs)?;
-
-        Ok(RewriteReport {
-            source: source_bytes,
-            destination: destination_bytes,
-            data_bytes_change: relative_change(
-                source_bytes.stored_data_bytes,
-                destination_bytes.stored_data_bytes,
-            ),
-            stored_bytes_change: relative_change_sum(
-                source_bytes.stored_data_bytes,
-                source_bytes.stored_index_bytes,
-                destination_bytes.stored_data_bytes,
-                destination_bytes.stored_index_bytes,
-            ),
-        })
+        Err(last_error.unwrap_or_else(|| {
+            Error::io("could not create a scratch directory outside the source and the destination")
+        }))
     }
 
     /// File sizes from the last committed batch. Call [`Store::flush`] first for a stable view.
@@ -754,32 +756,6 @@ impl Store {
             .unwrap_or_else(|err| err.into_inner())
     }
 
-    /// Decode one block at a time and queue those rows on `destination`.
-    ///
-    /// Rows stay as decoded values. They are not serialized back to JSON, so
-    /// the ingest size cap does not apply to a directory that already opened.
-    fn append_decoded_blocks(&self, destination: &Store) -> Result<u64> {
-        let blocks: Vec<segment::BlockMeta> = {
-            let catalog = self.catalog();
-            catalog
-                .segments
-                .iter()
-                .flat_map(|segment| segment.blocks.iter().cloned())
-                .collect()
-        };
-        let mut dictionaries = HashMap::new();
-        let mut copied = 0u64;
-        for block in &blocks {
-            let payload = self.read_block_bytes(block, &mut dictionaries)?;
-            let rows = crate::codec::decode_block(&self.schema, &payload)?;
-            require_header_row_count(block.row_count, rows.len())?;
-            for row in rows {
-                destination.pipeline.append_row(row)?;
-                copied += 1;
-            }
-        }
-        Ok(copied)
-    }
 }
 
 /// Data and index bytes, using the same split as [`Stats`].
@@ -1176,24 +1152,59 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || right.starts_with(left) || left.starts_with(right)
 }
 
-fn scratch_dir(prefix: &str, source: &Path, destination: &Path) -> Result<PathBuf> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(Error::io)?
-        .as_nanos();
-    let name = format!("{prefix}-{}-{nanos}", std::process::id());
-    let mut bases = vec![std::env::temp_dir()];
+fn scratch_bases(source: &Path, destination: &Path) -> Vec<PathBuf> {
+    let mut bases = Vec::new();
     if let Some(parent) = destination.parent() {
         if !parent.as_os_str().is_empty() {
             bases.push(parent.to_path_buf());
         }
     }
     if let Some(parent) = source.parent() {
-        if !parent.as_os_str().is_empty() {
+        if !parent.as_os_str().is_empty() && !bases.iter().any(|base| base == parent) {
             bases.push(parent.to_path_buf());
         }
     }
-    scratch_dir_in(&bases, &name, source, destination)
+    let temp = std::env::temp_dir();
+    if !bases.iter().any(|base| base == &temp) {
+        bases.push(temp);
+    }
+    bases
+}
+
+fn is_no_space(err: &Error) -> bool {
+    let text = err.to_string();
+    text.contains("No space left on device") || text.contains("os error 28")
+}
+
+fn write_rewritten_store(
+    scratch: &Path,
+    source: &Path,
+    schema: &Schema,
+) -> Result<(PathBuf, StoredBytes)> {
+    let staging = scratch.join("staging");
+    let schema_file = scratch.join("schema.json");
+    fs::write(&schema_file, schema.canonical())?;
+    let destination_store = Store::open(&staging, &schema_file)?;
+    let copied_rows = segment::visit_stored_rows(source, schema, |row| {
+        destination_store.pipeline.append_row(row)
+    })?;
+    destination_store.flush()?;
+    let stats = destination_store.stats();
+    if stats.rows != copied_rows {
+        return Err(Error::corrupt(
+            "rewritten directory row count does not match the source",
+        ));
+    }
+    destination_store.close()?;
+    let destination_bytes = directory_stored_bytes(&staging)?;
+    if destination_bytes.stored_data_bytes != stats.data_bytes
+        || destination_bytes.stored_index_bytes != stats.index_bytes
+    {
+        return Err(Error::corrupt(
+            "rewritten directory file sizes do not match the flushed store",
+        ));
+    }
+    Ok((staging, destination_bytes))
 }
 
 fn scratch_dir_in(
@@ -1218,7 +1229,7 @@ fn scratch_dir_in(
         if paths_overlap(&path, source) || paths_overlap(&path, destination) {
             continue;
         }
-        match fs::create_dir(&path) {
+        match create_private_dir(&path) {
             Ok(()) => return Ok(path),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => last_error = Some(Error::io(err)),
@@ -1257,6 +1268,19 @@ impl Drop for RemoveOnDrop {
     }
 }
 
+/// Mode 0700 survives umask 022, so a traversable parent cannot list the directory.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
+}
+
 fn is_store_file(name: &str) -> bool {
     if name == "schema.lock" {
         return true;
@@ -1270,38 +1294,6 @@ fn is_store_file(name: &str) -> bool {
     id.len() == 6
         && id.bytes().all(|byte| byte.is_ascii_digit())
         && matches!(ext, "dat" | "idx" | "dict" | "zon")
-}
-
-/// Copy the flat segment files. Subdirectories are not walked.
-fn copy_store_files(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir(to)?;
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !is_store_file(&name) {
-            continue;
-        }
-        if file_type.is_symlink() {
-            return Err(Error::io(format!(
-                "refusing to copy symlink {}",
-                entry.path().display()
-            )));
-        }
-        if !file_type.is_file() {
-            return Err(Error::io(format!(
-                "unsupported file in store directory: {}",
-                entry.path().display()
-            )));
-        }
-        let target = to.join(entry.file_name());
-        fs::copy(entry.path(), &target)?;
-    }
-    Ok(())
 }
 
 fn fsync_dir(path: &Path) -> Result<()> {
@@ -1391,7 +1383,7 @@ fn exclusive_publish_dir(destination: &Path) -> Result<PathBuf> {
         if paths_overlap(&sibling, destination) {
             continue;
         }
-        match fs::create_dir(&sibling) {
+        match create_private_dir(&sibling) {
             Ok(()) => return Ok(sibling),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(Error::io(err)),
@@ -4356,6 +4348,12 @@ mod tests {
         let created = scratch_dir_in(&bases, "eventer-rewrite-test", &source, &destination).unwrap();
         assert_eq!(created.parent(), Some(dir.path()));
         assert!(!created.starts_with(&source));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "scratch directory is traversable by other users");
+        }
         let _ = fs::remove_dir_all(&created);
         assert!(!source.join("eventer-rewrite-test").exists());
     }
