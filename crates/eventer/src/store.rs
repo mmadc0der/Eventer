@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::codec::{block_row_count, decode_rows_in_range_filtered, ColumnPredicate};
+use crate::codec::{
+    block_row_count, decode_rows_in_range_filtered, read_timestamp_column, ColumnPredicate,
+};
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, Schema};
@@ -179,8 +181,9 @@ impl Store {
     /// `offset` skips that many matching rows. `limit` of `None` returns the rest,
     /// and `Some(0)` is an error. Time bounds and predicates are applied before
     /// the skip. A contained block with no predicates is skipped only after its
-    /// payload row count matches the frame header. Once `limit` rows have been
-    /// collected, later blocks are not read. Order is ingest order.
+    /// payload row count matches the frame header and every payload timestamp
+    /// is inside the query. Once `limit` rows have been collected, later blocks
+    /// are not read. Order is ingest order.
     pub fn query_window(
         &self,
         from_ms: i64,
@@ -227,6 +230,7 @@ impl Store {
             require_header_row_count(block.row_count, nrows)?;
             if resolved.is_empty()
                 && contained
+                && every_timestamp_in_range(&self.schema, &payload, from_ms, to_ms)?
                 && skip_whole_block(offset, block.row_count, &mut skipped)
             {
                 continue;
@@ -344,6 +348,7 @@ impl Store {
             require_header_row_count(block.row_count, nrows)?;
             if resolved.is_empty()
                 && contained
+                && every_timestamp_in_range(&self.schema, &payload, from_ms, to_ms)?
                 && skip_whole_block(offset, block.row_count, &mut skipped)
             {
                 continue;
@@ -589,6 +594,20 @@ fn require_header_row_count(header_rows: u32, payload_rows: usize) -> Result<()>
         ));
     }
     Ok(())
+}
+
+/// Index min/max can claim a block is inside the query while a payload timestamp is not.
+/// A null or undecodable timestamp is [`Error::Corrupt`], the same error a row decode returns.
+fn every_timestamp_in_range(
+    schema: &Schema,
+    payload: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<bool> {
+    let timestamps = read_timestamp_column(schema, payload)?;
+    Ok(timestamps
+        .iter()
+        .all(|ts| *ts >= from_ms && *ts <= to_ms))
 }
 
 /// Skip a block whose every row is a match when those rows fall entirely inside the offset.
@@ -984,6 +1003,41 @@ mod tests {
         store.close().unwrap();
     }
 
+    #[test]
+    fn window_does_not_skip_a_block_whose_index_range_hides_an_outside_timestamp() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(3);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        for ts in [10, 20, 30, 22] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.close().unwrap();
+
+        patch_index_minmax(&data, 1, 10, 20);
+
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        let timestamps = |bytes: &[u8]| -> Vec<i64> {
+            serde_json::from_slice::<Vec<serde_json::Value>>(bytes)
+                .unwrap()
+                .into_iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect()
+        };
+        let unpaged = timestamps(&store.query_json_window(10, 25, &[], 0, None).unwrap());
+        assert_eq!(unpaged, vec![10, 20, 22]);
+        assert_eq!(
+            timestamps(&store.query_json_window(10, 25, &[], 3, Some(1)).unwrap()),
+            Vec::<i64>::new()
+        );
+        let rows = store.query_window(10, 25, &[], 3, Some(1)).unwrap();
+        assert!(rows.is_empty());
+        store.close().unwrap();
+    }
+
     /// Rewrite the first frame header and the matching index entry. The payload
     /// CRC does not cover these fields, and open keeps them when the index matches.
     fn patch_block_header(
@@ -1018,6 +1072,23 @@ mod tests {
         if let Some(rows) = row_count {
             index[entry + 16..entry + 20].copy_from_slice(&rows.to_le_bytes());
         }
+        fs::write(&index_path, &index).unwrap();
+    }
+
+    /// A 20-byte frame does not store min/max. Open keeps the index values when
+    /// the other header fields match, so a lying zone can hide an outside timestamp.
+    fn patch_index_minmax(dir: &Path, segment_id: u32, min_ts: i64, max_ts: i64) {
+        let index_path = segment::index_path(dir, segment_id);
+        let stored = fs::read(&index_path).unwrap();
+        let mut index = if stored.len() >= 4 && stored[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+            zstd::bulk::decompress(&stored, 1024 * 1024).unwrap()
+        } else {
+            stored
+        };
+        assert_eq!(&index[..4], segment::INDEX_MAGIC);
+        let entry = segment::INDEX_HEADER_LEN;
+        index[entry + 24..entry + 32].copy_from_slice(&min_ts.to_le_bytes());
+        index[entry + 32..entry + 40].copy_from_slice(&max_ts.to_le_bytes());
         fs::write(&index_path, &index).unwrap();
     }
 
