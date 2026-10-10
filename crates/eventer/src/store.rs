@@ -557,9 +557,13 @@ impl Store {
     /// index or zone file is written there. A rejected event, a full disk, or a
     /// crash before the destination is published leaves those files in place
     /// and does not put a store at `destination`. The rewritten store is written
-    /// aside and renamed into `destination` after the flush. A crash during that
-    /// rename can leave `destination` incomplete; opening that incomplete
-    /// directory does not mark the copy successful.
+    /// in a private directory and published after the flush. When `destination`
+    /// does not exist yet, that directory is renamed into place. When
+    /// `destination` already exists, the private directory is created inside it
+    /// and the finished files are moved in after they are fsynced, with
+    /// `schema.lock` last. A crash during publish can leave `destination`
+    /// incomplete; opening that incomplete directory does not mark the copy
+    /// successful.
     ///
     /// The report uses the same totals as [`Store::stats`]: `stored_data_bytes`
     /// is segment data plus dictionary sidecars, and `stored_index_bytes` is
@@ -616,12 +620,21 @@ impl Store {
 
         let source_bytes = directory_stored_bytes(&source_abs)?;
         let schema = schema::load_schema(&source_abs.join("schema.lock"))?;
+        let destination_existed = destination_abs.exists();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(Error::io)?
             .as_nanos();
         let scratch_name = format!("eventer-rewrite-{}-{nanos}", std::process::id());
-        let bases = scratch_bases(&source_abs, &destination_abs);
+        // An existing destination may be a mount point. `rename` onto that
+        // directory returns EBUSY, so the new store has to be written on that
+        // filesystem and the files moved in. A path that does not exist yet
+        // is still published by renaming a directory on the parent filesystem.
+        let bases = if destination_existed {
+            vec![destination_abs.clone()]
+        } else {
+            scratch_bases(&source_abs, &destination_abs)
+        };
         let mut last_error = None;
         for base in &bases {
             let Some(created) = scratch_dir_in(std::slice::from_ref(base), &scratch_name, &source_abs, &destination_abs)
@@ -641,7 +654,7 @@ impl Store {
                             "rewrite failed before the destination was published",
                         ));
                     }
-                    publish_directory(&staging, &destination_abs)?;
+                    publish_directory(&staging, &destination_abs, destination_existed)?;
                     return Ok(RewriteReport {
                         source: source_bytes,
                         destination: destination_bytes,
@@ -1152,6 +1165,19 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || right.starts_with(left) || left.starts_with(right)
 }
 
+/// A scratch directory inside an existing destination is the filesystem the
+/// caller asked for. Every other overlap with the source or the destination
+/// is refused.
+fn scratch_overlaps(path: &Path, source: &Path, destination: &Path) -> bool {
+    if paths_overlap(path, source) || path == destination {
+        return true;
+    }
+    if destination.is_dir() && path.starts_with(destination) {
+        return false;
+    }
+    paths_overlap(path, destination)
+}
+
 fn scratch_bases(source: &Path, destination: &Path) -> Vec<PathBuf> {
     let mut bases = Vec::new();
     if let Some(parent) = destination.parent() {
@@ -1226,7 +1252,7 @@ fn scratch_dir_in(
             }
         };
         let path = base.join(&name);
-        if paths_overlap(&path, source) || paths_overlap(&path, destination) {
+        if scratch_overlaps(&path, source, destination) {
             continue;
         }
         match create_private_dir(&path) {
@@ -1394,7 +1420,77 @@ fn exclusive_publish_dir(destination: &Path) -> Result<PathBuf> {
     ))
 }
 
-fn publish_directory(staging: &Path, destination: &Path) -> Result<()> {
+fn fsync_file(path: &Path) -> Result<()> {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(Error::io)
+}
+
+/// Move finished store files from `staging` into an existing `destination`.
+/// `schema.lock` is last, so a crash before that rename does not publish a
+/// directory that opens as a store. `rename` of the staging directory itself
+/// is not used: onto a mount point it returns `EBUSY`.
+fn publish_into_existing_directory(staging: &Path, destination: &Path) -> Result<()> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(staging)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !is_store_file(&name) {
+            continue;
+        }
+        if file_type.is_symlink() {
+            return Err(Error::io(format!(
+                "refusing to publish symlink {}",
+                entry.path().display()
+            )));
+        }
+        if !file_type.is_file() {
+            return Err(Error::io(format!(
+                "unsupported file in store directory: {}",
+                entry.path().display()
+            )));
+        }
+        let target = destination.join(&file_name);
+        if target.exists() {
+            return Err(Error::io(format!(
+                "publish directory already contains {}",
+                target.display()
+            )));
+        }
+        fsync_file(&entry.path())?;
+        files.push(file_name);
+    }
+    if !files.iter().any(|name| name == "schema.lock") {
+        return Err(Error::io(
+            "rewritten store is missing schema.lock and was not published",
+        ));
+    }
+    files.sort_by(|left, right| {
+        let left_lock = left == "schema.lock";
+        let right_lock = right == "schema.lock";
+        left_lock.cmp(&right_lock).then_with(|| left.cmp(right))
+    });
+    for name in &files {
+        fs::rename(staging.join(name), destination.join(name)).map_err(Error::io)?;
+    }
+    fsync_dir(destination)
+}
+
+fn publish_directory(
+    staging: &Path,
+    destination: &Path,
+    destination_existed: bool,
+) -> Result<()> {
+    if destination_existed {
+        return publish_into_existing_directory(staging, destination);
+    }
     if let Some(parent) = destination.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -4336,6 +4432,56 @@ mod tests {
         assert!(matches!(amount, Scalar::Decimal(_)), "{amount:?}");
         opened.close().unwrap();
         assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+    }
+
+    #[test]
+    fn rewrite_directory_moves_files_into_an_existing_empty_directory() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, Some(2), "view", Some("a"), "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+        let expected = query_bytes(&data, &schema);
+
+        let dest = dir.path().join("mounted");
+        fs::create_dir(&dest).unwrap();
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(dest.join("schema.lock").is_file());
+        assert!(
+            fs::read_dir(&dest)
+                .unwrap()
+                .all(|entry| entry.unwrap().file_type().unwrap().is_file()),
+            "the private directory was left inside the destination"
+        );
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert_eq!(query_bytes(&dest, &schema), expected);
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
+
+        let failed = dir.path().join("mounted-failed");
+        fs::create_dir(&failed).unwrap();
+        REWRITE_FAIL_BEFORE_PUBLISH.with(|flag| flag.set(true));
+        let err = Store::rewrite_directory(&data, &failed).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("before the destination was published"),
+            "{err}"
+        );
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(
+            !directory_has_entries(&failed).unwrap(),
+            "a failed rewrite left files in the existing destination"
+        );
     }
 
     #[test]
