@@ -1115,38 +1115,26 @@ mod tests {
         assert_eq!(&data[..4], segment::BLOCK_MAGIC);
 
         let index_path = segment::index_path(dir, segment_id);
-        let stored = fs::read(&index_path).unwrap();
-        let mut index = if stored.len() >= 4 && stored[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
-            zstd::bulk::decompress(&stored, 1024 * 1024).unwrap()
-        } else {
-            stored
-        };
-        assert_eq!(&index[..4], segment::INDEX_MAGIC);
-        let entry = segment::INDEX_HEADER_LEN;
+        let mut blocks = segment::read_index(&index_path).unwrap();
+        assert!(!blocks.is_empty());
         if let Some(len) = uncompressed_len {
-            index[entry + 12..entry + 16].copy_from_slice(&len.to_le_bytes());
+            blocks[0].uncompressed_len = len;
         }
         if let Some(rows) = row_count {
-            index[entry + 16..entry + 20].copy_from_slice(&rows.to_le_bytes());
+            blocks[0].row_count = rows;
         }
-        fs::write(&index_path, &index).unwrap();
+        fs::write(&index_path, segment::encode_index(&blocks)).unwrap();
     }
 
     /// A 20-byte frame does not store min/max. Open keeps the index values when
     /// the other header fields match, so a lying zone can hide an outside timestamp.
     fn patch_index_minmax(dir: &Path, segment_id: u32, min_ts: i64, max_ts: i64) {
         let index_path = segment::index_path(dir, segment_id);
-        let stored = fs::read(&index_path).unwrap();
-        let mut index = if stored.len() >= 4 && stored[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
-            zstd::bulk::decompress(&stored, 1024 * 1024).unwrap()
-        } else {
-            stored
-        };
-        assert_eq!(&index[..4], segment::INDEX_MAGIC);
-        let entry = segment::INDEX_HEADER_LEN;
-        index[entry + 24..entry + 32].copy_from_slice(&min_ts.to_le_bytes());
-        index[entry + 32..entry + 40].copy_from_slice(&max_ts.to_le_bytes());
-        fs::write(&index_path, &index).unwrap();
+        let mut blocks = segment::read_index(&index_path).unwrap();
+        assert!(!blocks.is_empty());
+        blocks[0].min_ts = min_ts;
+        blocks[0].max_ts = max_ts;
+        fs::write(&index_path, segment::encode_index(&blocks)).unwrap();
     }
 
     #[test]
@@ -1243,6 +1231,24 @@ mod tests {
             "a raw EVIX file from an older writer is left in place"
         );
         legacy.close().unwrap();
+
+        let blocks = segment::read_index(&index).unwrap();
+        let mut version_one = Vec::with_capacity(raw.len());
+        version_one.extend_from_slice(segment::INDEX_MAGIC);
+        version_one.extend_from_slice(&1u16.to_le_bytes());
+        version_one.extend_from_slice(&0u16.to_le_bytes());
+        for block in &blocks {
+            version_one.extend_from_slice(&segment::index_entry_bytes(block));
+        }
+        fs::write(&index, &version_one).unwrap();
+        let opened = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(opened.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            version_one,
+            "a raw version-1 index is left in place"
+        );
+        opened.close().unwrap();
 
         fs::write(&index, &compressed[..compressed.len() - 1]).unwrap();
         let rebuilt = Store::open_with(&data, &schema, test_options(8)).unwrap();
