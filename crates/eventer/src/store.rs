@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::codec::{
-    block_row_count, count_rows_in_range_filtered, decode_rows_in_range_filtered,
-    read_timestamp_column, ColumnPredicate,
+    accumulate_histogram, block_row_count, count_rows_in_range_filtered,
+    decode_rows_in_range_filtered, read_timestamp_column, ColumnPredicate,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -20,6 +20,16 @@ pub const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum rows a single query may return.
 pub const MAX_QUERY_ROWS: usize = 1_000_000;
+
+/// Most buckets one histogram may return. A wider request is rejected before any block is read.
+pub const MAX_HISTOGRAM_BUCKETS: usize = 4096;
+
+/// One epoch-aligned bucket of a histogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistogramBucket {
+    pub start_ms: i64,
+    pub count: u64,
+}
 
 /// Counters for the bytes sitting in segment files after the last flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,6 +465,66 @@ impl Store {
         Ok(total)
     }
 
+    /// Inclusive range histogram. [`Store::histogram_with_filter`] with no predicates.
+    pub fn histogram(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<HistogramBucket>> {
+        self.histogram_with_filter(from_ms, to_ms, bucket_ms, &[])
+    }
+
+    /// Counts for every epoch-aligned bucket that intersects `from_ms..=to_ms`.
+    ///
+    /// Bucket `i` starts at `floor(from_ms / bucket_ms) * bucket_ms + i * bucket_ms`,
+    /// using division that rounds toward negative infinity. The list includes a
+    /// bucket whose count is zero. The sum of the counts is what
+    /// [`Store::count_with_filter`] would return for the same range and predicates.
+    /// A row is counted in the bucket that contains its own timestamp.
+    ///
+    /// `bucket_ms` is a positive integer. More than [`MAX_HISTOGRAM_BUCKETS`]
+    /// buckets is an error, and no block is read for that call. A block the
+    /// sparse index places outside the range is not read. A block the zone map
+    /// can reject is not read. A block with no predicates reads timestamps only.
+    pub fn histogram_with_filter(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        bucket_ms: i64,
+        predicates: &[Predicate],
+    ) -> Result<Vec<HistogramBucket>> {
+        let Some(span) = histogram_span(from_ms, to_ms, bucket_ms)? else {
+            return Ok(Vec::new());
+        };
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
+            return histogram_buckets(span);
+        };
+        let _retention = self.pipeline.lock_for_read();
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+        let mut counts = vec![0u64; span.buckets];
+        let mut dictionaries = HashMap::new();
+        for block in blocks {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
+                return Err(Error::event("query response size limit exceeded"));
+            }
+            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let nrows = block_row_count(&payload)?;
+            require_header_row_count(block.row_count, nrows)?;
+            accumulate_histogram(
+                &self.schema,
+                &payload,
+                from_ms,
+                to_ms,
+                &resolved,
+                bucket_ms,
+                span.first_start,
+                &mut counts,
+            )?;
+        }
+        buckets_from_counts(span, &counts)
+    }
+
     /// Delete every block whose maximum timestamp is strictly less than `cutoff_ms`.
     ///
     /// The cutoff is the caller's. It is not taken from the newest timestamp in the
@@ -696,6 +766,53 @@ fn returns_whole_block(
         None => true,
         Some(limit) => limit.saturating_sub(emitted as u64) >= u64::from(block_rows),
     }
+}
+
+struct HistogramSpan {
+    first_start: i128,
+    bucket_ms: i64,
+    buckets: usize,
+}
+
+/// `None` when `from_ms > to_ms` (no bucket intersects the range).
+/// More than [`MAX_HISTOGRAM_BUCKETS`] is an error and does not read the store.
+fn histogram_span(from_ms: i64, to_ms: i64, bucket_ms: i64) -> Result<Option<HistogramSpan>> {
+    if bucket_ms <= 0 {
+        return Err(Error::event("bucket_ms must be a positive integer"));
+    }
+    if from_ms > to_ms {
+        return Ok(None);
+    }
+    let width = i128::from(bucket_ms);
+    let first_start = (i128::from(from_ms)).div_euclid(width) * width;
+    let last_start = (i128::from(to_ms)).div_euclid(width) * width;
+    let buckets = (last_start - first_start) / width + 1;
+    if buckets > i128::from(MAX_HISTOGRAM_BUCKETS as u32) {
+        return Err(Error::event("histogram would emit more than 4096 buckets"));
+    }
+    let buckets =
+        usize::try_from(buckets).map_err(|_| Error::event("histogram bucket overflow"))?;
+    Ok(Some(HistogramSpan {
+        first_start,
+        bucket_ms,
+        buckets,
+    }))
+}
+
+fn histogram_buckets(span: HistogramSpan) -> Result<Vec<HistogramBucket>> {
+    let zeros = vec![0; span.buckets];
+    buckets_from_counts(span, &zeros)
+}
+
+fn buckets_from_counts(span: HistogramSpan, counts: &[u64]) -> Result<Vec<HistogramBucket>> {
+    let mut out = Vec::with_capacity(span.buckets);
+    for (index, count) in counts.iter().copied().enumerate() {
+        let start = span.first_start + i128::from(index as u64) * i128::from(span.bucket_ms);
+        let start_ms = i64::try_from(start)
+            .map_err(|_| Error::event("histogram bucket start is outside i64"))?;
+        out.push(HistogramBucket { start_ms, count });
+    }
+    Ok(out)
 }
 
 fn remaining_query_bytes(produced: usize) -> Result<usize> {
@@ -1920,7 +2037,188 @@ mod tests {
         }
         assert_eq!(narrow.count(150, 250).unwrap(), 1);
         assert_eq!(narrow.query(150, 250).unwrap().len(), 1);
+        let lied = narrow.histogram(150, 250, 50).unwrap();
+        assert_eq!(
+            lied,
+            vec![
+                HistogramBucket {
+                    start_ms: 150,
+                    count: 0
+                },
+                HistogramBucket {
+                    start_ms: 200,
+                    count: 1
+                },
+                HistogramBucket {
+                    start_ms: 250,
+                    count: 0
+                },
+            ]
+        );
         narrow.close().unwrap();
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn histogram_aligns_to_the_epoch_and_keeps_empty_buckets() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for ts in [1000i64, 2000, 3000] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store
+            .append_json(&event(-1500, Some(1), "view", None, "1.00"))
+            .unwrap();
+        store.flush().unwrap();
+
+        assert_eq!(
+            store.histogram(1000, 3000, 1000).unwrap(),
+            vec![
+                HistogramBucket {
+                    start_ms: 1000,
+                    count: 1
+                },
+                HistogramBucket {
+                    start_ms: 2000,
+                    count: 1
+                },
+                HistogramBucket {
+                    start_ms: 3000,
+                    count: 1
+                },
+            ]
+        );
+        assert_eq!(
+            store.histogram(1000, 3000, 2000).unwrap(),
+            vec![
+                HistogramBucket {
+                    start_ms: 0,
+                    count: 1
+                },
+                HistogramBucket {
+                    start_ms: 2000,
+                    count: 2
+                },
+            ]
+        );
+        let gapped = store.histogram(1000, 5000, 1000).unwrap();
+        assert_eq!(
+            gapped,
+            vec![
+                HistogramBucket {
+                    start_ms: 1000,
+                    count: 1
+                },
+                HistogramBucket {
+                    start_ms: 2000,
+                    count: 1
+                },
+                HistogramBucket {
+                    start_ms: 3000,
+                    count: 1
+                },
+                HistogramBucket {
+                    start_ms: 4000,
+                    count: 0
+                },
+                HistogramBucket {
+                    start_ms: 5000,
+                    count: 0
+                },
+            ]
+        );
+        assert_eq!(
+            gapped.iter().map(|bucket| bucket.count).sum::<u64>(),
+            store.count(1000, 5000).unwrap()
+        );
+
+        assert_eq!(
+            store.histogram(-1500, -100, 1000).unwrap(),
+            vec![
+                HistogramBucket {
+                    start_ms: -2000,
+                    count: 1
+                },
+                HistogramBucket {
+                    start_ms: -1000,
+                    count: 0
+                },
+            ]
+        );
+
+        let none = [Predicate::Eq("action".into(), "missing".into())];
+        let empty = store
+            .histogram_with_filter(1000, 3000, 1000, &none)
+            .unwrap();
+        assert!(empty.iter().all(|bucket| bucket.count == 0));
+        assert_eq!(
+            empty.iter().map(|bucket| bucket.count).sum::<u64>(),
+            store.count_with_filter(1000, 3000, &none).unwrap()
+        );
+        assert!(store.histogram(10, 1, 1000).unwrap().is_empty());
+        let too_many = store.histogram(0, 4096, 1).unwrap_err();
+        assert!(too_many.to_string().contains("4096"), "{too_many}");
+        assert_eq!(store.count(1000, 3000).unwrap(), 3);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn histogram_rejects_a_wide_span_without_reading_the_block() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        store
+            .append_json(&event(1000, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store.flush().unwrap();
+        let block = store.catalog().segments[0].blocks[0].clone();
+        let path = segment::data_path(&data, block.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[block.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let err = store.histogram(0, 4096, 1).unwrap_err();
+        assert!(err.to_string().contains("4096"), "{err}");
+        assert!(store.count(1000, 1000).is_err());
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn histogram_does_not_read_a_block_outside_the_index_range() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for ts in [1i64, 2, 10_000, 10_001] {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let victim = store.catalog().segments[0].blocks[1].clone();
+        assert!(victim.min_ts > 2);
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        let flip_at = victim.offset as usize + segment::BLOCK_HEADER_LEN + 4;
+        bytes[flip_at] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            store.histogram(1, 2, 1).unwrap(),
+            vec![
+                HistogramBucket {
+                    start_ms: 1,
+                    count: 1
+                },
+                HistogramBucket {
+                    start_ms: 2,
+                    count: 1
+                },
+            ]
+        );
+        assert!(store.count(victim.min_ts, victim.max_ts).is_err());
         store.close().unwrap();
     }
 
@@ -1962,6 +2260,15 @@ mod tests {
         bytes[flip_at] ^= 0xff;
         fs::write(&path, &bytes).unwrap();
         assert_eq!(store.count_with_filter(0, 10_000, &predicates).unwrap(), 32);
+        assert_eq!(
+            store
+                .histogram_with_filter(0, 63, 32, &predicates)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            32
+        );
         assert!(store.query(victim.min_ts, victim.max_ts).is_err());
         store.close().unwrap();
     }

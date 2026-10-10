@@ -316,15 +316,74 @@ pub(crate) fn count_rows_in_range_filtered(
     to_ms: i64,
     predicates: &[ColumnPredicate],
 ) -> Result<u64> {
+    let mut total = 0u64;
+    visit_matching_timestamps(schema, bytes, from_ms, to_ms, predicates, |_ts| {
+        total = total
+            .checked_add(1)
+            .ok_or_else(|| Error::event("event count overflow"))?;
+        Ok(())
+    })?;
+    Ok(total)
+}
+
+/// Add each matching timestamp to the epoch-aligned bucket that contains it.
+///
+/// `counts[i]` is the bucket starting at `first_start + i * bucket_ms`. A timestamp
+/// outside `from_ms..=to_ms` is not visited. `bucket_ms` is a positive integer.
+pub(crate) fn accumulate_histogram(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+    bucket_ms: i64,
+    first_start: i128,
+    counts: &mut [u64],
+) -> Result<()> {
+    visit_matching_timestamps(schema, bytes, from_ms, to_ms, predicates, |ts| {
+        let start = (ts as i128).div_euclid(i128::from(bucket_ms)) * i128::from(bucket_ms);
+        let index = (start - first_start) / i128::from(bucket_ms);
+        let index = usize::try_from(index).map_err(|_| Error::corrupt("histogram bucket index"))?;
+        let bucket = counts
+            .get_mut(index)
+            .ok_or_else(|| Error::corrupt("histogram bucket index"))?;
+        *bucket = bucket
+            .checked_add(1)
+            .ok_or_else(|| Error::event("event count overflow"))?;
+        Ok(())
+    })
+}
+
+/// Call `visit` once for each payload timestamp in `from_ms..=to_ms` that matches
+/// every predicate.
+///
+/// An empty predicate list reads the timestamp column and nothing after it.
+/// A timestamp outside the range is left out even if the sparse index min/max
+/// sit inside the range. A null or undecodable timestamp returns the same
+/// [`Error::Corrupt`](crate::Error) as a row decode.
+///
+/// Predicates decode the timestamp column and the predicate columns. Columns
+/// after the last of those are not read. Columns between them are skipped, not
+/// turned into values.
+fn visit_matching_timestamps(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+    mut visit: impl FnMut(i64) -> Result<()>,
+) -> Result<()> {
     if from_ms > to_ms || predicates.iter().any(|pred| pred.allowed.is_empty()) {
-        return Ok(0);
+        return Ok(());
     }
     if predicates.is_empty() {
         let timestamps = read_timestamp_column(schema, bytes)?;
-        return Ok(timestamps
-            .into_iter()
-            .filter(|ts| *ts >= from_ms && *ts <= to_ms)
-            .count() as u64);
+        for ts in timestamps {
+            if ts >= from_ms && ts <= to_ms {
+                visit(ts)?;
+            }
+        }
+        return Ok(());
     }
     let nrows = block_row_count(bytes)?;
     let last_needed = predicates
@@ -333,6 +392,7 @@ pub(crate) fn count_rows_in_range_filtered(
         .fold(schema.timestamp_index, usize::max);
     let mut cursor = 4usize;
     let mut mask = vec![true; nrows];
+    let mut timestamps: Option<Vec<i64>> = None;
     let mut budget = usize::MAX;
     for index in 0..=last_needed {
         let field = &schema.fields[index];
@@ -373,12 +433,14 @@ pub(crate) fn count_rows_in_range_filtered(
             }
             let values = decode_column(field.ty, bytes, &mut cursor, nrows, &mask, &mut budget)?;
             if is_timestamp {
+                let mut column = Vec::with_capacity(nrows);
                 for (row, value) in values.iter().enumerate() {
                     match value {
                         Scalar::Timestamp(ts) => {
                             if mask[row] && (*ts < from_ms || *ts > to_ms) {
                                 mask[row] = false;
                             }
+                            column.push(*ts);
                         }
                         _ => {
                             return Err(Error::corrupt(
@@ -387,6 +449,7 @@ pub(crate) fn count_rows_in_range_filtered(
                         }
                     }
                 }
+                timestamps = Some(column);
             }
             if let Some(predicate) = predicate {
                 apply_eq(&mut mask, &values, &predicate.allowed);
@@ -395,7 +458,18 @@ pub(crate) fn count_rows_in_range_filtered(
             skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
         }
     }
-    Ok(mask.iter().filter(|keep| **keep).count() as u64)
+    let Some(timestamps) = timestamps else {
+        if mask.iter().any(|keep| *keep) {
+            return Err(Error::corrupt("timestamp column is missing"));
+        }
+        return Ok(());
+    };
+    for (row, ts) in timestamps.into_iter().enumerate() {
+        if mask[row] {
+            visit(ts)?;
+        }
+    }
+    Ok(())
 }
 
 fn encode_column(out: &mut Vec<u8>, ty: FieldType, rows: &[Row], index: usize) -> Result<()> {
@@ -4333,6 +4407,9 @@ mod tests {
             count_rows_in_range_filtered(&schema, &torn, 15, 25, &[]).unwrap(),
             1
         );
+        let mut buckets = [0u64; 3];
+        accumulate_histogram(&schema, &torn, 10, 30, &[], 10, 10, &mut buckets).unwrap();
+        assert_eq!(buckets, [1, 1, 1]);
 
         let mut cursor = 4;
         skip_column(
