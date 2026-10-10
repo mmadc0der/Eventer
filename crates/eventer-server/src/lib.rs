@@ -1,6 +1,8 @@
 //! HTTP front end for the event store.
 //!
-//! `POST /events` appends one JSON object and waits until it is fsynced.
+//! `POST /events` appends one JSON object, or a JSON array of objects, and waits
+//! until that write is fsynced. An array is parsed in full before any row is
+//! queued, then queued together so the batch shares one fsync.
 //! `GET /events?from=&to=` returns a JSON array of events in that inclusive
 //! millisecond range. Repeat `eq=field=value` to AND equality filters into the scan.
 //! `limit` keeps the first matching rows and `offset` skips matches before that.
@@ -46,11 +48,21 @@ async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
+enum Ingest {
+    One,
+    Batch(usize),
+}
+
 async fn post_event(State(state): State<AppState>, body: Bytes) -> Response {
     let store = Arc::clone(&state.store);
-    let joined = tokio::task::spawn_blocking(move || store.append_json_durable(&body)).await;
+    let joined = tokio::task::spawn_blocking(move || ingest(&store, &body)).await;
     match joined {
-        Ok(Ok(())) => (StatusCode::CREATED, Json(json!({"ok": true}))).into_response(),
+        Ok(Ok(Ingest::One)) => (StatusCode::CREATED, Json(json!({"ok": true}))).into_response(),
+        Ok(Ok(Ingest::Batch(count))) => (
+            StatusCode::CREATED,
+            Json(json!({"ok": true, "count": count})),
+        )
+            .into_response(),
         Ok(Err(err)) => error_response(&err),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -58,6 +70,28 @@ async fn post_event(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response(),
     }
+}
+
+fn ingest(store: &eventer::Store, body: &[u8]) -> eventer::Result<Ingest> {
+    if first_byte(body) == Some(b'[') {
+        let values: Vec<Box<serde_json::value::RawValue>> = serde_json::from_slice(body)?;
+        if values.is_empty() {
+            return Err(eventer::Error::event("event batch must not be empty"));
+        }
+        let events: Vec<&[u8]> = values.iter().map(|value| value.get().as_bytes()).collect();
+        let count = events.len();
+        store.append_json_batch_durable(&events)?;
+        Ok(Ingest::Batch(count))
+    } else {
+        store.append_json_durable(body)?;
+        Ok(Ingest::One)
+    }
+}
+
+fn first_byte(body: &[u8]) -> Option<u8> {
+    body.iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
 }
 
 #[derive(Debug, Deserialize)]
@@ -632,5 +666,127 @@ mod tests {
         );
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn post_batch_is_durable_and_atomic() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-batch-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = eventer::StoreOptions {
+            linger: Duration::from_millis(1),
+            parser_threads: 1,
+            compress_threads: 1,
+            ..eventer::StoreOptions::default()
+        };
+        let data = root.join("data");
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options.clone()).unwrap());
+        let app = router(Arc::clone(&store));
+
+        let one = post(&app, r#"{"ts":1000,"action":"click","amount":"1.25"}"#).await;
+        assert_eq!(one.0, StatusCode::CREATED);
+        assert_eq!(one.1, json!({"ok": true}));
+
+        let batch = post(
+            &app,
+            r#"[{"ts":2000,"action":"view","amount":"2.00"},{"ts":2001,"action":"buy","amount":"3.50"}]"#,
+        )
+        .await;
+        assert_eq!(batch.0, StatusCode::CREATED);
+        assert_eq!(batch.1, json!({"ok": true, "count": 2}));
+
+        store.close().unwrap();
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options.clone()).unwrap());
+        let app = router(Arc::clone(&store));
+        let rows = query(&app, "/events?from=1000&to=3000").await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1]["action"], "view");
+        assert_eq!(rows[2]["action"], "buy");
+
+        let rejected = post(
+            &app,
+            r#"[{"ts":4000,"action":"nope","amount":"1.00"},{"action":"missing","amount":"1.00"}]"#,
+        )
+        .await;
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        let after_reject = query(&app, "/events?from=0&to=9000").await;
+        assert_eq!(after_reject.len(), 3);
+        assert!(after_reject.iter().all(|row| row["action"] != "nope"));
+
+        let empty = post(&app, "[]").await;
+        assert_eq!(empty.0, StatusCode::BAD_REQUEST);
+        let nested = post(
+            &app,
+            r#"[{"ts":4100,"action":"still-no","amount":"1.00"},[]]"#,
+        )
+        .await;
+        assert_eq!(nested.0, StatusCode::BAD_REQUEST);
+        let typed = post(&app, r#"[{"ts":4200,"action":"bad-amount","amount":1.25}]"#).await;
+        assert_eq!(typed.0, StatusCode::BAD_REQUEST);
+
+        let followed = post(&app, r#"{"ts":5000,"action":"kept","amount":"4.00"}"#).await;
+        assert_eq!(followed.0, StatusCode::CREATED);
+        assert_eq!(followed.1, json!({"ok": true}));
+
+        store.close().unwrap();
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        let rows = query(&app, "/events?from=0&to=9000").await;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3]["action"], "kept");
+        assert_eq!(rows[3]["ts"], 5000);
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    async fn post(app: &Router, body: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, value)
+    }
+
+    async fn query(app: &Router, uri: &str) -> Vec<Value> {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
     }
 }

@@ -453,6 +453,38 @@ impl Pipeline {
         }
     }
 
+    /// Queue `events` back to back and wait until the last one is fsynced.
+    ///
+    /// Only the last event carries an ack, so the writer syncs once for the
+    /// batch instead of once per event. Callers must already have validated
+    /// every event: a parse failure after the send has started cannot unqueue
+    /// the events that landed before it.
+    pub fn append_batch_durable(&self, events: &[impl AsRef<[u8]>]) -> Result<()> {
+        if events.is_empty() {
+            return Err(Error::event("event batch must not be empty"));
+        }
+        let (ack_tx, ack_rx) = mpsc::channel();
+        {
+            let guard = self.tx.lock().unwrap_or_else(|err| err.into_inner());
+            let tx = guard.as_ref().ok_or(Error::Closed)?;
+            let last = events.len() - 1;
+            for (index, event) in events.iter().enumerate() {
+                tx.send(Cmd::Event {
+                    json: event.as_ref().to_vec(),
+                    ack: if index == last {
+                        Some(ack_tx.clone())
+                    } else {
+                        None
+                    },
+                })
+                .map_err(|_| Error::Closed)?;
+            }
+        }
+        drop(ack_tx);
+        ack_rx.recv().map_err(|_| Error::Closed)??;
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.fail_if_poisoned()?;
         let tx = self.sender()?;
@@ -883,7 +915,7 @@ fn scalar_encoded_upper_bound(ty: FieldType, scalar: &Scalar) -> usize {
 }
 
 fn compress_loop(rx: Receiver<CompIn>, tx: Sender<CompOut>, level: i32, publish: Arc<DictPublish>) {
-    let mut plain = zstd::bulk::Compressor::new(level).ok();
+    let mut plain = segment::block_compressor(level, &[]).ok();
     let mut with_dict: Option<(Arc<Vec<u8>>, zstd::bulk::Compressor<'static>)> = None;
     while let Ok(msg) = rx.recv() {
         let out = match msg {
@@ -925,7 +957,7 @@ fn compress_block(
             .as_ref()
             .is_some_and(|(existing, _)| Arc::ptr_eq(existing, dict));
         if !installed {
-            match zstd::bulk::Compressor::with_dictionary(level, dict) {
+            match segment::block_compressor(level, dict) {
                 Ok(compressor) => *with_dict = Some((Arc::clone(dict), compressor)),
                 Err(err) => {
                     return CompOut::Skip {
@@ -1133,7 +1165,7 @@ impl Disk {
             poison,
             retention,
             publish,
-            plain: zstd::bulk::Compressor::new(level).ok(),
+            plain: segment::block_compressor(level, &[]).ok(),
             dict_compressor: None,
             dict: None,
             segment_epoch: 0,
@@ -1358,8 +1390,7 @@ impl Disk {
                 .as_ref()
                 .is_some_and(|(existing, _)| Arc::ptr_eq(existing, dict));
             if !installed {
-                let compressor =
-                    zstd::bulk::Compressor::with_dictionary(self.level, dict).map_err(Error::io)?;
+                let compressor = segment::block_compressor(self.level, dict).map_err(Error::io)?;
                 self.dict_compressor = Some((Arc::clone(dict), compressor));
             }
             self.dict_compressor

@@ -8,6 +8,7 @@ use crate::zone::{self, BlockZone};
 
 pub const BLOCK_MAGIC: &[u8; 4] = b"EVBK";
 /// Block payload is a zstd frame compressed with the segment dictionary.
+/// New payloads omit the zstd magic; `EVBD` is what selects the dictionary.
 pub const BLOCK_MAGIC_DICT: &[u8; 4] = b"EVBD";
 pub const DICT_MAGIC: &[u8; 4] = b"EVZD";
 pub const INDEX_MAGIC: &[u8; 4] = b"EVIX";
@@ -31,6 +32,7 @@ const INDEX_ZSTD_LEVEL: i32 = 1;
 /// is rebuilt from the segment.
 const MAX_INDEX_UNCOMPRESSED: usize = 512 * 1024 * 1024;
 /// Little-endian zstd frame magic (`0xFD2FB528`).
+/// A block payload that starts with this is an older frame and still decodes.
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Uncompressed sealed-block sample kept before training one dictionary.
 pub const DICT_SAMPLE_MAX: usize = 256 * 1024;
@@ -304,6 +306,53 @@ fn recover_timestamps(
     Ok((min_ts, max_ts))
 }
 
+/// Compressor for one independent block payload.
+///
+/// The segment frame already stores the compressed length, the uncompressed
+/// length, and whether the segment dictionary applies, so the zstd frame omits
+/// its magic, content size, checksum, and dictionary id. Each call to
+/// `compress` still writes a full frame. History is not chained across blocks.
+pub(crate) fn block_compressor(
+    level: i32,
+    dictionary: &[u8],
+) -> std::io::Result<zstd::bulk::Compressor<'static>> {
+    use zstd::zstd_safe::{CParameter, FrameFormat};
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(level, dictionary)?;
+    compressor.set_parameter(CParameter::Format(FrameFormat::Magicless))?;
+    compressor.set_parameter(CParameter::ContentSizeFlag(false))?;
+    compressor.set_parameter(CParameter::ChecksumFlag(false))?;
+    compressor.set_parameter(CParameter::DictIdFlag(false))?;
+    Ok(compressor)
+}
+
+fn payload_has_legacy_magic(compressed: &[u8]) -> bool {
+    compressed.len() >= ZSTD_FRAME_MAGIC.len() && compressed[..4] == ZSTD_FRAME_MAGIC
+}
+
+fn decompress_block_payload(
+    compressed: &[u8],
+    uncompressed_len: usize,
+    dictionary: Option<&[u8]>,
+) -> std::io::Result<Vec<u8>> {
+    let legacy = payload_has_legacy_magic(compressed);
+    if legacy {
+        return if let Some(dictionary) = dictionary {
+            let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dictionary)?;
+            decompressor.decompress(compressed, uncompressed_len)
+        } else {
+            zstd::bulk::decompress(compressed, uncompressed_len)
+        };
+    }
+    let mut decompressor = match dictionary {
+        Some(dictionary) => zstd::bulk::Decompressor::with_dictionary(dictionary)?,
+        None => zstd::bulk::Decompressor::new()?,
+    };
+    decompressor.set_parameter(zstd::zstd_safe::DParameter::Format(
+        zstd::zstd_safe::FrameFormat::Magicless,
+    ))?;
+    decompressor.decompress(compressed, uncompressed_len)
+}
+
 pub fn frame_block(
     compressed: &[u8],
     uncompressed_len: u32,
@@ -403,7 +452,12 @@ fn try_frame(buf: &[u8], header_len: usize, with_timestamps: bool) -> Option<Par
     };
     let crc = u32::from_le_bytes(buf[crc_at..crc_at + 4].try_into().unwrap());
     let payload = &buf[header_len..total];
-    if payload.len() < 4 || payload[0..4] != ZSTD_FRAME_MAGIC || crc32fast::hash(payload) != crc {
+    if crc32fast::hash(payload) != crc {
+        return None;
+    }
+    // Older 36-byte frames always start with the zstd magic. New 20-byte
+    // payloads are magicless, so the crc alone identifies them.
+    if with_timestamps && !payload_has_legacy_magic(payload) {
         return None;
     }
     Some(ParsedFrame {
@@ -417,12 +471,26 @@ fn try_frame(buf: &[u8], header_len: usize, with_timestamps: bool) -> Option<Par
     })
 }
 
-/// Prefer a valid 20-byte frame. A buffer that only matches the 36-byte header stays readable.
+/// Prefer a crc-valid 20-byte frame. A 36-byte header is used when the 20-byte
+/// view does not match, or when that view collides and only the 36-byte
+/// payload still starts with the zstd magic.
 fn parse_framed_block(buf: &[u8]) -> Option<ParsedFrame> {
-    if let Some(frame) = try_frame(buf, BLOCK_HEADER_LEN, false) {
-        return Some(frame);
+    let short = try_frame(buf, BLOCK_HEADER_LEN, false);
+    let legacy = try_frame(buf, BLOCK_HEADER_LEN_V1, true);
+    match (short, legacy) {
+        (Some(short), Some(legacy)) => {
+            let short_payload = &buf[short.header_len..];
+            let legacy_payload = &buf[legacy.header_len..];
+            if !payload_has_legacy_magic(short_payload) && payload_has_legacy_magic(legacy_payload)
+            {
+                Some(legacy)
+            } else {
+                Some(short)
+            }
+        }
+        (Some(frame), None) | (None, Some(frame)) => Some(frame),
+        (None, None) => None,
     }
-    try_frame(buf, BLOCK_HEADER_LEN_V1, true)
 }
 
 fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<ScannedBlock>, u64, bool)> {
@@ -798,7 +866,10 @@ fn write_index_file(path: &Path, stored: &[u8], sync: bool) -> Result<()> {
 /// fails. Replacing the extension of that path nests `.idx.idx.partial`, which
 /// the error path does not remove.
 fn index_temp_path(path: &Path) -> PathBuf {
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     if name.ends_with(".idx.partial") {
         path.to_path_buf()
     } else {
@@ -1110,32 +1181,22 @@ pub fn read_block_payload(
             "uncompressed length does not match the index",
         ));
     }
-    if dictionary_frame {
-        let Some(dictionary) = dictionary else {
-            return Err(Error::corrupt(format!(
-                "dictionary frame at offset {} in segment {} has no dictionary",
-                meta.offset, meta.segment_id
-            )));
-        };
-        let mut decompressor =
-            zstd::bulk::Decompressor::with_dictionary(dictionary).map_err(|err| {
-                Error::corrupt(format!(
-                    "zstd dictionary decompressor failed at offset {} in segment {}: {err}",
-                    meta.offset, meta.segment_id
-                ))
-            })?;
-        decompressor
-            .decompress(compressed, uncompressed_len as usize)
-            .map_err(|err| {
-                Error::corrupt(format!(
-                    "zstd dictionary decompress failed at offset {} in segment {}: {err}",
-                    meta.offset, meta.segment_id
-                ))
-            })
-    } else {
-        zstd::bulk::decompress(compressed, uncompressed_len as usize)
-            .map_err(|err| Error::corrupt(format!("zstd decompress failed: {err}")))
+    if dictionary_frame && dictionary.is_none() {
+        return Err(Error::corrupt(format!(
+            "dictionary frame at offset {} in segment {} has no dictionary",
+            meta.offset, meta.segment_id
+        )));
     }
+    decompress_block_payload(compressed, uncompressed_len as usize, dictionary).map_err(|err| {
+        if dictionary_frame {
+            Error::corrupt(format!(
+                "zstd dictionary decompress failed at offset {} in segment {}: {err}",
+                meta.offset, meta.segment_id
+            ))
+        } else {
+            Error::corrupt(format!("zstd decompress failed: {err}"))
+        }
+    })
 }
 
 /// Append-only writer for the current segment.
@@ -1453,5 +1514,62 @@ mod tests {
         let err = decompress_index_frame(&big_frame, 64).unwrap_err();
         assert!(err.to_string().contains("decompress bound"), "{err}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn write_one_block(dir: &Path, framed: &[u8], compressed_len: u32, raw_len: u32) -> BlockMeta {
+        let mut active = ActiveSegment::create_new(dir, 1).unwrap();
+        let meta = BlockMeta {
+            segment_id: 1,
+            offset: 0,
+            compressed_len,
+            uncompressed_len: raw_len,
+            row_count: 1,
+            min_ts: 1,
+            max_ts: 1,
+        };
+        active.write_framed(framed, &meta).unwrap();
+        active.flush_os(true).unwrap();
+        meta
+    }
+
+    #[test]
+    fn magicless_block_round_trips_and_legacy_magic_still_decodes() {
+        let raw: Vec<u8> = (0..4096).map(|i| (i % 23) as u8).collect();
+        let dict: Vec<u8> = (0..512).map(|i| (i % 11) as u8).collect();
+        let magic = ZSTD_FRAME_MAGIC;
+
+        for dictionary in [None, Some(dict.as_slice())] {
+            let mut magicless = block_compressor(3, dictionary.unwrap_or(&[])).unwrap();
+            let compressed = magicless.compress(&raw).unwrap();
+            assert!(
+                !payload_has_legacy_magic(&compressed),
+                "new block payload must omit the zstd magic"
+            );
+            let mut legacy =
+                zstd::bulk::Compressor::with_dictionary(3, dictionary.unwrap_or(&[])).unwrap();
+            let old = legacy.compress(&raw).unwrap();
+            assert!(payload_has_legacy_magic(&old));
+            assert!(
+                compressed.len() < old.len(),
+                "magicless frame should drop the repeated header"
+            );
+
+            let dir = scratch_dir();
+            let framed =
+                frame_block(&compressed, raw.len() as u32, 1, dictionary.is_some()).unwrap();
+            let meta = write_one_block(&dir, &framed, compressed.len() as u32, raw.len() as u32);
+            let got = read_block_payload(&data_path(&dir, 1), &meta, dictionary).unwrap();
+            assert_eq!(got, raw);
+
+            let old_framed = frame_block(&old, raw.len() as u32, 1, dictionary.is_some()).unwrap();
+            let old_dir = scratch_dir();
+            let old_meta =
+                write_one_block(&old_dir, &old_framed, old.len() as u32, raw.len() as u32);
+            let got = read_block_payload(&data_path(&old_dir, 1), &old_meta, dictionary).unwrap();
+            assert_eq!(got, raw);
+            assert_eq!(&old[..4], &magic);
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::remove_dir_all(&old_dir);
+        }
     }
 }
