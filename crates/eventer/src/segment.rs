@@ -22,7 +22,15 @@ pub const BLOCK_HEADER_LEN_V1: usize = 36;
 pub const INDEX_HEADER_LEN: usize = 8;
 pub const INDEX_ENTRY_LEN: usize = 40;
 pub const DICT_HEADER_LEN: usize = 16;
-pub const INDEX_VERSION: u16 = 1;
+/// Version written for a new sparse index.
+///
+/// Version 1 stores every entry as absolute little-endian fields. Version 2
+/// stores the first entry the same way, including the four zero bytes at offset
+/// 20. Each later entry stores signed deltas of offset, compressed length,
+/// uncompressed length, row count, min timestamp, and max timestamp in those
+/// same widths. The pad bytes stay zero.
+pub const INDEX_VERSION: u16 = 2;
+const INDEX_VERSION_V1: u16 = 1;
 pub const DICT_VERSION: u16 = 1;
 /// Trained dictionary cap. The sidecar frames this plus a 16-byte header.
 pub const DICT_MAX_BYTES: usize = 4 * 1024;
@@ -976,7 +984,7 @@ fn parse_index(plain: &[u8]) -> Result<Vec<BlockMeta>> {
         return Err(Error::corrupt("index magic mismatch"));
     }
     let version = u16::from_le_bytes(plain[4..6].try_into().unwrap());
-    if version != INDEX_VERSION {
+    if version != INDEX_VERSION_V1 && version != INDEX_VERSION {
         return Err(Error::corrupt(format!(
             "unsupported index version {version}"
         )));
@@ -986,46 +994,127 @@ fn parse_index(plain: &[u8]) -> Result<Vec<BlockMeta>> {
         return Err(Error::corrupt("truncated index"));
     }
     let mut blocks = Vec::with_capacity(body.len() / INDEX_ENTRY_LEN);
+    let mut prev: Option<IndexFields> = None;
     for chunk in body.chunks_exact(INDEX_ENTRY_LEN) {
         let entry: [u8; INDEX_ENTRY_LEN] = chunk.try_into().unwrap();
-        blocks.push(decode_index_entry(&entry)?);
+        let stored = read_index_fields(&entry);
+        let fields = if version == INDEX_VERSION {
+            match prev {
+                Some(prev) => apply_index_delta(&prev, &stored),
+                None => stored,
+            }
+        } else {
+            stored
+        };
+        prev = Some(fields);
+        blocks.push(meta_from_fields(&fields));
     }
     Ok(blocks)
 }
 
-fn decode_index_entry(entry: &[u8; INDEX_ENTRY_LEN]) -> Result<BlockMeta> {
-    Ok(BlockMeta {
-        segment_id: 0,
+/// Absolute little-endian fields of one sparse-index entry. The four bytes at
+/// offset 20 are padding and stay zero.
+#[derive(Clone, Copy)]
+struct IndexFields {
+    offset: u64,
+    compressed_len: u32,
+    uncompressed_len: u32,
+    row_count: u32,
+    min_ts: i64,
+    max_ts: i64,
+}
+
+fn read_index_fields(entry: &[u8; INDEX_ENTRY_LEN]) -> IndexFields {
+    IndexFields {
         offset: u64::from_le_bytes(entry[0..8].try_into().unwrap()),
         compressed_len: u32::from_le_bytes(entry[8..12].try_into().unwrap()),
         uncompressed_len: u32::from_le_bytes(entry[12..16].try_into().unwrap()),
         row_count: u32::from_le_bytes(entry[16..20].try_into().unwrap()),
         min_ts: i64::from_le_bytes(entry[24..32].try_into().unwrap()),
         max_ts: i64::from_le_bytes(entry[32..40].try_into().unwrap()),
-    })
+    }
 }
 
-pub fn index_entry_bytes(meta: &BlockMeta) -> [u8; INDEX_ENTRY_LEN] {
+fn write_index_fields(fields: &IndexFields) -> [u8; INDEX_ENTRY_LEN] {
     let mut entry = [0u8; INDEX_ENTRY_LEN];
-    entry[0..8].copy_from_slice(&meta.offset.to_le_bytes());
-    entry[8..12].copy_from_slice(&meta.compressed_len.to_le_bytes());
-    entry[12..16].copy_from_slice(&meta.uncompressed_len.to_le_bytes());
-    entry[16..20].copy_from_slice(&meta.row_count.to_le_bytes());
-    entry[24..32].copy_from_slice(&meta.min_ts.to_le_bytes());
-    entry[32..40].copy_from_slice(&meta.max_ts.to_le_bytes());
+    entry[0..8].copy_from_slice(&fields.offset.to_le_bytes());
+    entry[8..12].copy_from_slice(&fields.compressed_len.to_le_bytes());
+    entry[12..16].copy_from_slice(&fields.uncompressed_len.to_le_bytes());
+    entry[16..20].copy_from_slice(&fields.row_count.to_le_bytes());
+    entry[24..32].copy_from_slice(&fields.min_ts.to_le_bytes());
+    entry[32..40].copy_from_slice(&fields.max_ts.to_le_bytes());
     entry
 }
 
-fn encode_index(blocks: &[BlockMeta]) -> Vec<u8> {
+fn fields_from_meta(meta: &BlockMeta) -> IndexFields {
+    IndexFields {
+        offset: meta.offset,
+        compressed_len: meta.compressed_len,
+        uncompressed_len: meta.uncompressed_len,
+        row_count: meta.row_count,
+        min_ts: meta.min_ts,
+        max_ts: meta.max_ts,
+    }
+}
+
+fn meta_from_fields(fields: &IndexFields) -> BlockMeta {
+    BlockMeta {
+        segment_id: 0,
+        offset: fields.offset,
+        compressed_len: fields.compressed_len,
+        uncompressed_len: fields.uncompressed_len,
+        row_count: fields.row_count,
+        min_ts: fields.min_ts,
+        max_ts: fields.max_ts,
+    }
+}
+
+/// Signed deltas in the same widths as the absolute fields. Two's-complement
+/// wrapping is the inverse of [`apply_index_delta`].
+fn delta_index_fields(prev: &IndexFields, next: &IndexFields) -> IndexFields {
+    IndexFields {
+        offset: next.offset.wrapping_sub(prev.offset),
+        compressed_len: next.compressed_len.wrapping_sub(prev.compressed_len),
+        uncompressed_len: next.uncompressed_len.wrapping_sub(prev.uncompressed_len),
+        row_count: next.row_count.wrapping_sub(prev.row_count),
+        min_ts: next.min_ts.wrapping_sub(prev.min_ts),
+        max_ts: next.max_ts.wrapping_sub(prev.max_ts),
+    }
+}
+
+fn apply_index_delta(prev: &IndexFields, delta: &IndexFields) -> IndexFields {
+    IndexFields {
+        offset: prev.offset.wrapping_add(delta.offset),
+        compressed_len: prev.compressed_len.wrapping_add(delta.compressed_len),
+        uncompressed_len: prev.uncompressed_len.wrapping_add(delta.uncompressed_len),
+        row_count: prev.row_count.wrapping_add(delta.row_count),
+        min_ts: prev.min_ts.wrapping_add(delta.min_ts),
+        max_ts: prev.max_ts.wrapping_add(delta.max_ts),
+    }
+}
+
+fn decode_index_entry(entry: &[u8; INDEX_ENTRY_LEN]) -> Result<BlockMeta> {
+    Ok(meta_from_fields(&read_index_fields(entry)))
+}
+
+pub fn index_entry_bytes(meta: &BlockMeta) -> [u8; INDEX_ENTRY_LEN] {
+    write_index_fields(&fields_from_meta(meta))
+}
+
+pub(crate) fn encode_index(blocks: &[BlockMeta]) -> Vec<u8> {
     let mut raw = Vec::with_capacity(INDEX_HEADER_LEN + blocks.len() * INDEX_ENTRY_LEN);
     raw.extend_from_slice(INDEX_MAGIC);
     raw.extend_from_slice(&INDEX_VERSION.to_le_bytes());
     raw.extend_from_slice(&0u16.to_le_bytes());
+    let mut prev: Option<IndexFields> = None;
     for block in blocks {
-        // Segment id is not stored in the entry; stamp it so equality checks work.
-        let mut owned = block.clone();
-        owned.segment_id = 0;
-        raw.extend_from_slice(&index_entry_bytes(&owned));
+        let fields = fields_from_meta(block);
+        let stored = match prev {
+            Some(prev) => delta_index_fields(&prev, &fields),
+            None => fields,
+        };
+        prev = Some(fields);
+        raw.extend_from_slice(&write_index_fields(&stored));
     }
     raw
 }
@@ -1401,8 +1490,9 @@ pub fn read_block_payload(
 /// Append-only writer for the current segment.
 ///
 /// Index entries are buffered and the whole index file is replaced at the end
-/// of a batch. A plain zstd frame is written only when it is strictly smaller
-/// than the raw `EVIX` bytes.
+/// of a batch. The replacement is a version-2 index: the first entry is
+/// absolute and each later entry is a signed delta. A plain zstd frame is
+/// written only when it is strictly smaller than those raw `EVIX` bytes.
 pub struct ActiveSegment {
     pub id: u32,
     data: std::io::BufWriter<File>,
@@ -1481,13 +1571,21 @@ impl ActiveSegment {
         let path = index_path(&self.dir, self.id);
         let before = fs::metadata(&path)?.len();
         let existing = fs::read(&path)?;
-        let mut raw = plain_index_bytes(&existing)?;
+        let raw = plain_index_bytes(&existing)?;
         let added = self.pending_index.len() as u64;
-        if raw.len() as u64 + added != self.index_len {
+        if raw.len() as u64 + added != self.index_len || added % INDEX_ENTRY_LEN as u64 != 0 {
             return Err(Error::corrupt("index length does not match the segment"));
         }
-        raw.extend_from_slice(&self.pending_index);
-        let stored = compress_index_if_smaller(&raw);
+        let mut blocks = parse_index(&raw)?;
+        for chunk in self.pending_index.chunks_exact(INDEX_ENTRY_LEN) {
+            let entry: [u8; INDEX_ENTRY_LEN] = chunk.try_into().unwrap();
+            blocks.push(decode_index_entry(&entry)?);
+        }
+        let encoded = encode_index(&blocks);
+        if encoded.len() as u64 != self.index_len {
+            return Err(Error::corrupt("index length does not match the segment"));
+        }
+        let stored = compress_index_if_smaller(&encoded);
         write_index_file(&path, &stored, sync)?;
         self.pending_index.clear();
         Ok(stored.len() as i64 - before as i64 - added as i64)
@@ -1614,6 +1712,94 @@ mod tests {
             min_ts: i64::from(index) * 1_000,
             max_ts: i64::from(index) * 1_000 + 999,
         }
+    }
+
+    fn encode_index_v1(blocks: &[BlockMeta]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(INDEX_HEADER_LEN + blocks.len() * INDEX_ENTRY_LEN);
+        raw.extend_from_slice(INDEX_MAGIC);
+        raw.extend_from_slice(&INDEX_VERSION_V1.to_le_bytes());
+        raw.extend_from_slice(&0u16.to_le_bytes());
+        for block in blocks {
+            raw.extend_from_slice(&index_entry_bytes(block));
+        }
+        raw
+    }
+
+    #[test]
+    fn version_two_index_stores_signed_deltas_and_version_one_still_loads() {
+        let mut metas: Vec<BlockMeta> = (0..4).map(sample_meta).collect();
+        metas[2].compressed_len = 40;
+        metas[2].uncompressed_len = 100;
+        metas[2].row_count = 8;
+        metas[2].min_ts = metas[1].min_ts - 50;
+        let encoded = encode_index(&metas);
+        assert_eq!(
+            u16::from_le_bytes(encoded[4..6].try_into().unwrap()),
+            INDEX_VERSION
+        );
+        assert_eq!(
+            encoded.len(),
+            INDEX_HEADER_LEN + metas.len() * INDEX_ENTRY_LEN
+        );
+        let first = &encoded[INDEX_HEADER_LEN..INDEX_HEADER_LEN + INDEX_ENTRY_LEN];
+        assert_eq!(first, &index_entry_bytes(&metas[0]));
+        for entry_index in 0..metas.len() {
+            let start = INDEX_HEADER_LEN + entry_index * INDEX_ENTRY_LEN;
+            assert_eq!(&encoded[start + 20..start + 24], &[0, 0, 0, 0]);
+        }
+        let second =
+            &encoded[INDEX_HEADER_LEN + INDEX_ENTRY_LEN..INDEX_HEADER_LEN + 2 * INDEX_ENTRY_LEN];
+        let prev = &metas[0];
+        let next = &metas[1];
+        assert_eq!(
+            i64::from_le_bytes(second[0..8].try_into().unwrap()),
+            next.offset.wrapping_sub(prev.offset) as i64
+        );
+        assert_eq!(
+            i32::from_le_bytes(second[8..12].try_into().unwrap()),
+            next.compressed_len.wrapping_sub(prev.compressed_len) as i32
+        );
+        assert_eq!(
+            i32::from_le_bytes(second[12..16].try_into().unwrap()),
+            next.uncompressed_len.wrapping_sub(prev.uncompressed_len) as i32
+        );
+        assert_eq!(
+            i32::from_le_bytes(second[16..20].try_into().unwrap()),
+            next.row_count.wrapping_sub(prev.row_count) as i32
+        );
+        assert_eq!(
+            i64::from_le_bytes(second[24..32].try_into().unwrap()),
+            next.min_ts.wrapping_sub(prev.min_ts)
+        );
+        assert_eq!(
+            i64::from_le_bytes(second[32..40].try_into().unwrap()),
+            next.max_ts.wrapping_sub(prev.max_ts)
+        );
+        assert_ne!(second, index_entry_bytes(next).as_slice());
+        let third_row = i32::from_le_bytes(
+            encoded[INDEX_HEADER_LEN + 2 * INDEX_ENTRY_LEN + 16
+                ..INDEX_HEADER_LEN + 2 * INDEX_ENTRY_LEN + 20]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(third_row < 0, "a smaller row count is a negative delta");
+
+        let loaded = parse_index(&encoded).unwrap();
+        for (got, expect) in loaded.iter().zip(&metas) {
+            let mut expect = expect.clone();
+            expect.segment_id = 0;
+            assert_eq!(got, &expect);
+        }
+
+        let legacy = encode_index_v1(&metas);
+        assert_eq!(
+            u16::from_le_bytes(legacy[4..6].try_into().unwrap()),
+            INDEX_VERSION_V1
+        );
+        let loaded = parse_index(&legacy).unwrap();
+        assert_eq!(loaded.len(), metas.len());
+        assert_eq!(loaded[2].row_count, metas[2].row_count);
+        assert_eq!(loaded[2].min_ts, metas[2].min_ts);
     }
 
     #[test]

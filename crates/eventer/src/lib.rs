@@ -2,9 +2,10 @@
 //!
 //! Events are parsed against a typed schema, packed into columnar blocks, compressed
 //! with zstd, and written by a single thread. A sparse index stores each block's
-//! time range so queries skip blocks that cannot match. That index file is a
-//! plain zstd frame when the frame is smaller than the raw bytes, and an older
-//! raw index still opens. A zone map stores per-column
+//! time range so queries skip blocks that cannot match. Version 2 stores the
+//! first entry as absolute fields and each later entry as signed deltas of those
+//! fields. That index file is a plain zstd frame when the frame is smaller than
+//! the raw bytes, and an older raw index still opens. A zone map stores per-column
 //! equality stats (exact sets or a bloom filter for strings, min/max for numbers)
 //! so a filtered query can skip the payload as well. Equality predicates that still
 //! need the block are applied while it is decoded.
