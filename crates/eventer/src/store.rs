@@ -563,9 +563,15 @@ impl Store {
     /// private directory. The finished files are moved in after they are
     /// fsynced, with `schema.lock` last. The marker is removed only after that
     /// lock is in place and the destination directory is fsynced. Opening the
-    /// destination while the marker is present fails and does not create
-    /// `schema.lock`. A rename or fsync error moves the published names back
-    /// and removes the marker, leaving `destination` empty.
+    /// destination while the marker is present fails, including when
+    /// `schema.lock` is already there, and does not read segment files or
+    /// create `schema.lock`. A destination that still has that marker is an
+    /// unfinished attempt: the marker, any `eventer-rewrite-*` scratch
+    /// directory, and store files left beside them are removed and the copy
+    /// starts again. A directory that holds a store and has no marker is
+    /// refused. A rename or fsync error moves the published names back. The
+    /// marker stays until the scratch directory has been removed, and is
+    /// unlinked after that.
     ///
     /// The report uses the same totals as [`Store::stats`]: `stored_data_bytes`
     /// is segment data plus dictionary sidecars, and `stored_index_bytes` is
@@ -600,6 +606,9 @@ impl Store {
                     "destination {} is not a directory",
                     destination.display()
                 )));
+            }
+            if rewrite_marker_present(destination) {
+                clear_unfinished_rewrite(destination)?;
             }
             if directory_holds_store(destination)? {
                 return Err(Error::event(
@@ -645,12 +654,17 @@ impl Store {
         };
         let mut last_error = None;
         for base in &bases {
-            let Some(created) = scratch_dir_in(std::slice::from_ref(base), &scratch_name, &source_abs, &destination_abs)
-                .map(Some)
-                .or_else(|err| {
-                    last_error = Some(err);
-                    Ok::<Option<PathBuf>, Error>(None)
-                })?
+            let Some(created) = scratch_dir_in(
+                std::slice::from_ref(base),
+                &scratch_name,
+                &source_abs,
+                &destination_abs,
+            )
+            .map(Some)
+            .or_else(|err| {
+                last_error = Some(err);
+                Ok::<Option<PathBuf>, Error>(None)
+            })?
             else {
                 continue;
             };
@@ -779,7 +793,6 @@ impl Store {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
     }
-
 }
 
 /// Data and index bytes, using the same split as [`Stats`].
@@ -1025,14 +1038,12 @@ enum SchemaLockAction {
 }
 
 fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
+    if rewrite_marker_present(dir) {
+        return Err(Error::corrupt("directory contains an unfinished rewrite"));
+    }
     let path = dir.join("schema.lock");
     let canonical = schema.canonical();
     if !path.exists() {
-        if dir.join(REWRITE_INCOMPLETE_MARKER).is_file() {
-            return Err(Error::corrupt(
-                "directory contains an unfinished rewrite and has no schema.lock",
-            ));
-        }
         write_schema_lock(&path, &canonical)?;
         return Ok(SchemaLockAction::Ready);
     }
@@ -1161,6 +1172,39 @@ fn remove_rewrite_marker(dir: &Path) -> Result<()> {
         fsync_dir(dir)?;
     }
     Ok(())
+}
+
+fn rewrite_marker_present(dir: &Path) -> bool {
+    dir.join(REWRITE_INCOMPLETE_MARKER).is_file()
+}
+
+/// Remove a killed rewrite so a later call can publish into `dir`.
+/// Store files and scratch directories go first. The marker is last, so a
+/// crash in the middle still leaves a directory that [`Store::open`] refuses.
+fn clear_unfinished_rewrite(dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name == REWRITE_INCOMPLETE_MARKER {
+            continue;
+        }
+        if file_type.is_dir() {
+            if name.starts_with("eventer-rewrite-") {
+                fs::remove_dir_all(entry.path()).map_err(Error::io)?;
+            }
+            continue;
+        }
+        if file_type.is_file() && (name == "schema.lock" || name.starts_with("seg-")) {
+            fs::remove_file(entry.path()).map_err(Error::io)?;
+        }
+    }
+    fsync_dir(dir)?;
+    remove_rewrite_marker(dir)
 }
 
 /// Deletes the rewrite marker unless [`RemoveRewriteMarker::disarm`] ran.
@@ -1350,9 +1394,7 @@ fn scratch_dir_in(
         }
     }
     Err(last_error.unwrap_or_else(|| {
-        Error::io(
-            "could not create a scratch directory outside the source and the destination",
-        )
+        Error::io("could not create a scratch directory outside the source and the destination")
     }))
 }
 
@@ -1471,7 +1513,9 @@ fn copy_store_files_synced(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn exclusive_publish_dir(destination: &Path) -> Result<PathBuf> {
-    let parent = destination.parent().filter(|parent| !parent.as_os_str().is_empty());
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
     let parent = match parent {
         Some(parent) => parent,
         None => {
@@ -1520,8 +1564,10 @@ fn fsync_file(path: &Path) -> Result<()> {
 /// `schema.lock` is last. The incomplete-rewrite marker stays until that
 /// lock is in place and `destination` has been fsynced, then it is removed.
 /// A rename or fsync error puts the published names back into `staging` and
-/// removes the marker, so `destination` stays empty. `rename` of the staging
-/// directory itself is not used: onto a mount point it returns `EBUSY`.
+/// leaves the marker. The scratch directory is removed before that marker,
+/// so the unfinished copy is gone before open would accept the directory.
+/// `rename` of the staging directory itself is not used: onto a mount point
+/// it returns `EBUSY`.
 fn publish_into_existing_directory(staging: &Path, destination: &Path) -> Result<()> {
     let mut files = Vec::new();
     for entry in fs::read_dir(staging)? {
@@ -1577,7 +1623,8 @@ fn publish_into_existing_directory(staging: &Path, destination: &Path) -> Result
         match fs::rename(staging.join(name), destination.join(name)) {
             Ok(()) => moved.push(name.clone()),
             Err(err) => {
-                return abort_existing_publish(&moved, staging, destination).and(Err(Error::io(err)));
+                return abort_existing_publish(&moved, staging, destination)
+                    .and(Err(Error::io(err)));
             }
         }
     }
@@ -1592,8 +1639,10 @@ fn abort_existing_publish(
     staging: &Path,
     destination: &Path,
 ) -> Result<()> {
-    rollback_published_files(moved, staging, destination)?;
-    remove_rewrite_marker(destination)
+    // The marker stays. `RemoveOnDrop` for the scratch directory runs before
+    // `RemoveRewriteMarker`, which unlinks and fsyncs the marker only after
+    // that scratch directory is gone.
+    rollback_published_files(moved, staging, destination)
 }
 
 fn rollback_published_files(
@@ -1607,11 +1656,7 @@ fn rollback_published_files(
     Ok(())
 }
 
-fn publish_directory(
-    staging: &Path,
-    destination: &Path,
-    destination_existed: bool,
-) -> Result<()> {
+fn publish_directory(staging: &Path, destination: &Path, destination_existed: bool) -> Result<()> {
     if destination_existed {
         return publish_into_existing_directory(staging, destination);
     }
@@ -4644,6 +4689,90 @@ mod tests {
     }
 
     #[test]
+    fn open_refuses_a_rewrite_marker_when_schema_lock_is_already_present() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let mut options = test_options(1);
+        options.segment_bytes = 1;
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        for ts in 1..=6 {
+            store
+                .append_json(&event(ts, Some(ts), "click", None, "1.00"))
+                .unwrap();
+            store.flush().unwrap();
+        }
+        store.close().unwrap();
+        let dest = dir.path().join("partial");
+        fs::create_dir(&dest).unwrap();
+        fs::copy(data.join("schema.lock"), dest.join("schema.lock")).unwrap();
+        fs::copy(data.join("seg-000001.dat"), dest.join("seg-000001.dat")).unwrap();
+        fs::write(dest.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        let before = snapshot_tree(&dest);
+        let err = match Store::open(&dest, &schema) {
+            Ok(_) => panic!("opened a directory that still has the rewrite marker"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unfinished rewrite"), "{err}");
+        assert_eq!(snapshot_tree(&dest), before);
+    }
+
+    #[test]
+    fn rewrite_directory_replaces_an_unfinished_attempt() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, Some(2), "view", Some("a"), "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let expected = query_bytes(&data, &schema);
+
+        let marker_only = dir.path().join("marker-only");
+        fs::create_dir(&marker_only).unwrap();
+        fs::write(marker_only.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        Store::rewrite_directory(&data, &marker_only).unwrap();
+        let opened = Store::open(&marker_only, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert_eq!(query_bytes(&marker_only, &schema), expected);
+        assert!(!marker_only.join(REWRITE_INCOMPLETE_MARKER).exists());
+
+        let partial = dir.path().join("partial");
+        fs::create_dir(&partial).unwrap();
+        fs::write(partial.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        fs::write(partial.join("seg-000001.dat"), b"leftover").unwrap();
+        let scratch = partial.join("eventer-rewrite-1-1").join("staging");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("seg-000001.dat"), b"scratch").unwrap();
+        Store::rewrite_directory(&data, &partial).unwrap();
+        let opened = Store::open(&partial, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert!(!partial.join("eventer-rewrite-1-1").exists());
+        assert!(!partial.join(REWRITE_INCOMPLETE_MARKER).exists());
+        assert_eq!(query_bytes(&partial, &schema), expected);
+
+        let finished = dir.path().join("finished");
+        Store::rewrite_directory(&data, &finished).unwrap();
+        let err = Store::rewrite_directory(&data, &finished).unwrap_err();
+        assert!(err.to_string().contains("already holds a store"), "{err}");
+
+        fs::write(finished.join(REWRITE_INCOMPLETE_MARKER), b"incomplete\n").unwrap();
+        Store::rewrite_directory(&data, &finished).unwrap();
+        let opened = Store::open(&finished, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert!(!finished.join(REWRITE_INCOMPLETE_MARKER).exists());
+        assert_eq!(query_bytes(&finished, &schema), expected);
+    }
+
+    #[test]
     fn rewrite_directory_puts_back_files_when_a_later_publish_rename_fails() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -4691,14 +4820,18 @@ mod tests {
         fs::create_dir(&source).unwrap();
         let destination = dir.path().join("destination");
         let bases = vec![source.clone(), dir.path().to_path_buf()];
-        let created = scratch_dir_in(&bases, "eventer-rewrite-test", &source, &destination).unwrap();
+        let created =
+            scratch_dir_in(&bases, "eventer-rewrite-test", &source, &destination).unwrap();
         assert_eq!(created.parent(), Some(dir.path()));
         assert!(!created.starts_with(&source));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&created).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "scratch directory is traversable by other users");
+            assert_eq!(
+                mode, 0o700,
+                "scratch directory is traversable by other users"
+            );
         }
         let _ = fs::remove_dir_all(&created);
         assert!(!source.join("eventer-rewrite-test").exists());
@@ -4717,10 +4850,9 @@ mod tests {
         store.close().unwrap();
         let before = snapshot_tree(&data);
         let dest = dir.path().join("rewritten");
-        let planted = dir.path().join(format!(
-            ".rewritten-publish-{}",
-            std::process::id()
-        ));
+        let planted = dir
+            .path()
+            .join(format!(".rewritten-publish-{}", std::process::id()));
         fs::create_dir(&planted).unwrap();
         fs::write(planted.join("seg-000099.dat"), b"leftover").unwrap();
 
