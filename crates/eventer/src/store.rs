@@ -561,9 +561,10 @@ impl Store {
     /// does not exist yet, that directory is renamed into place. When
     /// `destination` already exists, the private directory is created inside it
     /// and the finished files are moved in after they are fsynced, with
-    /// `schema.lock` last. A crash during publish can leave `destination`
-    /// incomplete; opening that incomplete directory does not mark the copy
-    /// successful.
+    /// `schema.lock` last. A crash during that move can leave segment files
+    /// in `destination` with no `schema.lock`. Opening that directory fails,
+    /// so the incomplete copy is not a store. A rename error moves the files
+    /// that already landed back out, leaving `destination` empty.
     ///
     /// The report uses the same totals as [`Store::stats`]: `stored_data_bytes`
     /// is segment data plus dictionary sidecars, and `stored_index_bytes` is
@@ -1017,6 +1018,11 @@ fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
     let path = dir.join("schema.lock");
     let canonical = schema.canonical();
     if !path.exists() {
+        if directory_has_segment_data(dir)? {
+            return Err(Error::corrupt(
+                "directory contains segment data but has no schema.lock",
+            ));
+        }
         write_schema_lock(&path, &canonical)?;
         return Ok(SchemaLockAction::Ready);
     }
@@ -1039,6 +1045,10 @@ fn schema_lock_action(dir: &Path, schema: &Schema) -> Result<SchemaLockAction> {
 thread_local! {
     static REWRITE_FAIL_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REWRITE_COPY_ACROSS_DEVICES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fail the publish rename once this many calls have been allowed through.
+    /// `0` disables the hook. `1` fails the first rename.
+    static REWRITE_FAIL_PUBLISH_RENAME_AFTER: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn rewrite_should_copy_across_devices() -> bool {
@@ -1048,6 +1058,28 @@ fn rewrite_should_copy_across_devices() -> bool {
             let copy = flag.get();
             flag.set(false);
             copy
+        })
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn rewrite_publish_rename_should_fail() -> bool {
+    #[cfg(test)]
+    {
+        REWRITE_FAIL_PUBLISH_RENAME_AFTER.with(|flag| {
+            let left = flag.get();
+            if left == 0 {
+                return false;
+            }
+            if left == 1 {
+                flag.set(0);
+                return true;
+            }
+            flag.set(left - 1);
+            false
         })
     }
     #[cfg(not(test))]
@@ -1096,6 +1128,26 @@ fn relative_change_sum(
 
 fn directory_has_entries(dir: &Path) -> Result<bool> {
     Ok(fs::read_dir(dir)?.next().is_some())
+}
+
+fn directory_has_segment_data(dir: &Path) -> Result<bool> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix("seg-") else {
+            continue;
+        };
+        let Some(id) = rest.strip_suffix(".dat") else {
+            continue;
+        };
+        if id.len() == 6 && id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn directory_holds_store(dir: &Path) -> Result<bool> {
@@ -1429,9 +1481,11 @@ fn fsync_file(path: &Path) -> Result<()> {
 }
 
 /// Move finished store files from `staging` into an existing `destination`.
-/// `schema.lock` is last, so a crash before that rename does not publish a
-/// directory that opens as a store. `rename` of the staging directory itself
-/// is not used: onto a mount point it returns `EBUSY`.
+/// `schema.lock` is last. A crash before that rename leaves segment files
+/// without a lock, and [`Store::open`] refuses that directory. A rename
+/// error puts the files that already landed back into `staging`, so
+/// `destination` stays empty. `rename` of the staging directory itself is
+/// not used: onto a mount point it returns `EBUSY`.
 fn publish_into_existing_directory(staging: &Path, destination: &Path) -> Result<()> {
     let mut files = Vec::new();
     for entry in fs::read_dir(staging)? {
@@ -1477,10 +1531,33 @@ fn publish_into_existing_directory(staging: &Path, destination: &Path) -> Result
         let right_lock = right == "schema.lock";
         left_lock.cmp(&right_lock).then_with(|| left.cmp(right))
     });
+    let mut moved = Vec::new();
     for name in &files {
-        fs::rename(staging.join(name), destination.join(name)).map_err(Error::io)?;
+        if rewrite_publish_rename_should_fail() {
+            return rollback_published_files(&moved, staging, destination).and(Err(Error::io(
+                "publish rename failed before the rewritten store was complete",
+            )));
+        }
+        match fs::rename(staging.join(name), destination.join(name)) {
+            Ok(()) => moved.push(name.clone()),
+            Err(err) => {
+                return rollback_published_files(&moved, staging, destination)
+                    .and(Err(Error::io(err)));
+            }
+        }
     }
     fsync_dir(destination)
+}
+
+fn rollback_published_files(
+    moved: &[std::ffi::OsString],
+    staging: &Path,
+    destination: &Path,
+) -> Result<()> {
+    for name in moved.iter().rev() {
+        fs::rename(destination.join(name), staging.join(name)).map_err(Error::io)?;
+    }
+    Ok(())
 }
 
 fn publish_directory(
@@ -4482,6 +4559,68 @@ mod tests {
             !directory_has_entries(&failed).unwrap(),
             "a failed rewrite left files in the existing destination"
         );
+    }
+
+    #[test]
+    fn open_refuses_segment_data_without_a_schema_lock() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join("seg-000001.dat"), b"partial").unwrap();
+        let err = match Store::open(&data, &schema) {
+            Ok(_) => panic!("opened a directory that has segment data and no schema.lock"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("no schema.lock"), "{err}");
+        assert!(!data.join("schema.lock").exists());
+        assert_eq!(fs::read(data.join("seg-000001.dat")).unwrap(), b"partial");
+
+        let fresh = dir.path().join("fresh");
+        let store = Store::open(&fresh, &schema).unwrap();
+        store.close().unwrap();
+        assert!(fresh.join("schema.lock").is_file());
+    }
+
+    #[test]
+    fn rewrite_directory_puts_back_files_when_a_later_publish_rename_fails() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(1, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, Some(2), "view", Some("a"), "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        let before = snapshot_tree(&data);
+        let expected = query_bytes(&data, &schema);
+
+        let dest = dir.path().join("mounted");
+        fs::create_dir(&dest).unwrap();
+        // Allow the first file through, then fail before schema.lock moves.
+        REWRITE_FAIL_PUBLISH_RENAME_AFTER.with(|flag| flag.set(2));
+        let err = Store::rewrite_directory(&data, &dest).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("publish rename failed before the rewritten store was complete"),
+            "{err}"
+        );
+        assert_eq!(snapshot_tree(&data), before);
+        assert!(
+            !directory_has_entries(&dest).unwrap(),
+            "a failed publish left files in the destination"
+        );
+        let report = Store::rewrite_directory(&data, &dest).unwrap();
+        assert_eq!(snapshot_tree(&data), before);
+        let opened = Store::open(&dest, &schema).unwrap();
+        assert_eq!(opened.stats().rows, 2);
+        opened.close().unwrap();
+        assert_eq!(query_bytes(&dest, &schema), expected);
+        assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
     }
 
     #[test]
