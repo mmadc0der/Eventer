@@ -3,15 +3,17 @@
 //! `POST /events` appends one JSON object and waits until it is fsynced.
 //! `GET /events?from=&to=` returns a JSON array of events in that inclusive
 //! millisecond range. Repeat `eq=field=value` to AND equality filters into the scan.
+//! `limit` keeps the first matching rows and `offset` skips matches before that.
+//! Omitting both returns the full match set.
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::{Query, RawQuery, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::body::Body;
-use axum::http::header::CONTENT_TYPE;
 use axum::routing::get;
 use axum::{Json, Router};
 use eventer::Predicate;
@@ -77,8 +79,13 @@ async fn get_events(
         Ok(value) => value,
         Err(response) => return *response,
     };
-    let specs = match eq_specs(raw.as_deref().unwrap_or("")) {
+    let raw_query = raw.as_deref().unwrap_or("");
+    let specs = match eq_specs(raw_query) {
         Ok(specs) => specs,
+        Err(response) => return *response,
+    };
+    let (offset, limit) = match page_params(raw_query) {
+        Ok(page) => page,
         Err(response) => return *response,
     };
     let mut predicates = Vec::with_capacity(specs.len());
@@ -90,7 +97,7 @@ async fn get_events(
     }
     let store = Arc::clone(&state.store);
     let joined = tokio::task::spawn_blocking(move || {
-        store.query_json_with_filter(from, to, &predicates)
+        store.query_json_window(from, to, &predicates, offset, limit)
     })
     .await;
     match joined {
@@ -119,19 +126,73 @@ fn eq_specs(query: &str) -> std::result::Result<Vec<String>, Box<Response>> {
             continue;
         }
         let Some((key, value)) = pair.split_once('=') else {
-            if percent_decode(pair)? == "eq" {
+            if percent_decode(pair, "eq")? == "eq" {
                 return Err(bad_request("`eq` must be field=value"));
             }
             continue;
         };
-        if percent_decode(key)? == "eq" {
-            specs.push(percent_decode(value)?);
+        if percent_decode(key, "eq")? == "eq" {
+            specs.push(percent_decode(value, "eq")?);
         }
     }
     Ok(specs)
 }
 
-fn percent_decode(input: &str) -> std::result::Result<String, Box<Response>> {
+fn page_params(query: &str) -> std::result::Result<(u64, Option<u64>), Box<Response>> {
+    let mut limit = None;
+    let mut offset = None;
+    if query.is_empty() {
+        return Ok((0, None));
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = pair.split_once('=') else {
+            let key = percent_decode(pair, "query")?;
+            if key == "limit" || key == "offset" {
+                return Err(bad_request(&format!("`{key}` must be an integer")));
+            }
+            continue;
+        };
+        let key = percent_decode(key, "query")?;
+        if key != "limit" && key != "offset" {
+            continue;
+        }
+        if (key == "limit" && limit.is_some()) || (key == "offset" && offset.is_some()) {
+            return Err(bad_request(&format!("`{key}` was given more than once")));
+        }
+        let value = percent_decode(value, &key)?;
+        let parsed = parse_u64_digits(&value).ok_or_else(|| {
+            bad_request(&format!(
+                "`{key}` must be a {} integer",
+                if key == "limit" {
+                    "positive"
+                } else {
+                    "non-negative"
+                }
+            ))
+        })?;
+        if key == "limit" {
+            if parsed == 0 {
+                return Err(bad_request("`limit` must be a positive integer"));
+            }
+            limit = Some(parsed);
+        } else {
+            offset = Some(parsed);
+        }
+    }
+    Ok((offset.unwrap_or(0), limit))
+}
+
+fn parse_u64_digits(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn percent_decode(input: &str, what: &str) -> std::result::Result<String, Box<Response>> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -143,11 +204,14 @@ fn percent_decode(input: &str) -> std::result::Result<String, Box<Response>> {
             }
             b'%' => {
                 if index + 2 >= bytes.len() {
-                    return Err(bad_request("`eq` has an invalid percent-encoding"));
+                    return Err(bad_request(&format!(
+                        "`{what}` has an invalid percent-encoding"
+                    )));
                 }
                 let hex = &input[index + 1..index + 3];
-                let byte = u8::from_str_radix(hex, 16)
-                    .map_err(|_| bad_request("`eq` has an invalid percent-encoding"))?;
+                let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+                    bad_request(&format!("`{what}` has an invalid percent-encoding"))
+                })?;
                 out.push(byte);
                 index += 3;
             }
@@ -157,7 +221,7 @@ fn percent_decode(input: &str) -> std::result::Result<String, Box<Response>> {
             }
         }
     }
-    String::from_utf8(out).map_err(|_| bad_request("`eq` is not valid UTF-8"))
+    String::from_utf8(out).map_err(|_| bad_request(&format!("`{what}` is not valid UTF-8")))
 }
 
 fn bad_request(message: &str) -> Box<Response> {
@@ -397,6 +461,176 @@ mod tests {
         assert_eq!(bad_pct.status(), StatusCode::BAD_REQUEST);
 
         store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn get_events_limits_and_skips_in_ingest_order() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-page-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = eventer::StoreOptions {
+            block_rows: 2,
+            linger: Duration::from_millis(1),
+            parser_threads: 1,
+            compress_threads: 1,
+            ..eventer::StoreOptions::default()
+        };
+        let data = root.join("data");
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options.clone()).unwrap());
+        let app = router(Arc::clone(&store));
+
+        for (ts, action) in [
+            (10, "click"),
+            (20, "view"),
+            (30, "click"),
+            (40, "view"),
+            (50, "click"),
+        ] {
+            let created = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/events")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"ts":{ts},"action":"{action}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::CREATED);
+        }
+
+        async fn timestamps(app: Router, uri: &str) -> (StatusCode, Value) {
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            (status, body)
+        }
+
+        let (status, body) = timestamps(app.clone(), "/events?from=10&to=50").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30, 40, 50]
+        );
+
+        let (status, body) = timestamps(app.clone(), "/events?from=10&to=50&limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+
+        let (status, body) =
+            timestamps(app.clone(), "/events?from=10&to=50&offset=2&limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![30, 40]
+        );
+
+        let (status, body) = timestamps(app.clone(), "/events?from=10&to=50&offset=4").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![50]
+        );
+
+        let (status, body) = timestamps(app.clone(), "/events?from=20&to=40&limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+
+        let (status, body) =
+            timestamps(app.clone(), "/events?from=10&to=50&eq=action=click&limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 30]
+        );
+
+        let (status, body) = timestamps(app.clone(), "/events?from=10&to=50&offset=9").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 0);
+
+        for uri in [
+            "/events?from=10&to=50&limit=0",
+            "/events?from=10&to=50&limit=-1",
+            "/events?from=10&to=50&offset=-1",
+            "/events?from=10&to=50&limit=1.5",
+            "/events?from=10&to=50&limit=nope",
+        ] {
+            let (status, body) = timestamps(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(body.is_object(), "{uri} body {body}");
+            assert!(body.get("error").is_some(), "{uri}");
+        }
+
+        store.close().unwrap();
+        let reopened = Arc::new(eventer::Store::open_with(&data, &schema, options).unwrap());
+        let app = router(Arc::clone(&reopened));
+        let (status, body) = timestamps(app, "/events?from=10&to=50&limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        reopened.close().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 }

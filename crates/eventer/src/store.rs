@@ -155,6 +155,27 @@ impl Store {
         to_ms: i64,
         predicates: &[Predicate],
     ) -> Result<Vec<Row>> {
+        self.query_window(from_ms, to_ms, predicates, 0, None)
+    }
+
+    /// Same match set as [`Store::query_with_filter`], then skip and limit.
+    ///
+    /// `offset` skips that many matching rows. `limit` of `None` returns the rest,
+    /// and `Some(0)` is an error. Time bounds and predicates are applied before
+    /// the skip. A block that sits entirely inside the range and has no predicates
+    /// can be skipped from its row count without reading the payload. Once `limit`
+    /// rows have been collected, later blocks are not read. Order is ingest order.
+    pub fn query_window(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        offset: u64,
+        limit: Option<u64>,
+    ) -> Result<Vec<Row>> {
+        if limit == Some(0) {
+            return Err(Error::event("query limit must be a positive integer"));
+        }
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(Vec::new());
         };
@@ -162,19 +183,38 @@ impl Store {
         let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut rows_out = Vec::new();
         let mut response_bytes = 1usize;
+        let mut skipped = 0u64;
         let mut dictionaries = HashMap::new();
         for block in blocks {
+            if window_full(limit, rows_out.len()) {
+                break;
+            }
             if rows_out.len() >= MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(response_bytes)?;
             let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
-            if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
+            if resolved.is_empty()
+                && contained
+                && skip_whole_block(offset, block.row_count, &mut skipped)
+            {
+                continue;
+            }
+            let whole = returns_whole_block(
+                resolved.is_empty(),
+                contained,
+                skipped,
+                offset,
+                limit,
+                rows_out.len(),
+                block.row_count,
+            );
+            if whole && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
-            if resolved.is_empty() && contained && rows_out.len() + nrows > MAX_QUERY_ROWS {
+            if whole && rows_out.len() + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
             let rows = decode_rows_in_range_filtered(
@@ -185,8 +225,17 @@ impl Store {
                 string_budget,
                 &resolved,
             )?;
+            let mut page_done = false;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
+                    match take_match(offset, limit, &mut skipped, rows_out.len()) {
+                        Take::Skip => continue,
+                        Take::Done => {
+                            page_done = true;
+                            break;
+                        }
+                        Take::Keep => {}
+                    }
                     if rows_out.len() >= MAX_QUERY_ROWS {
                         return Err(Error::event("query row limit exceeded"));
                     }
@@ -208,6 +257,9 @@ impl Store {
                     rows_out.push(row);
                 }
             }
+            if page_done {
+                break;
+            }
         }
         Ok(rows_out)
     }
@@ -224,6 +276,21 @@ impl Store {
         to_ms: i64,
         predicates: &[Predicate],
     ) -> Result<Vec<u8>> {
+        self.query_json_window(from_ms, to_ms, predicates, 0, None)
+    }
+
+    /// Same as [`Store::query_window`], encoded as one JSON array.
+    pub fn query_json_window(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        offset: u64,
+        limit: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        if limit == Some(0) {
+            return Err(Error::event("query limit must be a positive integer"));
+        }
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(b"[]".to_vec());
         };
@@ -232,19 +299,38 @@ impl Store {
         let mut out = Vec::from(b"[");
         let mut wrote = false;
         let mut row_count = 0usize;
+        let mut skipped = 0u64;
         let mut dictionaries = HashMap::new();
         for block in blocks {
+            if window_full(limit, row_count) {
+                break;
+            }
             if row_count >= MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
             let string_budget = remaining_query_bytes(out.len())?;
             let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
-            if resolved.is_empty() && contained && block.uncompressed_len as usize > string_budget {
+            if resolved.is_empty()
+                && contained
+                && skip_whole_block(offset, block.row_count, &mut skipped)
+            {
+                continue;
+            }
+            let whole = returns_whole_block(
+                resolved.is_empty(),
+                contained,
+                skipped,
+                offset,
+                limit,
+                row_count,
+                block.row_count,
+            );
+            if whole && block.uncompressed_len as usize > string_budget {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
-            if resolved.is_empty() && contained && row_count + nrows > MAX_QUERY_ROWS {
+            if whole && row_count + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
             let rows = decode_rows_in_range_filtered(
@@ -255,8 +341,17 @@ impl Store {
                 string_budget,
                 &resolved,
             )?;
+            let mut page_done = false;
             for row in rows {
                 if row.ts >= from_ms && row.ts <= to_ms {
+                    match take_match(offset, limit, &mut skipped, row_count) {
+                        Take::Skip => continue,
+                        Take::Done => {
+                            page_done = true;
+                            break;
+                        }
+                        Take::Keep => {}
+                    }
                     if row_count >= MAX_QUERY_ROWS {
                         return Err(Error::event("query row limit exceeded"));
                     }
@@ -277,6 +372,9 @@ impl Store {
                     row_count += 1;
                     out.extend_from_slice(&row_bytes);
                 }
+            }
+            if page_done {
+                break;
             }
         }
         out.push(b']');
@@ -433,6 +531,61 @@ fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<Vec<C
         }
     }
     Ok(grouped)
+}
+
+enum Take {
+    Skip,
+    Keep,
+    Done,
+}
+
+fn window_full(limit: Option<u64>, emitted: usize) -> bool {
+    limit.is_some_and(|limit| emitted as u64 >= limit)
+}
+
+fn take_match(offset: u64, limit: Option<u64>, skipped: &mut u64, emitted: usize) -> Take {
+    if *skipped < offset {
+        *skipped += 1;
+        return Take::Skip;
+    }
+    if window_full(limit, emitted) {
+        Take::Done
+    } else {
+        Take::Keep
+    }
+}
+
+/// Skip a block whose every row is a match when those rows fall entirely inside the offset.
+fn skip_whole_block(offset: u64, block_rows: u32, skipped: &mut u64) -> bool {
+    let block_rows = u64::from(block_rows);
+    if block_rows == 0 {
+        return false;
+    }
+    let remaining = offset.saturating_sub(*skipped);
+    if remaining >= block_rows {
+        *skipped += block_rows;
+        true
+    } else {
+        false
+    }
+}
+
+fn returns_whole_block(
+    unfiltered: bool,
+    contained: bool,
+    skipped: u64,
+    offset: u64,
+    limit: Option<u64>,
+    emitted: usize,
+    block_rows: u32,
+) -> bool {
+    if !unfiltered || !contained || skipped < offset {
+        return false;
+    }
+    match limit {
+        None => true,
+        Some(limit) => limit.saturating_sub(emitted as u64) >= u64::from(block_rows),
+    }
 }
 
 fn remaining_query_bytes(produced: usize) -> Result<usize> {
@@ -647,6 +800,85 @@ mod tests {
     }
 
     #[test]
+    fn query_window_skips_and_limits_in_ingest_order() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, action) in [
+            (10, "click"),
+            (20, "view"),
+            (30, "click"),
+            (40, "view"),
+            (50, "click"),
+        ] {
+            store
+                .append_json(&event(ts, Some(ts), action, None, "1.00"))
+                .unwrap();
+        }
+
+        let timestamps = |bytes: &[u8]| -> Vec<i64> {
+            serde_json::from_slice::<Vec<serde_json::Value>>(bytes)
+                .unwrap()
+                .into_iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect()
+        };
+
+        let all = store.query_json_window(10, 50, &[], 0, None).unwrap();
+        assert_eq!(timestamps(&all), vec![10, 20, 30, 40, 50]);
+        assert_eq!(
+            timestamps(&store.query_json_window(10, 50, &[], 0, Some(2)).unwrap()),
+            vec![10, 20]
+        );
+        assert_eq!(
+            timestamps(&store.query_json_window(10, 50, &[], 2, Some(2)).unwrap()),
+            vec![30, 40]
+        );
+        assert_eq!(
+            timestamps(&store.query_json_window(10, 50, &[], 4, None).unwrap()),
+            vec![50]
+        );
+        assert_eq!(
+            store.query_json_window(10, 50, &[], 5, None).unwrap(),
+            b"[]"
+        );
+        assert_eq!(
+            timestamps(&store.query_json_window(20, 40, &[], 0, Some(2)).unwrap()),
+            vec![20, 30]
+        );
+        let clicks = store
+            .query_json_window(
+                10,
+                50,
+                &[Predicate::Eq("action".into(), "click".into())],
+                0,
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(timestamps(&clicks), vec![10, 30]);
+        assert!(store
+            .query_json_window(10, 50, &[], 0, Some(0))
+            .unwrap_err()
+            .to_string()
+            .contains("positive integer"));
+
+        assert!(store.stats().blocks >= 3);
+        store.close().unwrap();
+
+        let reopened = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        assert_eq!(
+            timestamps(&reopened.query_json_window(10, 50, &[], 0, Some(2)).unwrap()),
+            vec![10, 20]
+        );
+        assert_eq!(
+            timestamps(&reopened.query_json_window(10, 50, &[], 2, Some(2)).unwrap()),
+            vec![30, 40]
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn reopening_rebuilds_a_truncated_index() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -713,7 +945,8 @@ mod tests {
         assert_eq!(store.stats().index_bytes, index_on_disk);
         store.drop_blocks_before(i64::MIN).unwrap();
         assert_eq!(
-            store.stats().index_bytes, index_on_disk,
+            store.stats().index_bytes,
+            index_on_disk,
             "a no-op retention pass still counts the compressed index"
         );
         store.close().unwrap();
