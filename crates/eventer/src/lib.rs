@@ -16,6 +16,9 @@
 //! timestamps only.
 //! [`Store::histogram_with_filter`](store::Store::histogram_with_filter) counts
 //! the same rows into fixed epoch-aligned time buckets.
+//! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums
+//! and finds the minimum and maximum of numeric columns over that same filtered
+//! window, without building the rows.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares
@@ -38,9 +41,10 @@ mod zone;
 pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
 pub use store::{
-    CmpOp, HistogramBucket, Predicate, RewriteReport, Stats, Store, StoreOptions, StoredBytes,
-    MAX_HISTOGRAM_BUCKETS,
+    CmpOp, ColumnStats, HistogramBucket, Predicate, RewriteReport, StatRequest, StatSum, Stats,
+    Store, StoreOptions, StoredBytes, MAX_HISTOGRAM_BUCKETS,
 };
+pub use value::format_decimal;
 pub use value::{scalar_from_literal, Scalar};
 
 /// Uncompressed size of each column for one block, including its null bitmap.
