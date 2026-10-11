@@ -36,10 +36,14 @@ pub const DICT_VERSION: u16 = 1;
 pub const DICT_MAX_BYTES: usize = 4 * 1024;
 /// Plain zstd level for the on-disk sidecar. Block frames keep the store level.
 const DICT_SIDECAR_ZSTD_LEVEL: i32 = 3;
-/// Plain zstd level for the sparse index. The segment dictionary is not used.
-/// The frame is kept only when it is smaller than the raw `EVIX` bytes, so a
-/// level-1 frame and a raw index still open.
-const INDEX_ZSTD_LEVEL: i32 = 19;
+/// Plain zstd for the sparse index. The segment dictionary is not used.
+/// Level 19 only while the raw `EVIX` image is at most 8 KiB (the stock image
+/// is 1,968 bytes and still compresses to 260). Larger commits use level 1.
+/// The frame is kept only when it is smaller than the raw bytes, so a level-1
+/// frame and a raw index still open.
+const INDEX_ZSTD_LEVEL_HIGH: i32 = 19;
+const INDEX_ZSTD_LEVEL_FAST: i32 = 1;
+const INDEX_ZSTD_HIGH_MAX_RAW: usize = 8 * 1024;
 /// A 12-byte block header does not store `uncompressed_len`. Recovery refuses
 /// a frame that expands past this, the same bound the sealer uses for one block.
 const MAX_BLOCK_UNCOMPRESSED: usize = 64 * 1024 * 1024;
@@ -1048,10 +1052,18 @@ fn is_zstd_frame(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[..4] == ZSTD_FRAME_MAGIC
 }
 
+fn index_zstd_level(raw_len: usize) -> i32 {
+    if raw_len <= INDEX_ZSTD_HIGH_MAX_RAW {
+        INDEX_ZSTD_LEVEL_HIGH
+    } else {
+        INDEX_ZSTD_LEVEL_FAST
+    }
+}
+
 /// Compress `raw` EVIX bytes with plain zstd. The frame is used only when it
 /// is strictly smaller than `raw`.
 fn compress_index_if_smaller(raw: &[u8]) -> Vec<u8> {
-    match zstd::bulk::compress(raw, INDEX_ZSTD_LEVEL) {
+    match zstd::bulk::compress(raw, index_zstd_level(raw.len())) {
         Ok(frame) if frame.len() < raw.len() && is_zstd_frame(&frame) => frame,
         _ => raw.to_vec(),
     }
@@ -1961,6 +1973,25 @@ mod tests {
         assert_eq!(loaded.last().unwrap().offset, extra.offset);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_zstd_level_drops_after_eight_kib() {
+        let stock = vec![7u8; 1968];
+        let at_cap = vec![7u8; INDEX_ZSTD_HIGH_MAX_RAW];
+        let over = vec![7u8; INDEX_ZSTD_HIGH_MAX_RAW + 1];
+        assert_eq!(
+            compress_index_if_smaller(&stock),
+            zstd::bulk::compress(&stock, INDEX_ZSTD_LEVEL_HIGH).unwrap()
+        );
+        assert_eq!(
+            compress_index_if_smaller(&at_cap),
+            zstd::bulk::compress(&at_cap, INDEX_ZSTD_LEVEL_HIGH).unwrap()
+        );
+        assert_eq!(
+            compress_index_if_smaller(&over),
+            zstd::bulk::compress(&over, INDEX_ZSTD_LEVEL_FAST).unwrap()
+        );
     }
 
     #[test]
