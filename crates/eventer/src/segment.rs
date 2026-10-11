@@ -37,7 +37,9 @@ pub const DICT_MAX_BYTES: usize = 4 * 1024;
 /// Plain zstd level for the on-disk sidecar. Block frames keep the store level.
 const DICT_SIDECAR_ZSTD_LEVEL: i32 = 3;
 /// Plain zstd level for the sparse index. The segment dictionary is not used.
-const INDEX_ZSTD_LEVEL: i32 = 1;
+/// The frame is kept only when it is smaller than the raw `EVIX` bytes, so a
+/// level-1 frame and a raw index still open.
+const INDEX_ZSTD_LEVEL: i32 = 19;
 /// A 12-byte block header does not store `uncompressed_len`. Recovery refuses
 /// a frame that expands past this, the same bound the sealer uses for one block.
 const MAX_BLOCK_UNCOMPRESSED: usize = 64 * 1024 * 1024;
@@ -1046,8 +1048,8 @@ fn is_zstd_frame(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[..4] == ZSTD_FRAME_MAGIC
 }
 
-/// Compress `raw` EVIX bytes with plain zstd level 1. The frame is used only
-/// when it is strictly smaller than `raw`.
+/// Compress `raw` EVIX bytes with plain zstd. The frame is used only when it
+/// is strictly smaller than `raw`.
 fn compress_index_if_smaller(raw: &[u8]) -> Vec<u8> {
     match zstd::bulk::compress(raw, INDEX_ZSTD_LEVEL) {
         Ok(frame) if frame.len() < raw.len() && is_zstd_frame(&frame) => frame,

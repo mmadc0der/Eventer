@@ -2304,6 +2304,19 @@ mod tests {
         );
         legacy.close().unwrap();
 
+        let level1 = zstd::bulk::compress(&raw, 1).unwrap();
+        assert!(level1.len() < raw.len());
+        assert_eq!(&level1[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        fs::write(&index, &level1).unwrap();
+        let legacy = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        assert_eq!(legacy.query(0, count).unwrap().len(), count as usize);
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            level1,
+            "a level-1 index frame from an older writer is left in place"
+        );
+        legacy.close().unwrap();
+
         let blocks = segment::read_index(&index).unwrap();
         let mut version_one = Vec::with_capacity(raw.len());
         version_one.extend_from_slice(segment::INDEX_MAGIC);
@@ -3588,6 +3601,27 @@ mod tests {
             fs::read(&zone_file).unwrap(),
             raw,
             "a raw zone file from an older writer is left in place"
+        );
+        reopened.close().unwrap();
+
+        let level1 = zstd::bulk::compress(&raw, 1).unwrap();
+        assert!(level1.len() < raw.len());
+        assert_eq!(&level1[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        fs::write(&zone_file, &level1).unwrap();
+        let reopened = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        let resolved = resolve_predicates(reopened.schema(), &predicates).unwrap();
+        assert_eq!(reopened.blocks_in_range(0, 10_000_000, &resolved).len(), 1);
+        assert_eq!(
+            reopened
+                .query_with_filter(0, 10_000_000, &predicates)
+                .unwrap()
+                .len(),
+            per_run as usize
+        );
+        assert_eq!(
+            fs::read(&zone_file).unwrap(),
+            level1,
+            "a level-1 zone frame from an older writer is left in place"
         );
         reopened.close().unwrap();
 

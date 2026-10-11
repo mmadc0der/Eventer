@@ -47,8 +47,10 @@ const ZONE_HEADER_LEN: usize = 16;
 const ZONE_TRAILER_LEN: usize = 4;
 /// Plain zstd frame magic. Distinct from [`ZONE_MAGIC`].
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-/// Level 1. The zone file is small and rewritten as a whole at the end of a batch.
-const ZONE_ZSTD_LEVEL: i32 = 1;
+/// The zone file is rewritten as a whole at the end of a batch. The frame is
+/// kept only when it is smaller than the raw `EVZN` bytes, so a level-1 frame
+/// and a raw zone file still open.
+const ZONE_ZSTD_LEVEL: i32 = 19;
 /// Cap for a decompressed zone frame. A larger claim is treated as corrupt and
 /// the segment is summarized again from its payloads.
 const MAX_ZONE_UNCOMPRESSED: usize = 512 * 1024 * 1024;
