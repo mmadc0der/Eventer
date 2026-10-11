@@ -446,12 +446,21 @@ pub(crate) fn count_rows_filtered(
     ranges: &[RangeFilter],
 ) -> Result<u64> {
     let mut total = 0u64;
-    visit_matching_timestamps(schema, bytes, from_ms, to_ms, predicates, ranges, |_ts| {
-        total = total
-            .checked_add(1)
-            .ok_or_else(|| Error::event("event count overflow"))?;
-        Ok(())
-    })?;
+    visit_matching_timestamps(
+        schema,
+        bytes,
+        from_ms,
+        to_ms,
+        predicates,
+        ranges,
+        &mut [],
+        |_ts, _row, _captured| {
+            total = total
+                .checked_add(1)
+                .ok_or_else(|| Error::event("event count overflow"))?;
+            Ok(())
+        },
+    )?;
     Ok(total)
 }
 
@@ -494,39 +503,62 @@ pub(crate) fn accumulate_histogram_filtered(
     first_start: i128,
     counts: &mut [u64],
 ) -> Result<()> {
-    visit_matching_timestamps(schema, bytes, from_ms, to_ms, predicates, ranges, |ts| {
-        let start = (ts as i128).div_euclid(i128::from(bucket_ms)) * i128::from(bucket_ms);
-        let index = (start - first_start) / i128::from(bucket_ms);
-        let index = usize::try_from(index).map_err(|_| Error::corrupt("histogram bucket index"))?;
-        let bucket = counts
-            .get_mut(index)
-            .ok_or_else(|| Error::corrupt("histogram bucket index"))?;
-        *bucket = bucket
-            .checked_add(1)
-            .ok_or_else(|| Error::event("event count overflow"))?;
-        Ok(())
-    })
+    visit_matching_timestamps(
+        schema,
+        bytes,
+        from_ms,
+        to_ms,
+        predicates,
+        ranges,
+        &mut [],
+        |ts, _row, _captured| {
+            let start = (ts as i128).div_euclid(i128::from(bucket_ms)) * i128::from(bucket_ms);
+            let index = (start - first_start) / i128::from(bucket_ms);
+            let index =
+                usize::try_from(index).map_err(|_| Error::corrupt("histogram bucket index"))?;
+            let bucket = counts
+                .get_mut(index)
+                .ok_or_else(|| Error::corrupt("histogram bucket index"))?;
+            *bucket = bucket
+                .checked_add(1)
+                .ok_or_else(|| Error::event("event count overflow"))?;
+            Ok(())
+        },
+    )
+}
+
+/// One decoded column kept for rows that survive the filters.
+///
+/// `values` stays empty when the column was not decoded. The timestamp fast
+/// path leaves it empty and passes the timestamp to `visit` instead.
+pub(crate) struct CapturedColumn {
+    pub index: usize,
+    pub values: Vec<Scalar>,
 }
 
 /// Call `visit` once for each payload timestamp in `from_ms..=to_ms` that matches
 /// every predicate.
 ///
-/// An empty predicate list reads the timestamp column and nothing after it.
-/// A timestamp outside the range is left out even if the sparse index min/max
-/// sit inside the range. A null or undecodable timestamp returns the same
+/// An empty predicate list, and no captured column other than the timestamp,
+/// reads the timestamp column and nothing after it. A timestamp outside the
+/// range is left out even if the sparse index min/max sit inside the range. A
+/// null or undecodable timestamp returns the same
 /// [`Error::Corrupt`](crate::Error) as a row decode.
 ///
-/// Predicates decode the timestamp column and the predicate columns. Columns
-/// after the last of those are not read. Columns between them are skipped, not
-/// turned into values.
-fn visit_matching_timestamps(
+/// Predicates decode the timestamp column, the predicate columns, and any
+/// captured columns. Columns after the last of those are not read. Columns
+/// between them are skipped, not turned into values. A captured float that is
+/// not finite is corrupt. `visit` receives the row index and the captured
+/// columns for that block.
+pub(crate) fn visit_matching_timestamps(
     schema: &Schema,
     bytes: &[u8],
     from_ms: i64,
     to_ms: i64,
     predicates: &[ColumnPredicate],
     ranges: &[RangeFilter],
-    mut visit: impl FnMut(i64) -> Result<()>,
+    captures: &mut [CapturedColumn],
+    mut visit: impl FnMut(i64, usize, &[CapturedColumn]) -> Result<()>,
 ) -> Result<()> {
     if from_ms > to_ms
         || predicates.iter().any(|pred| pred.allowed.is_empty())
@@ -534,11 +566,14 @@ fn visit_matching_timestamps(
     {
         return Ok(());
     }
-    if predicates.is_empty() && ranges.is_empty() {
+    let capture_other = captures
+        .iter()
+        .any(|column| column.index != schema.timestamp_index);
+    if predicates.is_empty() && ranges.is_empty() && !capture_other {
         let timestamps = read_timestamp_column(schema, bytes)?;
-        for ts in timestamps {
+        for (row, ts) in timestamps.into_iter().enumerate() {
             if ts >= from_ms && ts <= to_ms {
-                visit(ts)?;
+                visit(ts, row, captures)?;
             }
         }
         return Ok(());
@@ -548,6 +583,7 @@ fn visit_matching_timestamps(
         .iter()
         .map(|pred| pred.index)
         .chain(ranges.iter().map(|range| range.index))
+        .chain(captures.iter().map(|column| column.index))
         .fold(schema.timestamp_index, usize::max);
     let mut cursor = 4usize;
     let mut mask = vec![true; nrows];
@@ -568,12 +604,18 @@ fn visit_matching_timestamps(
                     mask.fill(false);
                 }
             }
+            for slot in captures.iter_mut() {
+                if slot.index >= index && slot.values.is_empty() {
+                    slot.values = vec![Scalar::Null; nrows];
+                }
+            }
             break;
         }
         let predicate = predicates.iter().find(|pred| pred.index == index);
         let range = ranges.iter().find(|range| range.index == index);
         let is_timestamp = index == schema.timestamp_index;
-        if is_timestamp || predicate.is_some() || range.is_some() {
+        let capture_here = captures.iter().any(|column| column.index == index);
+        if is_timestamp || predicate.is_some() || range.is_some() || capture_here {
             if is_timestamp && timestamp_range_misses(bytes, cursor, nrows, from_ms, to_ms)? {
                 skip_column(field.ty, bytes, &mut cursor, nrows, true)?;
                 mask.fill(false);
@@ -601,6 +643,20 @@ fn visit_matching_timestamps(
                 continue;
             }
             let values = decode_column(field.ty, bytes, &mut cursor, nrows, &mask, &mut budget)?;
+            if capture_here {
+                if field.ty == FieldType::Float {
+                    for value in &values {
+                        if let Scalar::Float(number) = value {
+                            if !number.is_finite() {
+                                return Err(Error::corrupt("float column is not finite"));
+                            }
+                        }
+                    }
+                }
+                if let Some(slot) = captures.iter_mut().find(|column| column.index == index) {
+                    slot.values = values.clone();
+                }
+            }
             if is_timestamp {
                 let mut column = Vec::with_capacity(nrows);
                 for (row, value) in values.iter().enumerate() {
@@ -631,9 +687,18 @@ fn visit_matching_timestamps(
         }
         return Ok(());
     };
+    for slot in captures.iter() {
+        if slot.values.is_empty() {
+            if mask.iter().any(|keep| *keep) && slot.index != schema.timestamp_index {
+                return Err(Error::corrupt("stat column is missing"));
+            }
+        } else if slot.values.len() != nrows {
+            return Err(Error::corrupt("stat column width does not match the block"));
+        }
+    }
     for (row, ts) in timestamps.into_iter().enumerate() {
         if mask[row] {
-            visit(ts)?;
+            visit(ts, row, captures)?;
         }
     }
     Ok(())
@@ -4944,5 +5009,33 @@ mod tests {
             count_rows_in_range_filtered(&schema, &null_block.bytes, 0, 100, &[]).unwrap_err();
         assert_eq!(row_err.to_string(), count_err.to_string());
         assert!(count_err.to_string().contains("timestamp column is null"));
+    }
+
+    #[test]
+    fn a_non_finite_float_stat_is_corrupt() {
+        let schema = schema();
+        let mut row = parse_event(
+            &schema,
+            br#"{"ts":1000,"user_id":1,"score":1.0,"ok":true,"action":"click","note":"n","amount":"1.00"}"#,
+        )
+        .unwrap();
+        row.values[2] = Scalar::Float(f64::NAN);
+        let encoded = encode_block(&schema, &[row]).unwrap();
+        let mut captured = [CapturedColumn {
+            index: 2,
+            values: Vec::new(),
+        }];
+        let err = visit_matching_timestamps(
+            &schema,
+            &encoded.bytes,
+            0,
+            5000,
+            &[],
+            &[],
+            &mut captured,
+            |_ts, _row, _captured| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not finite"), "{err}");
     }
 }

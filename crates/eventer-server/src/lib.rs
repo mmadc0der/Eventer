@@ -13,6 +13,8 @@
 //! same filters. `limit` and `offset` are rejected on both.
 //! `GET /events/histogram?from=&to=&bucket_ms=N` returns one count per epoch-aligned
 //! bucket that intersects that inclusive range.
+//! `GET /events/stats` returns `sum`, `min`, and `max` for numeric columns over
+//! that same range and the same filters, without the matching rows.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
 //! with the caller's `before_ms`. The request `Content-Type` must be
 //! `application/json`, with an optional `charset=utf-8`. A block is removed
@@ -30,7 +32,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use eventer::Predicate;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Number, Value};
 
 #[derive(Clone)]
 struct AppState {
@@ -42,6 +44,7 @@ pub fn router(store: Arc<eventer::Store>) -> Router {
         .route("/health", get(health))
         .route("/events/count", get(count_events))
         .route("/events/histogram", get(histogram_events))
+        .route("/events/stats", get(stats_events))
         .route("/events", get(get_events).post(post_event))
         .route("/events/drop", post(post_drop))
         .with_state(AppState { store })
@@ -313,6 +316,226 @@ async fn histogram_events(
             Json(json!({"error": "histogram task failed"})),
         )
             .into_response(),
+    }
+}
+
+async fn stats_events(
+    State(state): State<AppState>,
+    Query(params): Query<RangeParams>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let raw = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_stats_params(raw) {
+        return *response;
+    }
+    let from = match parse_bound(params.from, "from") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let to = match parse_bound(params.to, "to") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let stats = match stat_requests(raw) {
+        Ok(stats) => stats,
+        Err(response) => return *response,
+    };
+    if let Err(response) = reject_stat_fields(state.store.schema(), &stats) {
+        return *response;
+    }
+    let predicates = match parse_filters(state.store.schema(), raw) {
+        Ok(predicates) => predicates,
+        Err(response) => return *response,
+    };
+    let store = Arc::clone(&state.store);
+    let joined = tokio::task::spawn_blocking(move || {
+        store.aggregate_with_filter(from, to, &predicates, &stats)
+    })
+    .await;
+    match joined {
+        Ok(Ok(columns)) => {
+            let body = stats_body(state.store.schema(), &columns);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Ok(Err(err)) => error_response(&err),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "stats task failed"})),
+        )
+            .into_response(),
+    }
+}
+
+fn reject_stats_params(query: &str) -> std::result::Result<(), Box<Response>> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = percent_decode(key, "query")?;
+        if key == "limit" || key == "offset" || key == "bucket_ms" {
+            return Err(bad_request(&format!(
+                "`{key}` is not a parameter of /events/stats"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn stat_requests(query: &str) -> std::result::Result<Vec<eventer::StatRequest>, Box<Response>> {
+    let mut requests: Vec<eventer::StatRequest> = Vec::new();
+    let mut saw = false;
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, value) = match pair.split_once('=') {
+                Some((key, value)) => (key, value),
+                None => {
+                    let key = percent_decode(pair, "query")?;
+                    if matches!(key.as_str(), "sum" | "min" | "max") {
+                        return Err(bad_request(&format!("`{key}` is missing a field name")));
+                    }
+                    continue;
+                }
+            };
+            let key = percent_decode(key, "query")?;
+            if !matches!(key.as_str(), "sum" | "min" | "max") {
+                continue;
+            }
+            saw = true;
+            let field = percent_decode(value, &key)?;
+            if field.is_empty() {
+                return Err(bad_request(&format!("`{key}` is missing a field name")));
+            }
+            if let Some(existing) = requests.iter_mut().find(|request| request.field == field) {
+                match key.as_str() {
+                    "sum" => existing.sum = true,
+                    "min" => existing.min = true,
+                    "max" => existing.max = true,
+                    _ => {}
+                }
+            } else {
+                requests.push(eventer::StatRequest {
+                    field,
+                    sum: key == "sum",
+                    min: key == "min",
+                    max: key == "max",
+                });
+            }
+        }
+    }
+    if !saw {
+        return Err(bad_request(
+            "missing `sum`, `min`, or `max` query parameter",
+        ));
+    }
+    Ok(requests)
+}
+
+fn reject_stat_fields(
+    schema: &eventer::Schema,
+    stats: &[eventer::StatRequest],
+) -> std::result::Result<(), Box<Response>> {
+    for stat in stats {
+        let Some(field) = schema.fields.iter().find(|field| field.name == stat.field) else {
+            return Err(bad_request(&format!("unknown stat field `{}`", stat.field)));
+        };
+        if matches!(
+            field.ty,
+            eventer::FieldType::Bool
+                | eventer::FieldType::String
+                | eventer::FieldType::Text
+                | eventer::FieldType::Json
+        ) {
+            let op = if stat.sum {
+                "sum"
+            } else if stat.min {
+                "min"
+            } else {
+                "max"
+            };
+            return Err(bad_request(&format!(
+                "`{op}` does not apply to {} column `{}`",
+                field.ty.name(),
+                field.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn stats_body(schema: &eventer::Schema, columns: &[eventer::ColumnStats]) -> Value {
+    let mut out = Map::new();
+    for column in columns {
+        let Some(field) = schema
+            .fields
+            .iter()
+            .find(|field| field.name == column.field)
+        else {
+            continue;
+        };
+        let mut body = Map::new();
+        if let Some(sum) = column.sum {
+            body.insert("sum".to_string(), sum_json(field.ty, sum));
+        }
+        if let Some(min) = &column.min {
+            body.insert("min".to_string(), extreme_json(field.ty, min));
+        }
+        if let Some(max) = &column.max {
+            body.insert("max".to_string(), extreme_json(field.ty, max));
+        }
+        out.insert(column.field.clone(), Value::Object(body));
+    }
+    Value::Object(Map::from_iter([(
+        "columns".to_string(),
+        Value::Object(out),
+    )]))
+}
+
+fn sum_json(ty: eventer::FieldType, sum: eventer::StatSum) -> Value {
+    match sum {
+        eventer::StatSum::Float(value) => float_json(value),
+        eventer::StatSum::Exact { total, contributed } => {
+            let text = match ty {
+                eventer::FieldType::Decimal { scale } if contributed => {
+                    eventer::format_decimal(total, scale)
+                }
+                _ => total.to_string(),
+            };
+            Value::String(text)
+        }
+    }
+}
+
+fn extreme_json(ty: eventer::FieldType, value: &Option<eventer::Scalar>) -> Value {
+    let Some(value) = value else {
+        return Value::Null;
+    };
+    match (ty, value) {
+        (eventer::FieldType::Int, eventer::Scalar::Int(number)) => json!(number),
+        (eventer::FieldType::Timestamp, eventer::Scalar::Timestamp(number)) => json!(number),
+        (eventer::FieldType::Float, eventer::Scalar::Float(number)) => float_json(*number),
+        (eventer::FieldType::Decimal { scale }, eventer::Scalar::Decimal(number)) => {
+            Value::String(eventer::format_decimal(*number, scale))
+        }
+        _ => Value::Null,
+    }
+}
+
+/// A float sum of positive zero is the JSON number `0`. Any other finite float
+/// keeps its IEEE value. `min` and `max` use that same number form.
+fn float_json(value: f64) -> Value {
+    if value == 0.0 && !value.is_sign_negative() {
+        Value::Number(0.into())
+    } else {
+        Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
     }
 }
 
@@ -1659,6 +1882,156 @@ mod tests {
             4,
             "a rejected range does not change the stored rows"
         );
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stats_aggregate_the_filtered_window() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-stats-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(8, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        let rows = [
+            r#"{"ts":1000,"user_id":1,"score":0.5,"ok":true,"action":"buy","amount":"1.50"}"#,
+            r#"{"ts":2000,"user_id":5,"score":0.25,"ok":true,"action":"buy","amount":"2.25"}"#,
+            r#"{"ts":3000,"score":1.0,"ok":false,"action":"other"}"#,
+        ];
+        for row in rows {
+            let (status, body) = post(&app, row).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&sum=user_id&min=user_id&max=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["user_id"]["sum"], json!("6"));
+        assert_eq!(body["columns"]["user_id"]["min"], json!(1));
+        assert_eq!(body["columns"]["user_id"]["max"], json!(5));
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&sum=amount&min=amount&max=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["amount"]["sum"], json!("3.75"));
+        assert_eq!(body["columns"]["amount"]["min"], json!("1.50"));
+        assert_eq!(body["columns"]["amount"]["max"], json!("2.25"));
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&lt=amount=2.00&sum=amount&min=amount&max=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["amount"]["sum"], json!("1.50"));
+        assert_eq!(body["columns"]["amount"]["min"], json!("1.50"));
+        assert_eq!(body["columns"]["amount"]["max"], json!("1.50"));
+
+        let (status, counted) =
+            get_json(&app, "/events/count?from=1000&to=3000&eq=action=buy").await;
+        assert_eq!(status, StatusCode::OK, "{counted}");
+        assert_eq!(counted["count"], json!(2));
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&eq=action=buy&sum=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["user_id"]["sum"], json!("6"));
+        assert!(body["columns"]["user_id"].get("min").is_none());
+
+        let (status, body) = get_json(&app, "/events/stats?from=1000&to=2000&sum=score").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["score"]["sum"], json!(0.75));
+
+        let (status, body) = get_json(&app, "/events/stats?from=1000&to=2000&sum=ts").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["ts"]["sum"], json!("3000"));
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=9000&to=9000&sum=user_id&min=user_id&max=user_id&sum=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["user_id"]["sum"], json!("0"));
+        assert_eq!(body["columns"]["user_id"]["min"], Value::Null);
+        assert_eq!(body["columns"]["user_id"]["max"], Value::Null);
+        assert_eq!(body["columns"]["amount"]["sum"], json!("0"));
+
+        let (status, only_null) = get_json(
+            &app,
+            "/events/stats?from=3000&to=3000&sum=user_id&min=user_id&max=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{only_null}");
+        assert_eq!(only_null["columns"]["user_id"]["sum"], json!("0"));
+        assert_eq!(only_null["columns"]["user_id"]["min"], Value::Null);
+        assert_eq!(only_null["columns"]["user_id"]["max"], Value::Null);
+
+        for uri in [
+            "/events/stats?from=1000&to=3000",
+            "/events/stats?from=1000&to=3000&sum=",
+            "/events/stats?from=1000&to=3000&sum",
+            "/events/stats?from=1000&to=3000&sum=missing",
+            "/events/stats?from=1000&to=3000&sum=action",
+            "/events/stats?from=1000&to=3000&min=ok",
+            "/events/stats?from=1000&to=3000&sum=user_id&limit=1",
+            "/events/stats?from=1000&to=3000&sum=user_id&offset=0",
+            "/events/stats?from=1000&to=3000&sum=user_id&bucket_ms=1",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+            assert!(body.get("columns").is_none(), "{uri} -> {body}");
+        }
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&max=user_id&min=score",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["columns"]["user_id"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["max"]
+        );
+        assert_eq!(body["columns"]["user_id"]["max"], json!(5));
+        assert_eq!(body["columns"]["score"]["min"], json!(0.25));
 
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);

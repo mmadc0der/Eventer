@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -6,13 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::codec::{
-    accumulate_histogram_filtered, block_row_count, count_rows_filtered, decode_rows_filtered,
-    range_impossible, range_matches, read_timestamp_column, tighter_lower, tighter_upper,
-    ColumnPredicate, RangeEnd, RangeFilter,
+    accumulate_histogram_filtered, block_row_count, cmp_numeric, count_rows_filtered,
+    decode_rows_filtered, range_impossible, range_matches, read_timestamp_column, tighter_lower,
+    tighter_upper, visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd,
+    RangeFilter,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
-use crate::schema::{self, Schema};
+use crate::schema::{self, FieldType, Schema};
 use crate::segment::{self, Catalog};
 use crate::value::{self, row_to_json_bytes, Row, Scalar};
 
@@ -30,6 +32,41 @@ pub const MAX_HISTOGRAM_BUCKETS: usize = 4096;
 pub struct HistogramBucket {
     pub start_ms: i64,
     pub count: u64,
+}
+
+/// One column to aggregate. `sum`, `min`, and `max` may be combined.
+///
+/// The same field may appear in more than one request; the flags are OR-ed and
+/// the column is reported once, in the order the field was first named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatRequest {
+    pub field: String,
+    pub sum: bool,
+    pub min: bool,
+    pub max: bool,
+}
+
+/// Total for one numeric column.
+///
+/// [`StatSum::Exact`] is the 128-bit sum of an int, a decimal, or a timestamp.
+/// `contributed` is false when every matching value was null or no row matched,
+/// so a decimal total of zero is formatted as `"0"` rather than at the schema
+/// scale. [`StatSum::Float`] is IEEE-754 addition in ingest order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StatSum {
+    Exact { total: i128, contributed: bool },
+    Float(f64),
+}
+
+/// Aggregates for one column. An absent `sum`, `min`, or `max` was not requested.
+///
+/// Requested `min` and `max` are `Some(None)` when no non-null value matched.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStats {
+    pub field: String,
+    pub sum: Option<StatSum>,
+    pub min: Option<Option<Scalar>>,
+    pub max: Option<Option<Scalar>>,
 }
 
 /// Counters for the bytes sitting in segment files after the last flush.
@@ -556,6 +593,73 @@ impl Store {
         buckets_from_counts(span, &counts)
     }
 
+    /// Sum, minimum, and maximum of numeric columns over an inclusive range.
+    ///
+    /// Filters are the same ones [`Store::count_with_filter`] applies. A block
+    /// the sparse index places outside the range is not read. A block the zone
+    /// map can reject is not read. Rows that share a block with a match are
+    /// filtered while the block is decoded. `min` and `max` are taken from the
+    /// rows that survive, not from the zone bounds, because a time bound can
+    /// cut a block.
+    ///
+    /// Nulls do not contribute. A column whose matching values are all null, or
+    /// a filter that matches nothing, has null `min` and `max` and a zero sum.
+    /// An int, decimal, or timestamp sum uses a 128-bit accumulator and returns
+    /// [`Error::Event`](Error::Event) if that accumulator would overflow. A
+    /// float sum is IEEE-754 addition in ingest order inside a block and in
+    /// block order across the store. A non-finite float is
+    /// [`Error::Corrupt`](Error::Corrupt). At least one of `sum`, `min`, or
+    /// `max` is required. A bool, string, text, or json column is
+    /// [`Error::Schema`](Error::Schema). Checks run before the store is read.
+    pub fn aggregate_with_filter(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        stats: &[StatRequest],
+    ) -> Result<Vec<ColumnStats>> {
+        let specs = resolve_stat_requests(&self.schema, stats)?;
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
+            return Ok(empty_column_stats(&specs));
+        };
+        let _retention = self.pipeline.lock_for_read();
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+        let mut running: Vec<RunningStat> = specs.into_iter().map(RunningStat::new).collect();
+        let mut dictionaries = HashMap::new();
+        for block in blocks {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
+                return Err(Error::event("query response size limit exceeded"));
+            }
+            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let nrows = block_row_count(&payload)?;
+            require_header_row_count(block.row_count, nrows)?;
+            let mut captures: Vec<CapturedColumn> = running
+                .iter()
+                .map(|stat| CapturedColumn {
+                    index: stat.spec.index,
+                    values: Vec::new(),
+                })
+                .collect();
+            visit_matching_timestamps(
+                &self.schema,
+                &payload,
+                from_ms,
+                to_ms,
+                &resolved.predicates,
+                &resolved.ranges,
+                &mut captures,
+                |ts, row, captured| {
+                    for stat in &mut running {
+                        let value = stat_value(&self.schema, stat, ts, row, captured)?;
+                        stat.absorb(value)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(running.into_iter().map(RunningStat::finish).collect())
+    }
+
     /// Delete every block whose maximum timestamp is strictly less than `cutoff_ms`.
     ///
     /// The cutoff is the caller's. It is not taken from the newest timestamp in the
@@ -865,6 +969,211 @@ impl ResolvedScan {
     fn unfiltered(&self) -> bool {
         self.predicates.is_empty() && self.ranges.is_empty()
     }
+}
+
+struct ResolvedStat {
+    index: usize,
+    name: String,
+    ty: FieldType,
+    sum: bool,
+    min: bool,
+    max: bool,
+}
+
+struct RunningStat {
+    spec: ResolvedStat,
+    exact: i128,
+    float_sum: f64,
+    contributed: bool,
+    min: Option<Scalar>,
+    max: Option<Scalar>,
+}
+
+impl RunningStat {
+    fn new(spec: ResolvedStat) -> Self {
+        Self {
+            spec,
+            exact: 0,
+            float_sum: 0.0,
+            contributed: false,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn absorb(&mut self, value: Scalar) -> Result<()> {
+        let numeric = match (self.spec.ty, &value) {
+            (_, Scalar::Null) => return Ok(()),
+            (FieldType::Int, Scalar::Int(value)) => Scalar::Int(*value),
+            (FieldType::Timestamp, Scalar::Timestamp(value)) => Scalar::Timestamp(*value),
+            (FieldType::Decimal { .. }, Scalar::Decimal(value)) => Scalar::Decimal(*value),
+            (FieldType::Float, Scalar::Float(value)) => {
+                if !value.is_finite() {
+                    return Err(Error::corrupt(format!(
+                        "field `{}` is not a finite float",
+                        self.spec.name
+                    )));
+                }
+                Scalar::Float(*value)
+            }
+            _ => {
+                return Err(Error::corrupt(format!(
+                    "field `{}` has a value that does not match its type",
+                    self.spec.name
+                )))
+            }
+        };
+        if self.spec.sum {
+            match numeric {
+                Scalar::Float(value) => self.float_sum += value,
+                Scalar::Int(value) => self.add_exact(i128::from(value))?,
+                Scalar::Timestamp(value) => self.add_exact(i128::from(value))?,
+                Scalar::Decimal(value) => self.add_exact(value)?,
+                _ => {
+                    return Err(Error::corrupt(format!(
+                        "field `{}` has a value that does not match its type",
+                        self.spec.name
+                    )))
+                }
+            }
+        }
+        self.contributed = true;
+        if self.spec.min {
+            self.min = Some(tighter_extreme(self.min.take(), numeric.clone(), true)?);
+        }
+        if self.spec.max {
+            self.max = Some(tighter_extreme(self.max.take(), numeric, false)?);
+        }
+        Ok(())
+    }
+
+    fn add_exact(&mut self, value: i128) -> Result<()> {
+        self.exact = self
+            .exact
+            .checked_add(value)
+            .ok_or_else(|| Error::event(format!("sum of `{}` overflowed", self.spec.name)))?;
+        Ok(())
+    }
+
+    fn finish(self) -> ColumnStats {
+        ColumnStats {
+            field: self.spec.name,
+            sum: self.spec.sum.then(|| match self.spec.ty {
+                FieldType::Float => StatSum::Float(self.float_sum),
+                _ => StatSum::Exact {
+                    total: self.exact,
+                    contributed: self.contributed,
+                },
+            }),
+            min: self.spec.min.then_some(self.min),
+            max: self.spec.max.then_some(self.max),
+        }
+    }
+}
+
+fn tighter_extreme(current: Option<Scalar>, next: Scalar, want_min: bool) -> Result<Scalar> {
+    let Some(current) = current else {
+        return Ok(next);
+    };
+    match cmp_numeric(&next, &current) {
+        Some(Ordering::Less) if want_min => Ok(next),
+        Some(Ordering::Greater) if !want_min => Ok(next),
+        Some(_) => Ok(current),
+        None => Err(Error::corrupt("stat values cannot be compared")),
+    }
+}
+
+fn stat_value(
+    schema: &Schema,
+    stat: &RunningStat,
+    ts: i64,
+    row: usize,
+    captures: &[CapturedColumn],
+) -> Result<Scalar> {
+    if let Some(slot) = captures
+        .iter()
+        .find(|column| column.index == stat.spec.index)
+    {
+        if !slot.values.is_empty() {
+            return slot.values.get(row).cloned().ok_or_else(|| {
+                Error::corrupt(format!("field `{}` is missing a row", stat.spec.name))
+            });
+        }
+    }
+    if stat.spec.index == schema.timestamp_index {
+        return Ok(Scalar::Timestamp(ts));
+    }
+    Err(Error::corrupt(format!(
+        "field `{}` was not decoded",
+        stat.spec.name
+    )))
+}
+
+fn resolve_stat_requests(schema: &Schema, stats: &[StatRequest]) -> Result<Vec<ResolvedStat>> {
+    if stats.is_empty() || stats.iter().all(|stat| !stat.sum && !stat.min && !stat.max) {
+        return Err(Error::event("at least one of sum, min, or max is required"));
+    }
+    let mut resolved: Vec<ResolvedStat> = Vec::new();
+    for stat in stats {
+        if stat.field.is_empty() {
+            return Err(Error::event("stat field name is empty"));
+        }
+        if !stat.sum && !stat.min && !stat.max {
+            continue;
+        }
+        let index = schema
+            .fields
+            .iter()
+            .position(|field| field.name == stat.field)
+            .ok_or_else(|| Error::schema(format!("unknown stat field `{}`", stat.field)))?;
+        let ty = schema.fields[index].ty;
+        if !matches!(
+            ty,
+            FieldType::Int | FieldType::Timestamp | FieldType::Float | FieldType::Decimal { .. }
+        ) {
+            return Err(Error::schema(format!(
+                "stat does not apply to {} column `{}`",
+                ty.name(),
+                stat.field
+            )));
+        }
+        if let Some(existing) = resolved.iter_mut().find(|column| column.index == index) {
+            existing.sum |= stat.sum;
+            existing.min |= stat.min;
+            existing.max |= stat.max;
+        } else {
+            resolved.push(ResolvedStat {
+                index,
+                name: stat.field.clone(),
+                ty,
+                sum: stat.sum,
+                min: stat.min,
+                max: stat.max,
+            });
+        }
+    }
+    if resolved.is_empty() {
+        return Err(Error::event("at least one of sum, min, or max is required"));
+    }
+    Ok(resolved)
+}
+
+fn empty_column_stats(columns: &[ResolvedStat]) -> Vec<ColumnStats> {
+    columns
+        .iter()
+        .map(|column| ColumnStats {
+            field: column.name.clone(),
+            sum: column.sum.then(|| match column.ty {
+                FieldType::Float => StatSum::Float(0.0),
+                _ => StatSum::Exact {
+                    total: 0,
+                    contributed: false,
+                },
+            }),
+            min: column.min.then_some(None),
+            max: column.max.then_some(None),
+        })
+        .collect()
 }
 
 fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<ResolvedScan> {
@@ -5275,5 +5584,243 @@ mod tests {
         opened.close().unwrap();
         assert_eq!(report.destination, directory_stored_bytes(&dest).unwrap());
         let _ = fs::remove_dir_all(&planted);
+    }
+
+    fn stat_req(field: &str, sum: bool, min: bool, max: bool) -> StatRequest {
+        StatRequest {
+            field: field.to_string(),
+            sum,
+            min,
+            max,
+        }
+    }
+
+    fn exact_sum(columns: &[ColumnStats], field: &str) -> (i128, bool) {
+        let column = columns.iter().find(|column| column.field == field).unwrap();
+        match column.sum.unwrap() {
+            StatSum::Exact { total, contributed } => (total, contributed),
+            StatSum::Float(value) => panic!("float sum {value} for {field}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_sums_filtered_rows_and_skips_a_rejected_zone() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        for (ts, user, score, amount) in [
+            (1000i64, Some(1i64), 0.5f64, "1.50"),
+            (2000, Some(5), 0.25, "2.25"),
+            (5000, Some(9), 1.0, "4.00"),
+        ] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "score": score,
+                "ok": true,
+                "action": "buy",
+                "amount": amount,
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        let null_user = serde_json::json!({
+            "ts": 3000,
+            "score": 1.0,
+            "ok": false,
+            "action": "other",
+            "amount": "9.00",
+        });
+        store
+            .append_json(&serde_json::to_vec(&null_user).unwrap())
+            .unwrap();
+        store.flush().unwrap();
+
+        let columns = store
+            .aggregate_with_filter(1000, 3000, &[], &[stat_req("user_id", true, true, true)])
+            .unwrap();
+        assert_eq!(exact_sum(&columns, "user_id"), (6, true));
+        assert_eq!(columns[0].min, Some(Some(Scalar::Int(1))));
+        assert_eq!(columns[0].max, Some(Some(Scalar::Int(5))));
+        let amount = store
+            .aggregate_with_filter(1000, 3000, &[], &[stat_req("amount", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&amount, "amount"), (150 + 225 + 900, true));
+        let cut = store
+            .aggregate_with_filter(4000, 6000, &[], &[stat_req("user_id", false, true, true)])
+            .unwrap();
+        assert_eq!(cut[0].min, Some(Some(Scalar::Int(9))));
+        assert_eq!(cut[0].max, Some(Some(Scalar::Int(9))));
+        assert!(cut[0].sum.is_none());
+
+        let below =
+            crate::value::scalar_from_literal(FieldType::Decimal { scale: 2 }, "2.00").unwrap();
+        let filtered = store
+            .aggregate_with_filter(
+                1000,
+                3000,
+                &[Predicate::Cmp("amount".into(), CmpOp::Lt, below)],
+                &[stat_req("amount", true, true, true)],
+            )
+            .unwrap();
+        assert_eq!(exact_sum(&filtered, "amount"), (150, true));
+        assert_eq!(filtered[0].min, Some(Some(Scalar::Decimal(150))));
+        let buy = [Predicate::Eq("action".into(), "buy".into())];
+        assert_eq!(store.count_with_filter(1000, 3000, &buy).unwrap(), 2);
+        let same = store
+            .aggregate_with_filter(1000, 3000, &buy, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&same, "user_id"), (6, true));
+
+        let empty = store
+            .aggregate_with_filter(
+                9000,
+                9000,
+                &[],
+                &[
+                    stat_req("user_id", true, true, true),
+                    stat_req("score", true, true, false),
+                    stat_req("amount", true, false, false),
+                    stat_req("ts", true, true, true),
+                ],
+            )
+            .unwrap();
+        assert_eq!(exact_sum(&empty, "user_id"), (0, false));
+        assert_eq!(empty[0].min, Some(None));
+        assert_eq!(empty[0].max, Some(None));
+        assert_eq!(empty[1].sum, Some(StatSum::Float(0.0)));
+        assert_eq!(empty[1].min, Some(None));
+        assert!(empty[1].max.is_none());
+        assert_eq!(exact_sum(&empty, "amount"), (0, false));
+        assert_eq!(exact_sum(&empty, "ts"), (0, false));
+
+        let scores = store
+            .aggregate_with_filter(1000, 2000, &[], &[stat_req("score", true, true, true)])
+            .unwrap();
+        assert_eq!(scores[0].sum, Some(StatSum::Float(0.75)));
+        let timestamps = store
+            .aggregate_with_filter(1000, 2000, &[], &[stat_req("ts", true, true, true)])
+            .unwrap();
+        assert_eq!(exact_sum(&timestamps, "ts"), (3000, true));
+        assert_eq!(timestamps[0].min, Some(Some(Scalar::Timestamp(1000))));
+        assert_eq!(timestamps[0].max, Some(Some(Scalar::Timestamp(2000))));
+
+        let missing =
+            store.aggregate_with_filter(0, 10, &[], &[stat_req("nope", true, false, false)]);
+        assert!(matches!(missing, Err(Error::Schema(_))), "{missing:?}");
+        let text =
+            store.aggregate_with_filter(0, 10, &[], &[stat_req("action", true, false, false)]);
+        assert!(matches!(text, Err(Error::Schema(_))), "{text:?}");
+        assert_eq!(store.count(1000, 5000).unwrap(), 4);
+        store.close().unwrap();
+
+        let low_dir = TempDir::new();
+        let schema = write_schema(low_dir.path());
+        let data = low_dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, user) in [(10i64, 1i64), (11, 2), (20, 10), (21, 11)] {
+            store
+                .append_json(&event(ts, Some(user), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let gt = [Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(5))];
+        let resolved = resolve_predicates(store.schema(), &gt).unwrap();
+        assert_eq!(store.blocks_in_range(0, 100, &resolved).len(), 1);
+        let victim = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.max_ts <= 11)
+            .cloned()
+            .unwrap();
+        let outside = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.min_ts >= 20)
+            .cloned()
+            .unwrap();
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[victim.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let kept = store
+            .aggregate_with_filter(0, 100, &gt, &[stat_req("user_id", true, true, true)])
+            .unwrap();
+        assert_eq!(exact_sum(&kept, "user_id"), (21, true));
+        assert_eq!(kept[0].min, Some(Some(Scalar::Int(10))));
+        assert_eq!(kept[0].max, Some(Some(Scalar::Int(11))));
+        let skipped_time = store
+            .aggregate_with_filter(
+                outside.min_ts,
+                outside.max_ts,
+                &[],
+                &[stat_req("user_id", true, false, false)],
+            )
+            .unwrap();
+        assert_eq!(exact_sum(&skipped_time, "user_id"), (21, true));
+        assert!(store
+            .aggregate_with_filter(
+                victim.min_ts,
+                victim.max_ts,
+                &[],
+                &[stat_req("user_id", true, false, false)]
+            )
+            .is_err());
+        store.close().unwrap();
+
+        let wide = TempDir::new();
+        let schema_path = wide.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "amount", "type": "decimal", "scale": 0}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let store =
+            Store::open_with(wide.path().join("data"), &schema_path, test_options(8)).unwrap();
+        let huge = i128::MAX.to_string();
+        for (ts, amount) in [(1i64, huge.as_str()), (2, "1")] {
+            store
+                .append_json(format!(r#"{{"ts":{ts},"amount":"{amount}"}}"#).as_bytes())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let overflow =
+            store.aggregate_with_filter(0, 10, &[], &[stat_req("amount", true, true, false)]);
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("overflow")),
+            "{overflow:?}"
+        );
+        store.close().unwrap();
+
+        let floats = TempDir::new();
+        let schema = write_schema(floats.path());
+        let store = Store::open_with(floats.path().join("data"), &schema, test_options(2)).unwrap();
+        for (ts, score) in [(1i64, 1e16f64), (2, 1.0), (3, -1e16)] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": 1,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let summed = store
+            .aggregate_with_filter(0, 10, &[], &[stat_req("score", true, false, false)])
+            .unwrap();
+        assert_eq!(summed[0].sum, Some(StatSum::Float(0.0)));
+        store.close().unwrap();
     }
 }
