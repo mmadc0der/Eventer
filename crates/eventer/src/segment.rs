@@ -648,6 +648,27 @@ fn choose_parsed_frame(found: Vec<(ParsedFrame, bool)>) -> Option<ParsedFrame> {
 fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<ScannedBlock>, u64, bool)> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let file_len = file.seek(SeekFrom::End(0))?;
+    let (blocks, offset, uses_dict) = read_scanned_blocks(&mut file, file_len, segment_id)?;
+    if offset < file_len {
+        file.set_len(offset)?;
+        file.sync_all()?;
+    }
+    Ok((blocks, offset, uses_dict))
+}
+
+/// Scan frames without opening the file for write and without truncating a torn tail.
+fn scan_segment_readonly(path: &Path, segment_id: u32) -> Result<(Vec<ScannedBlock>, bool)> {
+    let mut file = File::open(path)?;
+    let file_len = file.seek(SeekFrom::End(0))?;
+    let (blocks, _, uses_dict) = read_scanned_blocks(&mut file, file_len, segment_id)?;
+    Ok((blocks, uses_dict))
+}
+
+fn read_scanned_blocks(
+    file: &mut File,
+    file_len: u64,
+    segment_id: u32,
+) -> Result<(Vec<ScannedBlock>, u64, bool)> {
     let mut offset = 0u64;
     let mut blocks = Vec::new();
     let mut uses_dict = false;
@@ -655,7 +676,7 @@ fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<ScannedBlock>, u
         if offset >= file_len || file_len - offset < BLOCK_HEADER_LEN as u64 {
             break;
         }
-        let Some(parsed) = read_parsed_frame(&mut file, offset, file_len)? else {
+        let Some(parsed) = read_parsed_frame(file, offset, file_len)? else {
             break;
         };
         let header_timestamps = match (parsed.min_ts, parsed.max_ts) {
@@ -687,11 +708,84 @@ fn scan_and_repair(path: &Path, segment_id: u32) -> Result<(Vec<ScannedBlock>, u
         };
         offset = next;
     }
-    if offset < file_len {
-        file.set_len(offset)?;
-        file.sync_all()?;
-    }
     Ok((blocks, offset, uses_dict))
+}
+
+/// Decode each stored block once and hand the rows to `visit`.
+///
+/// The source directory is not modified: no torn tail is truncated, and no index
+/// or zone file is written. A short frame recovers its length and timestamps from
+/// that same decode.
+pub(crate) fn visit_stored_rows(
+    dir: &Path,
+    schema: &Schema,
+    mut visit: impl FnMut(crate::value::Row) -> Result<()>,
+) -> Result<u64> {
+    let mut copied = 0u64;
+    for id in list_segment_ids(dir)? {
+        let data = data_path(dir, id);
+        let (scanned, uses_dict) = scan_segment_readonly(&data, id)?;
+        let stored = match read_dictionary(&dictionary_path(dir, id)) {
+            Ok(stored) => stored,
+            Err(Error::Corrupt(_)) if !uses_dict => None,
+            Err(err) => return Err(err),
+        };
+        if uses_dict && stored.is_none() {
+            return Err(Error::corrupt(format!(
+                "segment {id} has dictionary-compressed blocks but the dictionary file is missing"
+            )));
+        }
+        let dictionary = stored.as_ref().map(|dict| dict.bytes.as_slice());
+        for frame in &scanned {
+            let rows = decode_scanned_block(&data, frame, dictionary, schema)?;
+            if frame.row_in_header && rows.len() != frame.meta.row_count as usize {
+                return Err(Error::corrupt(
+                    "block row count does not match the frame header",
+                ));
+            }
+            for row in rows {
+                visit(row)?;
+                copied += 1;
+            }
+        }
+    }
+    Ok(copied)
+}
+
+fn decode_scanned_block(
+    path: &Path,
+    frame: &ScannedBlock,
+    dictionary: Option<&[u8]>,
+    schema: &Schema,
+) -> Result<Vec<crate::value::Row>> {
+    if frame.uncompressed_in_header && frame.row_in_header && frame.header_timestamps.is_some() {
+        let payload = read_block_payload(path, &frame.meta, dictionary)?;
+        return crate::codec::decode_block(schema, &payload);
+    }
+    let payload = read_compressed_frame(
+        path,
+        frame.meta.offset,
+        frame.header_len,
+        frame.meta.compressed_len,
+    )?;
+    let raw = if frame.dictionary {
+        let Some(dictionary) = dictionary else {
+            return Err(Error::corrupt(format!(
+                "dictionary frame at offset {} in segment {} has no dictionary",
+                frame.meta.offset, frame.meta.segment_id
+            )));
+        };
+        decompress_payload(&payload, Some(dictionary), decompress_cap(frame))?
+    } else {
+        decompress_payload(&payload, None, decompress_cap(frame))?
+    };
+    let rows = crate::codec::decode_block(schema, &raw)?;
+    if rows.is_empty() {
+        return Err(Error::corrupt(
+            "decoded block has no rows to recover timestamps from",
+        ));
+    }
+    Ok(rows)
 }
 
 fn read_parsed_frame(file: &mut File, offset: u64, file_len: u64) -> Result<Option<ParsedFrame>> {
