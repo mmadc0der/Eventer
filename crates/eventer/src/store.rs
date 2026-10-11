@@ -680,7 +680,8 @@ impl Store {
     /// int, timestamp, and decimal, `false` then `true` for bool, and byte order
     /// for string and text. An empty match is an empty list.
     ///
-    /// More than [`MAX_HISTOGRAM_BUCKETS`] distinct keys returns
+    /// More than [`MAX_HISTOGRAM_BUCKETS`] distinct keys, or string and text
+    /// keys whose retained bytes exceed [`MAX_QUERY_BYTES`], returns
     /// [`Error::Event`](Error::Event) and no groups. A block the sparse index
     /// places outside the range is not read. A block the zone map can reject is
     /// not read. Keys come from the rows that survive the filters, not from the
@@ -705,6 +706,10 @@ impl Store {
             indexes.push(group.index);
         }
         let mut groups: BTreeMap<GroupKey, Vec<RunningStat>> = BTreeMap::new();
+        let mut string_groups: BTreeMap<String, Vec<RunningStat>> = BTreeMap::new();
+        let mut null_group: Option<Vec<RunningStat>> = None;
+        let mut key_bytes = 0usize;
+        let text_group = matches!(group.ty, FieldType::String | FieldType::Text);
         let mut dictionaries = HashMap::new();
         for block in blocks {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
@@ -723,6 +728,45 @@ impl Store {
                 &resolved.ranges,
                 &mut captures,
                 |ts, row, captured| {
+                    if text_group {
+                        match group_text_from_row(&self.schema, &group, row, captured)? {
+                            None => {
+                                if null_group.is_none() {
+                                    reserve_group_key(string_groups.len(), &mut key_bytes, 0)?;
+                                    null_group =
+                                        Some(specs.iter().cloned().map(RunningStat::new).collect());
+                                }
+                                absorb_group_stats(
+                                    &self.schema,
+                                    null_group.as_mut().expect("null group was just inserted"),
+                                    ts,
+                                    row,
+                                    captured,
+                                )?;
+                            }
+                            Some(text) => {
+                                if string_groups.contains_key(text) {
+                                    absorb_group_stats(
+                                        &self.schema,
+                                        string_groups.get_mut(text).expect("string group exists"),
+                                        ts,
+                                        row,
+                                        captured,
+                                    )?;
+                                } else {
+                                    let distinct =
+                                        string_groups.len() + usize::from(null_group.is_some());
+                                    reserve_group_key(distinct, &mut key_bytes, text.len())?;
+                                    let running =
+                                        string_groups.entry(text.to_owned()).or_insert_with(|| {
+                                            specs.iter().cloned().map(RunningStat::new).collect()
+                                        });
+                                    absorb_group_stats(&self.schema, running, ts, row, captured)?;
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
                     let key = group_key_from_row(&self.schema, &group, ts, row, captured)?;
                     if groups.len() >= MAX_HISTOGRAM_BUCKETS && !groups.contains_key(&key) {
                         return Err(Error::event("stats would emit more than 4096 groups"));
@@ -730,15 +774,24 @@ impl Store {
                     let running = groups
                         .entry(key)
                         .or_insert_with(|| specs.iter().cloned().map(RunningStat::new).collect());
-                    for stat in running.iter_mut() {
-                        let value = stat_value(&self.schema, stat, ts, row, captured)?;
-                        stat.absorb(value)?;
-                    }
+                    absorb_group_stats(&self.schema, running, ts, row, captured)?;
                     Ok(())
                 },
             )?;
         }
-        groups
+        let ordered: Vec<(GroupKey, Vec<RunningStat>)> = if text_group {
+            let mut ordered = Vec::new();
+            if let Some(running) = null_group {
+                ordered.push((GroupKey::Null, running));
+            }
+            for (key, running) in string_groups {
+                ordered.push((GroupKey::Str(key), running));
+            }
+            ordered
+        } else {
+            groups.into_iter().collect()
+        };
+        ordered
             .into_iter()
             .map(|(key, running)| {
                 let columns = running
@@ -1326,6 +1379,69 @@ fn resolve_group_field(schema: &Schema, by: &str) -> Result<ResolvedGroup> {
         name: by.to_string(),
         ty,
     })
+}
+
+fn reserve_group_key(distinct: usize, key_bytes: &mut usize, extra: usize) -> Result<()> {
+    if distinct >= MAX_HISTOGRAM_BUCKETS {
+        return Err(Error::event("stats would emit more than 4096 groups"));
+    }
+    if extra == 0 {
+        return Ok(());
+    }
+    let room = remaining_query_bytes(*key_bytes)?;
+    if extra > room {
+        return Err(Error::event("query response size limit exceeded"));
+    }
+    *key_bytes += extra;
+    Ok(())
+}
+
+fn absorb_group_stats(
+    schema: &Schema,
+    running: &mut [RunningStat],
+    ts: i64,
+    row: usize,
+    captured: &[CapturedColumn],
+) -> Result<()> {
+    for stat in running.iter_mut() {
+        let value = stat_value(schema, stat, ts, row, captured)?;
+        stat.absorb(value)?;
+    }
+    Ok(())
+}
+
+/// `None` is a null key. The `&str` points at the captured column, so a repeated
+/// key can be probed without allocating another `String`.
+fn group_text_from_row<'a>(
+    schema: &Schema,
+    group: &ResolvedGroup,
+    row: usize,
+    captures: &'a [CapturedColumn],
+) -> Result<Option<&'a str>> {
+    let slot = captures
+        .iter()
+        .find(|column| column.index == group.index)
+        .ok_or_else(|| Error::corrupt(format!("field `{}` was not decoded", group.name)))?;
+    match slot.values.get(row) {
+        Some(Scalar::Null) => Ok(None),
+        Some(Scalar::Str(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(Error::corrupt(format!(
+            "field `{}` has a value that does not match its type",
+            group.name
+        ))),
+        None => {
+            if group.index == schema.timestamp_index {
+                return Err(Error::corrupt(format!(
+                    "field `{}` has a value that does not match its type",
+                    group.name
+                )));
+            }
+            Err(Error::corrupt(format!(
+                "field `{}` is missing a row",
+                group.name
+            )))
+        }
+    }
 }
 
 fn group_key_from_row(
@@ -6411,6 +6527,45 @@ mod tests {
                 &[stat_req("user_id", true, false, false)]
             )
             .is_err());
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn grouped_text_keys_stop_at_the_query_byte_ceiling() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        let half = "a".repeat(MAX_QUERY_BYTES / 2);
+        let other = "b".repeat(MAX_QUERY_BYTES / 2);
+        for (ts, note) in [(1, half.clone()), (2, half), (3, other)] {
+            store
+                .pipeline
+                .append_row(Row {
+                    ts,
+                    values: vec![
+                        Scalar::Timestamp(ts),
+                        Scalar::Int(1),
+                        Scalar::Float(1.0),
+                        Scalar::Bool(true),
+                        Scalar::Str("k".into()),
+                        Scalar::Str(note),
+                        Scalar::Decimal(100),
+                    ],
+                })
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.count(1, 3).unwrap(), 3);
+        let stats = [stat_req("user_id", true, false, false)];
+        let repeated = store.aggregate_grouped(1, 2, &[], &stats, "note").unwrap();
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(exact_sum(&repeated[0].columns, "user_id"), (2, true));
+        let overflow = store.aggregate_grouped(1, 3, &[], &stats, "note");
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("query response size limit exceeded")),
+            "{overflow:?}"
+        );
         store.close().unwrap();
     }
 }

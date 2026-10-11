@@ -589,6 +589,9 @@ pub(crate) fn visit_matching_timestamps(
     let mut mask = vec![true; nrows];
     let mut timestamps: Option<Vec<i64>> = None;
     let mut budget = usize::MAX;
+    // Captured string and text values are owned until the visitor returns.
+    // That budget is the query ceiling, shared by every such column in the block.
+    let mut string_budget = crate::store::MAX_QUERY_BYTES;
     for index in 0..=last_needed {
         let field = &schema.fields[index];
         if column_was_not_stored(bytes, cursor) {
@@ -621,15 +624,28 @@ pub(crate) fn visit_matching_timestamps(
                 mask.fill(false);
                 continue;
             }
+            if matches!(field.ty, FieldType::String | FieldType::Text)
+                && (capture_here || predicate.is_some())
+            {
+                let spans = read_text_spans(bytes, &mut cursor, nrows, false)?;
+                if let Some(predicate) = predicate {
+                    mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
+                }
+                if range.is_some() {
+                    mask.fill(false);
+                }
+                if capture_here {
+                    let values =
+                        materialize_text_spans(bytes, &spans, &mask, &mut string_budget, false)?;
+                    if let Some(slot) = captures.iter_mut().find(|column| column.index == index) {
+                        slot.values = values;
+                    }
+                }
+                continue;
+            }
             if let Some(predicate) = predicate {
-                if !capture_here
-                    && matches!(
-                        field.ty,
-                        FieldType::String | FieldType::Text | FieldType::Json
-                    )
-                {
-                    let spans =
-                        read_text_spans(bytes, &mut cursor, nrows, field.ty == FieldType::Json)?;
+                if !capture_here && field.ty == FieldType::Json {
+                    let spans = read_text_spans(bytes, &mut cursor, nrows, true)?;
                     mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
                     if range.is_some() {
                         mask.fill(false);
@@ -5039,5 +5055,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not finite"), "{err}");
+    }
+
+    #[test]
+    fn captured_text_omits_rows_the_predicate_already_dropped() {
+        let schema = schema();
+        let mut rows = Vec::new();
+        for (ts, action) in [(1000, "click"), (2000, "view"), (3000, "click")] {
+            rows.push(
+                parse_event(
+                    &schema,
+                    format!(
+                        r#"{{"ts":{ts},"user_id":1,"score":1.0,"ok":true,"action":"{action}","note":"n","amount":"1.00"}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap(),
+            );
+        }
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let predicate = [ColumnPredicate {
+            index: 4,
+            allowed: vec![Scalar::Str("click".into())],
+        }];
+        let mut captured = [CapturedColumn {
+            index: 4,
+            values: Vec::new(),
+        }];
+        visit_matching_timestamps(
+            &schema,
+            &encoded.bytes,
+            0,
+            5000,
+            &predicate,
+            &[],
+            &mut captured,
+            |_ts, _row, _captured| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            captured[0].values,
+            vec![
+                Scalar::Str("click".into()),
+                Scalar::Null,
+                Scalar::Str("click".into()),
+            ]
+        );
     }
 }
