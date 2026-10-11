@@ -127,17 +127,7 @@ Inside a block, integers, timestamps, and decimals use a constant, a constant st
 cargo run --release -p eventer-bench -- 100000
 ```
 
-One host, three release runs of 100,000 events, zstd level 3, 2048-row blocks:
-
-| | |
-| --- | --- |
-| Raw JSON | 102.44 bytes/event |
-| Stored segment data | 3.94 bytes/event |
-| Sparse index | 1,968 bytes total |
-| Size ratio | 26.0× smaller than JSON |
-| Throughput | 969k–1.03M events/sec |
-
-Stored size was identical across the runs (394,005 data bytes, 49 blocks, one segment). Elapsed time was 0.097–0.103 seconds.
+The same 100,000 events, zstd level 3, and 2048-row blocks are what [CHANGELOG.md](CHANGELOG.md) compares across format versions. On `305a4d5` that run stores 3,639 data bytes and 885 index bytes (49 blocks, one segment): 2,815× smaller than the 10,244,000 bytes of raw JSON. The first columnar store, on the same events, stored 394,005 data bytes and 1,968 index bytes (26×). Throughput depends on the host and is not part of that table.
 
 ## Rust API
 
