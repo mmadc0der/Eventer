@@ -622,10 +622,12 @@ pub(crate) fn visit_matching_timestamps(
                 continue;
             }
             if let Some(predicate) = predicate {
-                if matches!(
-                    field.ty,
-                    FieldType::String | FieldType::Text | FieldType::Json
-                ) {
+                if !capture_here
+                    && matches!(
+                        field.ty,
+                        FieldType::String | FieldType::Text | FieldType::Json
+                    )
+                {
                     let spans =
                         read_text_spans(bytes, &mut cursor, nrows, field.ty == FieldType::Json)?;
                     mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);

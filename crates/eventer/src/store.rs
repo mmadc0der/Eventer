@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -68,6 +68,16 @@ pub struct ColumnStats {
     pub sum: Option<StatSum>,
     pub min: Option<Option<Scalar>>,
     pub max: Option<Option<Scalar>>,
+}
+
+/// One group from [`Store::aggregate_grouped`].
+///
+/// `key` is [`Scalar::Null`] when the group column is null. `columns` is the
+/// ungrouped result for the rows in that group alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatGroup {
+    pub key: Scalar,
+    pub columns: Vec<ColumnStats>,
 }
 
 /// Counters for the bytes sitting in segment files after the last flush.
@@ -636,13 +646,7 @@ impl Store {
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
-            let mut captures: Vec<CapturedColumn> = running
-                .iter()
-                .map(|stat| CapturedColumn {
-                    index: stat.spec.index,
-                    values: Vec::new(),
-                })
-                .collect();
+            let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
             visit_matching_timestamps(
                 &self.schema,
                 &payload,
@@ -661,6 +665,92 @@ impl Store {
             )?;
         }
         running.into_iter().map(RunningStat::finish).collect()
+    }
+
+    /// Group [`Store::aggregate_with_filter`] by one column.
+    ///
+    /// `by` is a bool, string, text, int, timestamp, or decimal field. A float
+    /// or json column, an empty name, or an unknown field is an error and does
+    /// not read the store. The field may also be a `sum`, `min`, or `max`
+    /// target. At least one of those is still required.
+    ///
+    /// Each group's `columns` are the aggregates of the rows with that key.
+    /// Nulls do not contribute to `sum`, `min`, or `max`. A null key is its own
+    /// group. Groups are ordered by the key: null first, then numeric order for
+    /// int, timestamp, and decimal, `false` then `true` for bool, and byte order
+    /// for string and text. An empty match is an empty list.
+    ///
+    /// More than [`MAX_HISTOGRAM_BUCKETS`] distinct keys returns
+    /// [`Error::Event`](Error::Event) and no groups. A block the sparse index
+    /// places outside the range is not read. A block the zone map can reject is
+    /// not read. Keys come from the rows that survive the filters, not from the
+    /// zone's distinct set, because a time bound can cut a block.
+    pub fn aggregate_grouped(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        stats: &[StatRequest],
+        by: &str,
+    ) -> Result<Vec<StatGroup>> {
+        let specs = resolve_stat_requests(&self.schema, stats)?;
+        let group = resolve_group_field(&self.schema, by)?;
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
+            return Ok(Vec::new());
+        };
+        let _retention = self.pipeline.lock_for_read();
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+        let mut indexes: Vec<usize> = specs.iter().map(|spec| spec.index).collect();
+        if !indexes.contains(&group.index) {
+            indexes.push(group.index);
+        }
+        let mut groups: BTreeMap<GroupKey, Vec<RunningStat>> = BTreeMap::new();
+        let mut dictionaries = HashMap::new();
+        for block in blocks {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
+                return Err(Error::event("query response size limit exceeded"));
+            }
+            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let nrows = block_row_count(&payload)?;
+            require_header_row_count(block.row_count, nrows)?;
+            let mut captures = capture_columns(indexes.iter().copied());
+            visit_matching_timestamps(
+                &self.schema,
+                &payload,
+                from_ms,
+                to_ms,
+                &resolved.predicates,
+                &resolved.ranges,
+                &mut captures,
+                |ts, row, captured| {
+                    let key = group_key_from_row(&self.schema, &group, ts, row, captured)?;
+                    if groups.len() >= MAX_HISTOGRAM_BUCKETS && !groups.contains_key(&key) {
+                        return Err(Error::event("stats would emit more than 4096 groups"));
+                    }
+                    let running = groups
+                        .entry(key)
+                        .or_insert_with(|| specs.iter().cloned().map(RunningStat::new).collect());
+                    for stat in running.iter_mut() {
+                        let value = stat_value(&self.schema, stat, ts, row, captured)?;
+                        stat.absorb(value)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        groups
+            .into_iter()
+            .map(|(key, running)| {
+                let columns = running
+                    .into_iter()
+                    .map(RunningStat::finish)
+                    .collect::<Result<_>>()?;
+                Ok(StatGroup {
+                    key: key.scalar(),
+                    columns,
+                })
+            })
+            .collect()
     }
 
     /// Delete every block whose maximum timestamp is strictly less than `cutoff_ms`.
@@ -974,6 +1064,7 @@ impl ResolvedScan {
     }
 }
 
+#[derive(Clone)]
 struct ResolvedStat {
     index: usize,
     name: String,
@@ -981,6 +1072,35 @@ struct ResolvedStat {
     sum: bool,
     min: bool,
     max: bool,
+}
+
+struct ResolvedGroup {
+    index: usize,
+    name: String,
+    ty: FieldType,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum GroupKey {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Timestamp(i64),
+    Decimal(i128),
+    Str(String),
+}
+
+impl GroupKey {
+    fn scalar(&self) -> Scalar {
+        match self {
+            GroupKey::Null => Scalar::Null,
+            GroupKey::Bool(value) => Scalar::Bool(*value),
+            GroupKey::Int(value) => Scalar::Int(*value),
+            GroupKey::Timestamp(value) => Scalar::Timestamp(*value),
+            GroupKey::Decimal(value) => Scalar::Decimal(*value),
+            GroupKey::Str(value) => Scalar::Str(value.clone()),
+        }
+    }
 }
 
 struct RunningStat {
@@ -1175,6 +1295,84 @@ fn resolve_stat_requests(schema: &Schema, stats: &[StatRequest]) -> Result<Vec<R
         return Err(Error::event("at least one of sum, min, or max is required"));
     }
     Ok(resolved)
+}
+
+fn resolve_group_field(schema: &Schema, by: &str) -> Result<ResolvedGroup> {
+    if by.is_empty() {
+        return Err(Error::event("group field name is empty"));
+    }
+    let index = schema
+        .fields
+        .iter()
+        .position(|field| field.name == by)
+        .ok_or_else(|| Error::schema(format!("unknown group field `{by}`")))?;
+    let ty = schema.fields[index].ty;
+    if !matches!(
+        ty,
+        FieldType::Int
+            | FieldType::Timestamp
+            | FieldType::Decimal { .. }
+            | FieldType::Bool
+            | FieldType::String
+            | FieldType::Text
+    ) {
+        return Err(Error::schema(format!(
+            "group does not apply to {} column `{by}`",
+            ty.name()
+        )));
+    }
+    Ok(ResolvedGroup {
+        index,
+        name: by.to_string(),
+        ty,
+    })
+}
+
+fn group_key_from_row(
+    schema: &Schema,
+    group: &ResolvedGroup,
+    ts: i64,
+    row: usize,
+    captures: &[CapturedColumn],
+) -> Result<GroupKey> {
+    let scalar = if group.index == schema.timestamp_index {
+        Scalar::Timestamp(ts)
+    } else {
+        let slot = captures
+            .iter()
+            .find(|column| column.index == group.index)
+            .ok_or_else(|| Error::corrupt(format!("field `{}` was not decoded", group.name)))?;
+        slot.values
+            .get(row)
+            .cloned()
+            .ok_or_else(|| Error::corrupt(format!("field `{}` is missing a row", group.name)))?
+    };
+    match (group.ty, scalar) {
+        (_, Scalar::Null) => Ok(GroupKey::Null),
+        (FieldType::Bool, Scalar::Bool(value)) => Ok(GroupKey::Bool(value)),
+        (FieldType::Int, Scalar::Int(value)) => Ok(GroupKey::Int(value)),
+        (FieldType::Timestamp, Scalar::Timestamp(value)) => Ok(GroupKey::Timestamp(value)),
+        (FieldType::Decimal { .. }, Scalar::Decimal(value)) => Ok(GroupKey::Decimal(value)),
+        (FieldType::String | FieldType::Text, Scalar::Str(value)) => Ok(GroupKey::Str(value)),
+        _ => Err(Error::corrupt(format!(
+            "field `{}` has a value that does not match its type",
+            group.name
+        ))),
+    }
+}
+
+fn capture_columns(indexes: impl IntoIterator<Item = usize>) -> Vec<CapturedColumn> {
+    let mut captures: Vec<CapturedColumn> = Vec::new();
+    for index in indexes {
+        if captures.iter().any(|column| column.index == index) {
+            continue;
+        }
+        captures.push(CapturedColumn {
+            index,
+            values: Vec::new(),
+        });
+    }
+    captures
 }
 
 fn empty_column_stats(columns: &[ResolvedStat]) -> Vec<ColumnStats> {
@@ -5914,6 +6112,305 @@ mod tests {
             matches!(negative, Err(Error::Event(ref message)) if message.contains("overflow")),
             "{negative:?}"
         );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn aggregate_grouped_orders_one_column_and_skips_unread_blocks() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        let rows = [
+            (1000i64, Some(1i64), true, "click", Some("b"), "1.00"),
+            (2000, Some(5), false, "click", Some("A"), "2.00"),
+            (3000, None, true, "view", Some("a"), "4.00"),
+            (4000, Some(-1), false, "view", None, "10.00"),
+        ];
+        for (ts, user, ok, action, note, amount) in rows {
+            let mut obj = serde_json::json!({
+                "ts": ts,
+                "score": 1.0,
+                "ok": ok,
+                "action": action,
+                "amount": amount,
+            });
+            if let Some(user) = user {
+                obj["user_id"] = serde_json::json!(user);
+            }
+            if let Some(note) = note {
+                obj["note"] = serde_json::json!(note);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        let missing_action = serde_json::json!({
+            "ts": 2500,
+            "user_id": 9,
+            "score": 1.0,
+            "ok": false,
+            "amount": "8.00",
+        });
+        store
+            .append_json(&serde_json::to_vec(&missing_action).unwrap())
+            .unwrap();
+        store.flush().unwrap();
+
+        let stats = [stat_req("amount", true, true, true)];
+        let groups = store
+            .aggregate_grouped(1000, 3000, &[], &stats, "action")
+            .unwrap();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].key, Scalar::Null);
+        assert_eq!(exact_sum(&groups[0].columns, "amount"), (800, true));
+        assert_eq!(groups[1].key, Scalar::Str("click".into()));
+        assert_eq!(exact_sum(&groups[1].columns, "amount"), (300, true));
+        assert_eq!(groups[1].columns[0].min, Some(Some(Scalar::Decimal(100))));
+        assert_eq!(groups[1].columns[0].max, Some(Some(Scalar::Decimal(200))));
+        assert_eq!(groups[2].key, Scalar::Str("view".into()));
+        assert_eq!(exact_sum(&groups[2].columns, "amount"), (400, true));
+        assert_eq!(groups[2].columns[0].min, Some(Some(Scalar::Decimal(400))));
+        assert_eq!(groups[2].columns[0].max, Some(Some(Scalar::Decimal(400))));
+
+        let ungrouped = store
+            .aggregate_with_filter(1000, 3000, &[], &stats)
+            .unwrap();
+        assert_eq!(exact_sum(&ungrouped, "amount"), (300 + 400 + 800, true));
+
+        let none = store
+            .aggregate_grouped(
+                1000,
+                3000,
+                &[Predicate::Eq("action".into(), "missing".into())],
+                &stats,
+                "action",
+            )
+            .unwrap();
+        assert!(none.is_empty());
+
+        let only_click = store
+            .aggregate_grouped(
+                1000,
+                3000,
+                &[Predicate::Eq("action".into(), "click".into())],
+                &stats,
+                "action",
+            )
+            .unwrap();
+        assert_eq!(only_click.len(), 1);
+        assert_eq!(only_click[0].key, Scalar::Str("click".into()));
+        assert_eq!(exact_sum(&only_click[0].columns, "amount"), (300, true));
+
+        let cut = store
+            .aggregate_grouped(1000, 1000, &[], &stats, "action")
+            .unwrap();
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].key, Scalar::Str("click".into()));
+        assert_eq!(exact_sum(&cut[0].columns, "amount"), (100, true));
+
+        let by_amount = store
+            .aggregate_grouped(
+                1000,
+                4000,
+                &[],
+                &[stat_req("amount", true, false, false)],
+                "amount",
+            )
+            .unwrap();
+        let amount_keys: Vec<_> = by_amount
+            .iter()
+            .map(|group| match group.key {
+                Scalar::Decimal(value) => value,
+                _ => panic!("amount key {:?}", group.key),
+            })
+            .collect();
+        assert_eq!(amount_keys, vec![100, 200, 400, 800, 1000]);
+
+        let by_user = store
+            .aggregate_grouped(
+                1000,
+                4000,
+                &[],
+                &[stat_req("user_id", true, false, false)],
+                "user_id",
+            )
+            .unwrap();
+        let user_keys: Vec<_> = by_user.iter().map(|group| group.key.clone()).collect();
+        assert_eq!(
+            user_keys,
+            vec![
+                Scalar::Null,
+                Scalar::Int(-1),
+                Scalar::Int(1),
+                Scalar::Int(5),
+                Scalar::Int(9),
+            ]
+        );
+
+        let by_ok = store
+            .aggregate_grouped(1000, 4000, &[], &stats, "ok")
+            .unwrap();
+        assert_eq!(by_ok[0].key, Scalar::Bool(false));
+        assert_eq!(by_ok[1].key, Scalar::Bool(true));
+        assert_eq!(
+            exact_sum(&by_ok[0].columns, "amount"),
+            (200 + 800 + 1000, true)
+        );
+        assert_eq!(exact_sum(&by_ok[1].columns, "amount"), (100 + 400, true));
+
+        let by_note = store
+            .aggregate_grouped(1000, 3000, &[], &stats, "note")
+            .unwrap();
+        let note_keys: Vec<_> = by_note.iter().map(|group| group.key.clone()).collect();
+        assert_eq!(
+            note_keys,
+            vec![
+                Scalar::Null,
+                Scalar::Str("A".into()),
+                Scalar::Str("a".into()),
+                Scalar::Str("b".into()),
+            ]
+        );
+
+        let by_ts = store
+            .aggregate_grouped(1000, 2000, &[], &[stat_req("ts", true, true, true)], "ts")
+            .unwrap();
+        assert_eq!(by_ts[0].key, Scalar::Timestamp(1000));
+        assert_eq!(by_ts[1].key, Scalar::Timestamp(2000));
+        assert_eq!(exact_sum(&by_ts[0].columns, "ts"), (1000, true));
+
+        let float = store.aggregate_grouped(0, 10, &[], &stats, "score");
+        assert!(matches!(float, Err(Error::Schema(_))), "{float:?}");
+        let json_schema = dir.path().join("json-schema.json");
+        fs::write(
+            &json_schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let json_store =
+            Store::open_with(dir.path().join("json-data"), &json_schema, test_options(8)).unwrap();
+        let json_group = json_store.aggregate_grouped(0, 10, &[], &stats, "props");
+        assert!(
+            matches!(json_group, Err(Error::Schema(_))),
+            "{json_group:?}"
+        );
+        let empty_name = store.aggregate_grouped(0, 10, &[], &stats, "");
+        assert!(matches!(empty_name, Err(Error::Event(_))), "{empty_name:?}");
+        let unknown = store.aggregate_grouped(0, 10, &[], &stats, "missing");
+        assert!(matches!(unknown, Err(Error::Schema(_))), "{unknown:?}");
+        assert_eq!(store.count(1000, 4000).unwrap(), 5);
+        store.close().unwrap();
+        json_store.close().unwrap();
+
+        let wide = TempDir::new();
+        let schema = write_schema(wide.path());
+        let data = wide.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(512)).unwrap();
+        for id in 0..4097i64 {
+            store
+                .append_json(&event(id, Some(id), "k", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let capped = store
+            .aggregate_grouped(
+                0,
+                4095,
+                &[],
+                &[stat_req("user_id", true, false, false)],
+                "user_id",
+            )
+            .unwrap();
+        assert_eq!(capped.len(), 4096);
+        assert_eq!(capped[0].key, Scalar::Int(0));
+        assert_eq!(capped[4095].key, Scalar::Int(4095));
+        let overflow = store.aggregate_grouped(
+            0,
+            4096,
+            &[],
+            &[stat_req("user_id", true, false, false)],
+            "user_id",
+        );
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("4096")),
+            "{overflow:?}"
+        );
+        store.close().unwrap();
+
+        let skipped = TempDir::new();
+        let schema = write_schema(skipped.path());
+        let data = skipped.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, user, action) in [
+            (10i64, 1i64, "low"),
+            (11, 2, "low"),
+            (20, 10, "high"),
+            (21, 11, "high"),
+        ] {
+            store
+                .append_json(&event(ts, Some(user), action, None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let gt = [Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(5))];
+        let resolved = resolve_predicates(store.schema(), &gt).unwrap();
+        assert_eq!(store.blocks_in_range(0, 100, &resolved).len(), 1);
+        let victim = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.max_ts <= 11)
+            .cloned()
+            .unwrap();
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[victim.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let kept = store
+            .aggregate_grouped(
+                0,
+                100,
+                &gt,
+                &[stat_req("user_id", true, false, false)],
+                "action",
+            )
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].key, Scalar::Str("high".into()));
+        assert_eq!(exact_sum(&kept[0].columns, "user_id"), (21, true));
+        let later = store
+            .aggregate_grouped(
+                20,
+                21,
+                &[],
+                &[stat_req("user_id", true, false, false)],
+                "action",
+            )
+            .unwrap();
+        assert_eq!(later[0].key, Scalar::Str("high".into()));
+        let unread = store.aggregate_grouped(
+            victim.min_ts,
+            victim.max_ts,
+            &[],
+            &[stat_req("user_id", true, false, false)],
+            "score",
+        );
+        assert!(matches!(unread, Err(Error::Schema(_))), "{unread:?}");
+        assert!(store
+            .aggregate_with_filter(
+                victim.min_ts,
+                victim.max_ts,
+                &[],
+                &[stat_req("user_id", true, false, false)]
+            )
+            .is_err());
         store.close().unwrap();
     }
 }
