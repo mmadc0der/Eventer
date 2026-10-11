@@ -4,7 +4,7 @@ Relative size of the stock benchmark across shipped formats. Every row is one `c
 
 `stored_data_bytes` is the segment data file plus the dictionary sidecar. `stored_index_bytes` is the sparse index plus, from the zone-map version on, the zone file. "Smaller" is `(previous − this) / previous`. A negative index change is growth.
 
-The first store is the baseline for the last column. Current `main` (`305a4d5`) keeps 3,639 data bytes against that baseline of 394,005 (108× fewer data bytes, 99.1% smaller) and 4,524 bytes of data plus index against 395,973 (87.5× fewer, 98.9% smaller).
+The first store is the baseline for the last column. Current `main` (`7829a39`) keeps 3,639 data bytes against that baseline of 394,005 (108× fewer data bytes, 99.1% smaller) and 4,313 bytes of data plus index against 395,973 (91.8× fewer, 98.9% smaller).
 
 | Commit | What changed | Data | vs previous data | Index | vs previous index | Data + index | vs previous total | Data vs first store |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -28,8 +28,9 @@ The first store is the baseline for the last column. Current `main` (`305a4d5`) 
 | `10ae7fc` | One checksum for the zone file | 3639 | 0% | 1091 | 21.4% smaller | 4730 | 5.9% smaller | 99.1% smaller |
 | `3147df3` | Delta-coded sparse index | 3639 | 0% | 885 | 18.9% smaller | 4524 | 4.4% smaller | 99.1% smaller |
 | `305a4d5` | Time-bucket counts | 3639 | 0% | 885 | 0% | 4524 | 0% | 99.1% smaller |
+| `96e1ceb` | Timestamp zone bounds taken from the sparse index | 3639 | 0% | 674 | 23.8% smaller | 4313 | 4.7% smaller | 99.1% smaller |
 
-JSON columns did not change this workload: the bench schema has no `json` field. Equality filters, schema append, retention, batch ingest, `limit`/`offset`, and `GET /events/count` sit between these commits and do not change the encoder. The two endpoints that were measured again, HTTP drop (`d194464`) and time-bucket counts (`305a4d5`), match the format commit they sit on.
+JSON columns did not change this workload: the bench schema has no `json` field. Equality filters, schema append, retention, batch ingest, `limit`/`offset`, `GET /events/count`, numeric range predicates (`208c7b0`), and directory rewrite (`7829a39`) sit between these commits and do not change the encoder. HTTP drop (`d194464`), time-bucket counts (`305a4d5`), range predicates, and directory rewrite match the format commit they sit on.
 
 Zone maps make the index total larger because the zone file did not exist before. The sparse index underneath was still 1,968 bytes until the later index compression.
 
