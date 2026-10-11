@@ -7,8 +7,10 @@
 //! fields. That index file is a plain zstd frame when the frame is smaller than
 //! the raw bytes, and an older raw index still opens. A zone map stores per-column
 //! equality stats (exact sets or a bloom filter for strings, min/max for numbers)
-//! so a filtered query can skip the payload as well. Equality predicates that still
-//! need the block are applied while it is decoded.
+//! so a filtered query can skip the payload as well. Equality predicates and
+//! numeric ranges that still need the block are applied while it is decoded.
+//! An integer or decimal zone whose min/max cannot overlap the range is not read.
+//! Float zones stay unknown and are filtered from the decoded values.
 //! [`Store::count_with_filter`](store::Store::count_with_filter) counts those
 //! rows without building the JSON array. A block with no predicates reads
 //! timestamps only.
@@ -32,7 +34,9 @@ mod zone;
 
 pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
-pub use store::{HistogramBucket, Predicate, Stats, Store, StoreOptions, MAX_HISTOGRAM_BUCKETS};
+pub use store::{
+    CmpOp, HistogramBucket, Predicate, Stats, Store, StoreOptions, MAX_HISTOGRAM_BUCKETS,
+};
 pub use value::{scalar_from_literal, Scalar};
 
 /// Uncompressed size of each column for one block, including its null bitmap.

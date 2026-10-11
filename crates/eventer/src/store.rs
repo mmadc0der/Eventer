@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::codec::{
-    accumulate_histogram, block_row_count, count_rows_in_range_filtered,
-    decode_rows_in_range_filtered, read_timestamp_column, ColumnPredicate,
+    accumulate_histogram_filtered, block_row_count, count_rows_filtered, decode_rows_filtered,
+    range_impossible, range_matches, read_timestamp_column, tighter_lower, tighter_upper,
+    ColumnPredicate, RangeEnd, RangeFilter,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -73,16 +74,34 @@ impl Default for StoreOptions {
     }
 }
 
-/// Equality constraint pushed into block decoding.
+/// Ordered comparison. [`CmpOp::Gt`] and [`CmpOp::Lt`] are exclusive.
+/// [`CmpOp::Ge`] and [`CmpOp::Le`] are inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    /// `field > value`.
+    Gt,
+    /// `field >= value`.
+    Ge,
+    /// `field < value`.
+    Lt,
+    /// `field <= value`.
+    Le,
+}
+
+/// Constraint pushed into block decoding.
 ///
 /// Predicates on one query are AND-ed. [`Predicate::In`] matches any listed value.
 /// [`Scalar::Null`] matches a null column. An empty [`Predicate::In`] matches nothing.
+/// [`Predicate::Cmp`] compares an int, timestamp, decimal, or float column. Nulls
+/// do not match a range. A bool, string, text, or json column is rejected.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
     /// `field == value`, for example `Predicate::Eq("type".into(), "assistant".into())`.
     Eq(String, Scalar),
     /// `field` equals one of `values`.
     In(String, Vec<Scalar>),
+    /// `field` compared with `value` by [`CmpOp`].
+    Cmp(String, CmpOp, Scalar),
 }
 
 /// Append-only event store. Clone the directory handle by wrapping `Store` in `Arc`.
@@ -171,10 +190,13 @@ impl Store {
         self.query_with_filter(from_ms, to_ms, &[])
     }
 
-    /// Inclusive time range plus equality predicates.
+    /// Inclusive time range plus equality predicates and numeric ranges.
     ///
     /// Blocks whose zone map cannot contain the requested values are not read.
-    /// Each predicate on a block that is read is applied while the block is decoded.
+    /// An integer or decimal zone whose max is below a lower bound, or whose min
+    /// is above an upper bound, is not read, including exclusive bounds. A float
+    /// zone is not a skip. Each predicate on a block that is read is applied
+    /// while the block is decoded. Nulls do not match a range.
     /// If a filter column's constant or dictionary cannot contain the requested value,
     /// the rest of that block is not decoded. Unknown fields and values of the wrong
     /// column type return [`Error::Schema`]. Checks run before [`Store::flush`].
@@ -227,7 +249,7 @@ impl Store {
             let string_budget = remaining_query_bytes(response_bytes)?;
             let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
             let whole = returns_whole_block(
-                resolved.is_empty(),
+                resolved.unfiltered(),
                 contained,
                 skipped,
                 offset,
@@ -241,7 +263,7 @@ impl Store {
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
-            if resolved.is_empty()
+            if resolved.unfiltered()
                 && contained
                 && offset_covers_block(offset, skipped, block.row_count)
             {
@@ -254,13 +276,14 @@ impl Store {
             if whole && rows_out.len() + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
-            let rows = decode_rows_in_range_filtered(
+            let rows = decode_rows_filtered(
                 &self.schema,
                 &payload,
                 from_ms,
                 to_ms,
                 string_budget,
-                &resolved,
+                &resolved.predicates,
+                &resolved.ranges,
             )?;
             let mut page_done = false;
             for row in rows {
@@ -348,7 +371,7 @@ impl Store {
             let string_budget = remaining_query_bytes(out.len())?;
             let contained = block.min_ts >= from_ms && block.max_ts <= to_ms;
             let whole = returns_whole_block(
-                resolved.is_empty(),
+                resolved.unfiltered(),
                 contained,
                 skipped,
                 offset,
@@ -362,7 +385,7 @@ impl Store {
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
-            if resolved.is_empty()
+            if resolved.unfiltered()
                 && contained
                 && offset_covers_block(offset, skipped, block.row_count)
             {
@@ -375,13 +398,14 @@ impl Store {
             if whole && row_count + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
-            let rows = decode_rows_in_range_filtered(
+            let rows = decode_rows_filtered(
                 &self.schema,
                 &payload,
                 from_ms,
                 to_ms,
                 string_budget,
-                &resolved,
+                &resolved.predicates,
+                &resolved.ranges,
             )?;
             let mut page_done = false;
             for row in rows {
@@ -456,8 +480,14 @@ impl Store {
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
-            let matched =
-                count_rows_in_range_filtered(&self.schema, &payload, from_ms, to_ms, &resolved)?;
+            let matched = count_rows_filtered(
+                &self.schema,
+                &payload,
+                from_ms,
+                to_ms,
+                &resolved.predicates,
+                &resolved.ranges,
+            )?;
             total = total
                 .checked_add(matched)
                 .ok_or_else(|| Error::event("event count overflow"))?;
@@ -511,12 +541,13 @@ impl Store {
             let payload = self.read_block_bytes(&block, &mut dictionaries)?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
-            accumulate_histogram(
+            accumulate_histogram_filtered(
                 &self.schema,
                 &payload,
                 from_ms,
                 to_ms,
-                &resolved,
+                &resolved.predicates,
+                &resolved.ranges,
                 bucket_ms,
                 span.first_start,
                 &mut counts,
@@ -565,12 +596,12 @@ impl Store {
         from_ms: i64,
         to_ms: i64,
         predicates: &[Predicate],
-    ) -> Result<Option<Vec<ColumnPredicate>>> {
+    ) -> Result<Option<ResolvedScan>> {
         if from_ms > to_ms {
             return Ok(None);
         }
         let resolved = resolve_predicates(&self.schema, predicates)?;
-        if resolved.iter().any(|pred| pred.allowed.is_empty()) {
+        if resolved.impossible {
             return Ok(None);
         }
         self.flush()?;
@@ -603,8 +634,11 @@ impl Store {
         &self,
         from_ms: i64,
         to_ms: i64,
-        resolved: &[ColumnPredicate],
+        resolved: &ResolvedScan,
     ) -> Vec<segment::BlockMeta> {
+        if resolved.impossible {
+            return Vec::new();
+        }
         let catalog = self.catalog();
         let mut blocks = Vec::new();
         for segment in &catalog.segments {
@@ -612,11 +646,9 @@ impl Store {
                 if block.max_ts < from_ms || block.min_ts > to_ms {
                     continue;
                 }
-                if segment
-                    .zones
-                    .get(index)
-                    .is_some_and(|zone| !crate::zone::may_match(zone, resolved))
-                {
+                if segment.zones.get(index).is_some_and(|zone| {
+                    !crate::zone::may_match_ranges(zone, &resolved.predicates, &resolved.ranges)
+                }) {
                     continue;
                 }
                 blocks.push(block.clone());
@@ -642,39 +674,151 @@ impl Drop for Store {
 /// Bytes already written, including the opening `[`. A further row needs at
 /// least one payload byte plus the closing `]`, so a full buffer stops the
 /// next block before it is read or decoded.
-fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<Vec<ColumnPredicate>> {
+struct ResolvedScan {
+    predicates: Vec<ColumnPredicate>,
+    ranges: Vec<RangeFilter>,
+    impossible: bool,
+}
+
+impl ResolvedScan {
+    fn unfiltered(&self) -> bool {
+        self.predicates.is_empty() && self.ranges.is_empty()
+    }
+}
+
+fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<ResolvedScan> {
     let mut grouped: Vec<ColumnPredicate> = Vec::new();
+    let mut ranges: Vec<RangeFilter> = Vec::new();
     for predicate in predicates {
-        let (name, values) = match predicate {
-            Predicate::Eq(name, value) => (name.as_str(), vec![value.clone()]),
-            Predicate::In(name, values) => (name.as_str(), values.clone()),
-        };
-        let index = schema
-            .fields
-            .iter()
-            .position(|field| field.name == name)
-            .ok_or_else(|| Error::schema(format!("unknown filter field `{name}`")))?;
-        let ty = schema.fields[index].ty;
-        for value in &values {
-            if !value::scalar_matches_field(value, ty) {
-                return Err(Error::schema(format!(
-                    "filter value for `{name}` does not match type {}",
-                    ty.name()
-                )));
+        match predicate {
+            Predicate::Eq(name, value) => {
+                push_equality(schema, &mut grouped, name, vec![value.clone()])?;
+            }
+            Predicate::In(name, values) => {
+                push_equality(schema, &mut grouped, name, values.clone())?;
+            }
+            Predicate::Cmp(name, op, value) => {
+                push_range(schema, &mut ranges, name, *op, value)?;
             }
         }
-        if let Some(existing) = grouped.iter_mut().find(|pred| pred.index == index) {
+    }
+    for range in &ranges {
+        if let Some(existing) = grouped.iter_mut().find(|pred| pred.index == range.index) {
             existing
                 .allowed
-                .retain(|current| values.iter().any(|next| next == current));
-        } else {
-            grouped.push(ColumnPredicate {
-                index,
-                allowed: values,
-            });
+                .retain(|current| range_matches(current, range));
         }
     }
-    Ok(grouped)
+    let impossible =
+        grouped.iter().any(|pred| pred.allowed.is_empty()) || ranges.iter().any(range_impossible);
+    Ok(ResolvedScan {
+        predicates: grouped,
+        ranges,
+        impossible,
+    })
+}
+
+fn push_equality(
+    schema: &Schema,
+    grouped: &mut Vec<ColumnPredicate>,
+    name: &str,
+    values: Vec<Scalar>,
+) -> Result<()> {
+    let index = field_index(schema, name)?;
+    let ty = schema.fields[index].ty;
+    for value in &values {
+        if !value::scalar_matches_field(value, ty) {
+            return Err(Error::schema(format!(
+                "filter value for `{name}` does not match type {}",
+                ty.name()
+            )));
+        }
+    }
+    if let Some(existing) = grouped.iter_mut().find(|pred| pred.index == index) {
+        existing
+            .allowed
+            .retain(|current| values.iter().any(|next| next == current));
+    } else {
+        grouped.push(ColumnPredicate {
+            index,
+            allowed: values,
+        });
+    }
+    Ok(())
+}
+
+fn push_range(
+    schema: &Schema,
+    ranges: &mut Vec<RangeFilter>,
+    name: &str,
+    op: CmpOp,
+    value: &Scalar,
+) -> Result<()> {
+    let index = field_index(schema, name)?;
+    let ty = schema.fields[index].ty;
+    if !matches!(
+        ty,
+        crate::schema::FieldType::Int
+            | crate::schema::FieldType::Timestamp
+            | crate::schema::FieldType::Float
+            | crate::schema::FieldType::Decimal { .. }
+    ) {
+        return Err(Error::schema(format!(
+            "range filters do not apply to {} column `{name}`",
+            ty.name()
+        )));
+    }
+    if !value::scalar_matches_field(value, ty) || matches!(value, Scalar::Null) {
+        return Err(Error::schema(format!(
+            "filter value for `{name}` does not match type {}",
+            ty.name()
+        )));
+    }
+    if let Scalar::Float(number) = value {
+        if !number.is_finite() {
+            return Err(Error::schema(format!(
+                "filter value for `{name}` must be a finite number"
+            )));
+        }
+    }
+    let end = RangeEnd {
+        inclusive: matches!(op, CmpOp::Ge | CmpOp::Le),
+        value: value.clone(),
+    };
+    let lower = matches!(op, CmpOp::Gt | CmpOp::Ge);
+    if let Some(existing) = ranges.iter_mut().find(|range| range.index == index) {
+        if lower {
+            existing.lower = Some(match existing.lower.clone() {
+                Some(previous) => tighter_lower(previous, end),
+                None => end,
+            });
+        } else {
+            existing.upper = Some(match existing.upper.clone() {
+                Some(previous) => tighter_upper(previous, end),
+                None => end,
+            });
+        }
+    } else {
+        let (lower_end, upper_end) = if lower {
+            (Some(end), None)
+        } else {
+            (None, Some(end))
+        };
+        ranges.push(RangeFilter {
+            index,
+            lower: lower_end,
+            upper: upper_end,
+        });
+    }
+    Ok(())
+}
+
+fn field_index(schema: &Schema, name: &str) -> Result<usize> {
+    schema
+        .fields
+        .iter()
+        .position(|field| field.name == name)
+        .ok_or_else(|| Error::schema(format!("unknown filter field `{name}`")))
 }
 
 enum Take {
@@ -2001,6 +2145,199 @@ mod tests {
             )
             .unwrap();
         assert_eq!(same.len(), 2);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn range_filters_compare_numbers_and_skip_a_low_integer_zone() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        for (ts, user, amount, score) in [
+            (1000i64, Some(1i64), "1.00", 1.0f64),
+            (2000, Some(5), "5.00", 5.0),
+            (3000, Some(9), "9.00", 9.0),
+            (4000, None, "5.00", 0.0),
+        ] {
+            let mut obj = serde_json::json!({
+                "ts": ts,
+                "score": score,
+                "ok": user.is_some(),
+                "action": "click",
+                "amount": amount,
+            });
+            if let Some(user) = user {
+                obj["user_id"] = serde_json::json!(user);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        let ids = |op, bound: i64| -> Vec<Option<i64>> {
+            store
+                .query_with_filter(
+                    1000,
+                    4000,
+                    &[Predicate::Cmp("user_id".into(), op, Scalar::Int(bound))],
+                )
+                .unwrap()
+                .into_iter()
+                .map(|row| match &row.values[1] {
+                    Scalar::Int(value) => Some(*value),
+                    Scalar::Null => None,
+                    other => panic!("user_id {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            ids(CmpOp::Ge, 5),
+            vec![Some(5), Some(9)],
+            "ge includes the bound and every larger int"
+        );
+        assert_eq!(ids(CmpOp::Gt, 5), vec![Some(9)]);
+        assert_eq!(ids(CmpOp::Le, 5), vec![Some(1), Some(5)]);
+        assert_eq!(ids(CmpOp::Lt, 5), vec![Some(1)]);
+
+        let decimal = crate::schema::FieldType::Decimal { scale: 2 };
+        let amount = crate::value::scalar_from_literal(decimal, "5.00").unwrap();
+        let below = store
+            .query_with_filter(
+                1000,
+                4000,
+                &[Predicate::Cmp("amount".into(), CmpOp::Lt, amount)],
+            )
+            .unwrap();
+        assert_eq!(below.len(), 1);
+        assert_eq!(row_value(&store, &below[0])["amount"], "1.00");
+
+        let above_score = store
+            .query_with_filter(
+                1000,
+                4000,
+                &[Predicate::Cmp(
+                    "score".into(),
+                    CmpOp::Gt,
+                    Scalar::Float(5.0),
+                )],
+            )
+            .unwrap();
+        assert_eq!(above_score.len(), 1);
+        assert_eq!(
+            row_value(&store, &above_score[0])["score"].as_f64(),
+            Some(9.0)
+        );
+
+        let ge = [Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(5))];
+        assert_eq!(store.count_with_filter(1000, 4000, &ge).unwrap(), 2);
+        assert_eq!(
+            store
+                .histogram_with_filter(1000, 4000, 1000, &ge)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            2
+        );
+        let page = store.query_window(1000, 4000, &ge, 1, Some(1)).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(row_value(&store, &page[0])["user_id"], 9);
+
+        let bad = store.query_with_filter(
+            1000,
+            4000,
+            &[Predicate::Cmp("action".into(), CmpOp::Gt, "a".into())],
+        );
+        assert!(matches!(bad, Err(Error::Schema(_))), "{bad:?}");
+        assert_eq!(store.count(1000, 4000).unwrap(), 4);
+        store.close().unwrap();
+
+        let low_dir = TempDir::new();
+        let schema = write_schema(low_dir.path());
+        let data = low_dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(10, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(11, Some(2), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(20, Some(10), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(21, Some(11), "click", None, "1.00"))
+            .unwrap();
+        store.flush().unwrap();
+        let gt = [Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(5))];
+        let resolved = resolve_predicates(store.schema(), &gt).unwrap();
+        assert_eq!(store.blocks_in_range(0, 100, &resolved).len(), 1);
+        let victim = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.max_ts <= 11)
+            .cloned()
+            .unwrap();
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[victim.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(store.query_with_filter(0, 100, &gt).unwrap().len(), 2);
+        assert_eq!(store.count_with_filter(0, 100, &gt).unwrap(), 2);
+        assert_eq!(
+            store
+                .histogram_with_filter(0, 100, 1, &gt)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            2
+        );
+        let unread = store.query_with_filter(
+            0,
+            100,
+            &[Predicate::Cmp("ok".into(), CmpOp::Gt, Scalar::Bool(true))],
+        );
+        assert!(matches!(unread, Err(Error::Schema(_))), "{unread:?}");
+        assert!(store.query(victim.min_ts, victim.max_ts).is_err());
+        store.close().unwrap();
+
+        let float_dir = TempDir::new();
+        let schema = write_schema(float_dir.path());
+        let data = float_dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(1)).unwrap();
+        for (ts, score) in [(1i64, 1.0), (2, 9.0)] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": ts,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let low = store.catalog().segments[0].blocks[0].clone();
+        assert!(low.max_ts <= 1);
+        let path = segment::data_path(&data, low.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[low.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let read = store.query_with_filter(
+            0,
+            10,
+            &[Predicate::Cmp(
+                "score".into(),
+                CmpOp::Gt,
+                Scalar::Float(5.0),
+            )],
+        );
+        assert!(read.is_err(), "a float zone is not a skip");
         store.close().unwrap();
     }
 

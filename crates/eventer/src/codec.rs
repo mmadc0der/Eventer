@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
@@ -79,11 +80,94 @@ pub(crate) struct ColumnPredicate {
     pub allowed: Vec<Scalar>,
 }
 
+/// One end of an ordered comparison. `inclusive` is false for `>` and `<`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RangeEnd {
+    pub inclusive: bool,
+    pub value: Scalar,
+}
+
+/// Inclusive or exclusive numeric bounds on one column. Missing ends are open.
+///
+/// A null never satisfies a range. Several bounds on the same column are already
+/// tightened to one lower end and one upper end.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RangeFilter {
+    pub index: usize,
+    pub lower: Option<RangeEnd>,
+    pub upper: Option<RangeEnd>,
+}
+
+pub(crate) fn cmp_numeric(left: &Scalar, right: &Scalar) -> Option<Ordering> {
+    match (left, right) {
+        (Scalar::Int(left), Scalar::Int(right)) => Some(left.cmp(right)),
+        (Scalar::Timestamp(left), Scalar::Timestamp(right)) => Some(left.cmp(right)),
+        (Scalar::Decimal(left), Scalar::Decimal(right)) => Some(left.cmp(right)),
+        (Scalar::Float(left), Scalar::Float(right)) => left.partial_cmp(right),
+        _ => None,
+    }
+}
+
+pub(crate) fn tighter_lower(left: RangeEnd, right: RangeEnd) -> RangeEnd {
+    tighter_end(left, right, true)
+}
+
+pub(crate) fn tighter_upper(left: RangeEnd, right: RangeEnd) -> RangeEnd {
+    tighter_end(left, right, false)
+}
+
+fn tighter_end(left: RangeEnd, right: RangeEnd, lower: bool) -> RangeEnd {
+    match cmp_numeric(&left.value, &right.value) {
+        Some(Ordering::Equal) => RangeEnd {
+            inclusive: left.inclusive && right.inclusive,
+            value: left.value,
+        },
+        Some(order) if (order == Ordering::Greater) == lower => left,
+        Some(_) => right,
+        None => left,
+    }
+}
+
+/// True when the two ends cannot contain a value, including equal exclusive ends.
+pub(crate) fn range_impossible(range: &RangeFilter) -> bool {
+    let (Some(lower), Some(upper)) = (&range.lower, &range.upper) else {
+        return false;
+    };
+    match cmp_numeric(&lower.value, &upper.value) {
+        Some(Ordering::Greater) => true,
+        Some(Ordering::Equal) => !(lower.inclusive && upper.inclusive),
+        Some(Ordering::Less) => false,
+        None => true,
+    }
+}
+
+pub(crate) fn range_matches(value: &Scalar, range: &RangeFilter) -> bool {
+    if matches!(value, Scalar::Null) {
+        return false;
+    }
+    if let Some(lower) = &range.lower {
+        match cmp_numeric(value, &lower.value) {
+            Some(Ordering::Greater) => {}
+            Some(Ordering::Equal) if lower.inclusive => {}
+            _ => return false,
+        }
+    }
+    if let Some(upper) = &range.upper {
+        match cmp_numeric(value, &upper.value) {
+            Some(Ordering::Less) => {}
+            Some(Ordering::Equal) if upper.inclusive => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Decode rows in `from_ms..=to_ms` that match every predicate.
 ///
 /// An empty predicate list uses one pass and the string budget. A constant or
 /// dictionary that cannot match still walks later column framing so a corrupt
 /// block returns [`Error::Corrupt`](crate::Error).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_rows_in_range_filtered(
     schema: &Schema,
     bytes: &[u8],
@@ -92,10 +176,33 @@ pub(crate) fn decode_rows_in_range_filtered(
     max_string_bytes: usize,
     predicates: &[ColumnPredicate],
 ) -> Result<Vec<Row>> {
-    if predicates.is_empty() {
+    decode_rows_filtered(
+        schema,
+        bytes,
+        from_ms,
+        to_ms,
+        max_string_bytes,
+        predicates,
+        &[],
+    )
+}
+
+pub(crate) fn decode_rows_filtered(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    max_string_bytes: usize,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+) -> Result<Vec<Row>> {
+    if predicates.is_empty() && ranges.is_empty() {
         return decode_rows(schema, bytes, Some((from_ms, to_ms)), max_string_bytes);
     }
-    if from_ms > to_ms || predicates.iter().any(|pred| pred.allowed.is_empty()) {
+    if from_ms > to_ms
+        || predicates.iter().any(|pred| pred.allowed.is_empty())
+        || ranges.iter().any(range_impossible)
+    {
         return Ok(Vec::new());
     }
     let nrows = block_row_count(bytes)?;
@@ -116,15 +223,21 @@ pub(crate) fn decode_rows_in_range_filtered(
                 if let Some(predicate) = predicates.iter().find(|pred| pred.index == rest) {
                     apply_eq(&mut mask, &nulls, &predicate.allowed);
                 }
+                if ranges.iter().any(|range| range.index == rest) {
+                    mask.fill(false);
+                }
                 columns[rest] = Some(nulls);
             }
             break;
         }
         let predicate = predicates.iter().find(|pred| pred.index == index);
+        let range = ranges.iter().find(|range| range.index == index);
         let is_timestamp = index == schema.timestamp_index;
-        let is_filter = is_timestamp || predicate.is_some();
+        let is_filter = is_timestamp || predicate.is_some() || range.is_some();
         let filters_remain = (index + 1..schema.fields.len()).any(|later| {
-            later == schema.timestamp_index || predicates.iter().any(|pred| pred.index == later)
+            later == schema.timestamp_index
+                || predicates.iter().any(|pred| pred.index == later)
+                || ranges.iter().any(|range| range.index == later)
         });
 
         if is_filter {
@@ -139,15 +252,21 @@ pub(crate) fn decode_rows_in_range_filtered(
                     let spans =
                         read_text_spans(bytes, &mut cursor, nrows, field.ty == FieldType::Json)?;
                     mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
+                    if range.is_some() {
+                        mask.fill(false);
+                    }
                     if !mask.iter().any(|keep| *keep) {
                         return finish_empty(schema, bytes, &mut cursor, index + 1);
                     }
                     // Clone only after every later predicate has updated `mask`.
                     deferred.push((index, field.ty == FieldType::Json, spans));
                     continue;
-                } else if column_misses(field.ty, bytes, cursor, nrows, &predicate.allowed)? {
-                    return finish_empty(schema, bytes, &mut cursor, index);
                 }
+            }
+            if (predicate.is_some() || range.is_some())
+                && column_misses(field.ty, bytes, cursor, nrows, predicate, range)?
+            {
+                return finish_empty(schema, bytes, &mut cursor, index);
             }
             let values = decode_column(field.ty, bytes, &mut cursor, nrows, &mask, &mut budget)?;
             if is_timestamp {
@@ -166,9 +285,7 @@ pub(crate) fn decode_rows_in_range_filtered(
                     }
                 }
             }
-            if let Some(predicate) = predicate {
-                apply_eq(&mut mask, &values, &predicate.allowed);
-            }
+            apply_constraints(&mut mask, &values, predicate, range);
             columns[index] = Some(values);
             if !mask.iter().any(|keep| *keep) {
                 return finish_empty(schema, bytes, &mut cursor, index + 1);
@@ -309,6 +426,7 @@ fn decode_rows(
 /// Predicates decode the timestamp column and the predicate columns. Columns
 /// after the last of those are not read. Columns between them are skipped, not
 /// turned into values.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn count_rows_in_range_filtered(
     schema: &Schema,
     bytes: &[u8],
@@ -316,8 +434,19 @@ pub(crate) fn count_rows_in_range_filtered(
     to_ms: i64,
     predicates: &[ColumnPredicate],
 ) -> Result<u64> {
+    count_rows_filtered(schema, bytes, from_ms, to_ms, predicates, &[])
+}
+
+pub(crate) fn count_rows_filtered(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+) -> Result<u64> {
     let mut total = 0u64;
-    visit_matching_timestamps(schema, bytes, from_ms, to_ms, predicates, |_ts| {
+    visit_matching_timestamps(schema, bytes, from_ms, to_ms, predicates, ranges, |_ts| {
         total = total
             .checked_add(1)
             .ok_or_else(|| Error::event("event count overflow"))?;
@@ -330,6 +459,7 @@ pub(crate) fn count_rows_in_range_filtered(
 ///
 /// `counts[i]` is the bucket starting at `first_start + i * bucket_ms`. A timestamp
 /// outside `from_ms..=to_ms` is not visited. `bucket_ms` is a positive integer.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn accumulate_histogram(
     schema: &Schema,
     bytes: &[u8],
@@ -340,7 +470,31 @@ pub(crate) fn accumulate_histogram(
     first_start: i128,
     counts: &mut [u64],
 ) -> Result<()> {
-    visit_matching_timestamps(schema, bytes, from_ms, to_ms, predicates, |ts| {
+    accumulate_histogram_filtered(
+        schema,
+        bytes,
+        from_ms,
+        to_ms,
+        predicates,
+        &[],
+        bucket_ms,
+        first_start,
+        counts,
+    )
+}
+
+pub(crate) fn accumulate_histogram_filtered(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+    bucket_ms: i64,
+    first_start: i128,
+    counts: &mut [u64],
+) -> Result<()> {
+    visit_matching_timestamps(schema, bytes, from_ms, to_ms, predicates, ranges, |ts| {
         let start = (ts as i128).div_euclid(i128::from(bucket_ms)) * i128::from(bucket_ms);
         let index = (start - first_start) / i128::from(bucket_ms);
         let index = usize::try_from(index).map_err(|_| Error::corrupt("histogram bucket index"))?;
@@ -371,12 +525,16 @@ fn visit_matching_timestamps(
     from_ms: i64,
     to_ms: i64,
     predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
     mut visit: impl FnMut(i64) -> Result<()>,
 ) -> Result<()> {
-    if from_ms > to_ms || predicates.iter().any(|pred| pred.allowed.is_empty()) {
+    if from_ms > to_ms
+        || predicates.iter().any(|pred| pred.allowed.is_empty())
+        || ranges.iter().any(range_impossible)
+    {
         return Ok(());
     }
-    if predicates.is_empty() {
+    if predicates.is_empty() && ranges.is_empty() {
         let timestamps = read_timestamp_column(schema, bytes)?;
         for ts in timestamps {
             if ts >= from_ms && ts <= to_ms {
@@ -389,6 +547,7 @@ fn visit_matching_timestamps(
     let last_needed = predicates
         .iter()
         .map(|pred| pred.index)
+        .chain(ranges.iter().map(|range| range.index))
         .fold(schema.timestamp_index, usize::max);
     let mut cursor = 4usize;
     let mut mask = vec![true; nrows];
@@ -405,12 +564,16 @@ fn visit_matching_timestamps(
                     let nulls = vec![Scalar::Null; nrows];
                     apply_eq(&mut mask, &nulls, &predicate.allowed);
                 }
+                if ranges.iter().any(|range| range.index == rest) {
+                    mask.fill(false);
+                }
             }
             break;
         }
         let predicate = predicates.iter().find(|pred| pred.index == index);
+        let range = ranges.iter().find(|range| range.index == index);
         let is_timestamp = index == schema.timestamp_index;
-        if is_timestamp || predicate.is_some() {
+        if is_timestamp || predicate.is_some() || range.is_some() {
             if is_timestamp && timestamp_range_misses(bytes, cursor, nrows, from_ms, to_ms)? {
                 skip_column(field.ty, bytes, &mut cursor, nrows, true)?;
                 mask.fill(false);
@@ -424,12 +587,18 @@ fn visit_matching_timestamps(
                     let spans =
                         read_text_spans(bytes, &mut cursor, nrows, field.ty == FieldType::Json)?;
                     mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
-                    continue;
-                } else if column_misses(field.ty, bytes, cursor, nrows, &predicate.allowed)? {
-                    skip_column(field.ty, bytes, &mut cursor, nrows, is_timestamp)?;
-                    mask.fill(false);
+                    if range.is_some() {
+                        mask.fill(false);
+                    }
                     continue;
                 }
+            }
+            if (predicate.is_some() || range.is_some())
+                && column_misses(field.ty, bytes, cursor, nrows, predicate, range)?
+            {
+                skip_column(field.ty, bytes, &mut cursor, nrows, is_timestamp)?;
+                mask.fill(false);
+                continue;
             }
             let values = decode_column(field.ty, bytes, &mut cursor, nrows, &mask, &mut budget)?;
             if is_timestamp {
@@ -451,9 +620,7 @@ fn visit_matching_timestamps(
                 }
                 timestamps = Some(column);
             }
-            if let Some(predicate) = predicate {
-                apply_eq(&mut mask, &values, &predicate.allowed);
-            }
+            apply_constraints(&mut mask, &values, predicate, range);
         } else {
             skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
         }
@@ -2403,6 +2570,44 @@ fn apply_eq(mask: &mut [bool], values: &[Scalar], allowed: &[Scalar]) {
     }
 }
 
+fn apply_constraints(
+    mask: &mut [bool],
+    values: &[Scalar],
+    eq: Option<&ColumnPredicate>,
+    range: Option<&RangeFilter>,
+) {
+    if let Some(eq) = eq {
+        apply_eq(mask, values, &eq.allowed);
+    }
+    if let Some(range) = range {
+        for (row, value) in values.iter().enumerate() {
+            if mask[row] && !range_matches(value, range) {
+                mask[row] = false;
+            }
+        }
+    }
+}
+
+/// A constant column misses when neither its value nor a null can satisfy the
+/// filters. Nulls satisfy equality only, and only when the range is absent.
+fn constant_misses(
+    value: &Scalar,
+    has_null: bool,
+    eq: Option<&ColumnPredicate>,
+    range: Option<&RangeFilter>,
+) -> bool {
+    let value_hit = eq.is_none_or(|eq| eq.allowed.iter().any(|candidate| candidate == value))
+        && range.is_none_or(|range| range_matches(value, range));
+    let null_hit = has_null
+        && range.is_none()
+        && eq.is_some_and(|eq| {
+            eq.allowed
+                .iter()
+                .any(|candidate| matches!(candidate, Scalar::Null))
+        });
+    !value_hit && !null_hit
+}
+
 fn scalar_text_hit(allowed: &[Scalar], text: &str, json: bool) -> bool {
     allowed.iter().any(|value| match value {
         Scalar::Str(expected) if !json => expected == text,
@@ -2573,38 +2778,40 @@ fn column_misses(
     bytes: &[u8],
     start: usize,
     nrows: usize,
-    allowed: &[Scalar],
+    eq: Option<&ColumnPredicate>,
+    range: Option<&RangeFilter>,
 ) -> Result<bool> {
-    if allowed.is_empty() {
+    if eq.is_some_and(|eq| eq.allowed.is_empty()) || range.is_some_and(range_impossible) {
         return Ok(true);
     }
     let mut cursor = start;
     let present = read_present(bytes, &mut cursor, nrows)?;
     let (present_count, has_null) = present_stats(&present, nrows);
-    let null_ok = allowed.iter().any(|value| matches!(value, Scalar::Null));
     if present_count == 0 {
-        return Ok(!null_ok);
+        let null_hit = range.is_none()
+            && eq.is_some_and(|eq| {
+                eq.allowed
+                    .iter()
+                    .any(|candidate| matches!(candidate, Scalar::Null))
+            });
+        return Ok(!null_hit);
     }
     match ty {
         FieldType::String | FieldType::Text | FieldType::Json => Ok(false),
-        FieldType::Int => int_const_misses(bytes, &mut cursor, allowed, has_null, null_ok, false),
-        FieldType::Timestamp => {
-            int_const_misses(bytes, &mut cursor, allowed, has_null, null_ok, true)
-        }
-        FieldType::Float => float_const_misses(bytes, &mut cursor, allowed, has_null, null_ok),
-        FieldType::Bool => bool_const_misses(bytes, &mut cursor, allowed, has_null, null_ok),
-        FieldType::Decimal { .. } => {
-            decimal_const_misses(bytes, &mut cursor, allowed, has_null, null_ok)
-        }
+        FieldType::Int => int_const_misses(bytes, &mut cursor, has_null, eq, range, false),
+        FieldType::Timestamp => int_const_misses(bytes, &mut cursor, has_null, eq, range, true),
+        FieldType::Float => float_const_misses(bytes, &mut cursor, has_null, eq, range),
+        FieldType::Bool => bool_const_misses(bytes, &mut cursor, has_null, eq, range),
+        FieldType::Decimal { .. } => decimal_const_misses(bytes, &mut cursor, has_null, eq, range),
     }
 }
 
 fn int_const_misses(
     bytes: &[u8],
     cursor: &mut usize,
-    allowed: &[Scalar],
     has_null: bool,
-    null_ok: bool,
+    eq: Option<&ColumnPredicate>,
+    range: Option<&RangeFilter>,
     timestamp: bool,
 ) -> Result<bool> {
     let kind = read_u8(bytes, cursor)?;
@@ -2612,38 +2819,35 @@ fn int_const_misses(
         return Ok(false);
     }
     let base = read_i64(bytes, cursor)?;
-    let hit = allowed.iter().any(|value| match value {
-        Scalar::Int(number) if !timestamp => *number == base,
-        Scalar::Timestamp(number) if timestamp => *number == base,
-        _ => false,
-    });
-    Ok(!hit && !(has_null && null_ok))
+    let value = if timestamp {
+        Scalar::Timestamp(base)
+    } else {
+        Scalar::Int(base)
+    };
+    Ok(constant_misses(&value, has_null, eq, range))
 }
 
 fn float_const_misses(
     bytes: &[u8],
     cursor: &mut usize,
-    allowed: &[Scalar],
     has_null: bool,
-    null_ok: bool,
+    eq: Option<&ColumnPredicate>,
+    range: Option<&RangeFilter>,
 ) -> Result<bool> {
     let kind = read_u8(bytes, cursor)?;
     if kind != 1 {
         return Ok(false);
     }
     let base = read_f64(bytes, cursor)?;
-    let hit = allowed
-        .iter()
-        .any(|value| matches!(value, Scalar::Float(number) if *number == base));
-    Ok(!hit && !(has_null && null_ok))
+    Ok(constant_misses(&Scalar::Float(base), has_null, eq, range))
 }
 
 fn bool_const_misses(
     bytes: &[u8],
     cursor: &mut usize,
-    allowed: &[Scalar],
     has_null: bool,
-    null_ok: bool,
+    eq: Option<&ColumnPredicate>,
+    range: Option<&RangeFilter>,
 ) -> Result<bool> {
     let kind = read_u8(bytes, cursor)?;
     if kind != 1 {
@@ -2653,29 +2857,27 @@ fn bool_const_misses(
     if base > 1 {
         return Err(Error::corrupt("bool constant is not 0 or 1"));
     }
-    let flag = base == 1;
-    let hit = allowed
-        .iter()
-        .any(|value| matches!(value, Scalar::Bool(expected) if *expected == flag));
-    Ok(!hit && !(has_null && null_ok))
+    Ok(constant_misses(
+        &Scalar::Bool(base == 1),
+        has_null,
+        eq,
+        range,
+    ))
 }
 
 fn decimal_const_misses(
     bytes: &[u8],
     cursor: &mut usize,
-    allowed: &[Scalar],
     has_null: bool,
-    null_ok: bool,
+    eq: Option<&ColumnPredicate>,
+    range: Option<&RangeFilter>,
 ) -> Result<bool> {
     let kind = read_u8(bytes, cursor)?;
     if kind != 1 {
         return Ok(false);
     }
     let base = read_i128(bytes, cursor)?;
-    let hit = allowed
-        .iter()
-        .any(|value| matches!(value, Scalar::Decimal(number) if *number == base));
-    Ok(!hit && !(has_null && null_ok))
+    Ok(constant_misses(&Scalar::Decimal(base), has_null, eq, range))
 }
 
 fn timestamp_range_misses(
