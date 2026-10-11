@@ -13,7 +13,9 @@
 //! Float zones stay unknown and are filtered from the decoded values.
 //! [`Store::count_with_filter`](store::Store::count_with_filter) counts those
 //! rows without building the JSON array. A block with no predicates reads
-//! timestamps only.
+//! timestamps only. Each column is its own zstd frame when that container is
+//! at most a quarter larger than one frame, so a filter does not decompress
+//! columns after the predicate.
 //! [`Store::histogram_with_filter`](store::Store::histogram_with_filter) counts
 //! the same rows into fixed epoch-aligned time buckets.
 //! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums
