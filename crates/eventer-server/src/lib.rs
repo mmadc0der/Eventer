@@ -499,7 +499,7 @@ fn stats_body(schema: &eventer::Schema, columns: &[eventer::ColumnStats]) -> Val
 
 fn sum_json(ty: eventer::FieldType, sum: eventer::StatSum) -> Value {
     match sum {
-        eventer::StatSum::Float(value) => float_json(value),
+        eventer::StatSum::Float { total, contributed } => float_sum_json(total, contributed),
         eventer::StatSum::Exact { total, contributed } => {
             let text = match ty {
                 eventer::FieldType::Decimal { scale } if contributed => {
@@ -519,7 +519,7 @@ fn extreme_json(ty: eventer::FieldType, value: &Option<eventer::Scalar>) -> Valu
     match (ty, value) {
         (eventer::FieldType::Int, eventer::Scalar::Int(number)) => json!(number),
         (eventer::FieldType::Timestamp, eventer::Scalar::Timestamp(number)) => json!(number),
-        (eventer::FieldType::Float, eventer::Scalar::Float(number)) => float_json(*number),
+        (eventer::FieldType::Float, eventer::Scalar::Float(number)) => float_extreme_json(*number),
         (eventer::FieldType::Decimal { scale }, eventer::Scalar::Decimal(number)) => {
             Value::String(eventer::format_decimal(*number, scale))
         }
@@ -527,16 +527,19 @@ fn extreme_json(ty: eventer::FieldType, value: &Option<eventer::Scalar>) -> Valu
     }
 }
 
-/// A float sum of positive zero is the JSON number `0`. Any other finite float
-/// keeps its IEEE value. `min` and `max` use that same number form.
-fn float_json(value: f64) -> Value {
-    if value == 0.0 && !value.is_sign_negative() {
-        Value::Number(0.into())
-    } else {
-        Number::from_f64(value)
-            .map(Value::Number)
-            .unwrap_or(Value::Null)
+/// An empty float sum is the JSON integer `0`. A sum that had contributing
+/// values keeps its IEEE form, including positive zero as `0.0`. The store
+/// rejects a non-finite accumulator before this runs.
+fn float_sum_json(total: f64, contributed: bool) -> Value {
+    if !contributed {
+        return Value::Number(0.into());
     }
+    Value::Number(Number::from_f64(total).expect("float sum is finite"))
+}
+
+/// `min` and `max` use the same JSON number as `GET /events`, including `0.0`.
+fn float_extreme_json(value: f64) -> Value {
+    Value::Number(Number::from_f64(value).expect("float extreme is finite"))
 }
 
 /// Refuse a span that would emit more than [`eventer::MAX_HISTOGRAM_BUCKETS`]
@@ -2032,6 +2035,53 @@ mod tests {
         );
         assert_eq!(body["columns"]["user_id"]["max"], json!(5));
         assert_eq!(body["columns"]["score"]["min"], json!(0.25));
+
+        let (status, body) = post(
+            &app,
+            r#"{"ts":4000,"user_id":1,"score":0.0,"ok":true,"action":"buy","amount":"1.00"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, listed) = get_json(&app, "/events?from=4000&to=4000").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=4000&to=4000&sum=score&min=score&max=score",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["score"]["sum"], listed[0]["score"]);
+        assert_eq!(body["columns"]["score"]["min"], listed[0]["score"]);
+        assert_eq!(body["columns"]["score"]["max"], listed[0]["score"]);
+        let (status, empty) = get_json(
+            &app,
+            "/events/stats?from=9000&to=9000&sum=score&min=score&max=score",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert_eq!(empty["columns"]["score"]["sum"], json!(0));
+        assert_eq!(empty["columns"]["score"]["min"], Value::Null);
+        assert_eq!(empty["columns"]["score"]["max"], Value::Null);
+
+        let (status, body) = post(
+            &app,
+            r#"{"ts":5000,"user_id":1,"score":1e308,"ok":true,"action":"buy","amount":"1.00"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = post(
+            &app,
+            r#"{"ts":5001,"user_id":2,"score":1e308,"ok":true,"action":"buy","amount":"1.00"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=5000&to=5001&sum=score&min=score&max=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.get("columns").is_none(), "{body}");
 
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);

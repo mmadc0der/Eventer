@@ -51,11 +51,12 @@ pub struct StatRequest {
 /// [`StatSum::Exact`] is the 128-bit sum of an int, a decimal, or a timestamp.
 /// `contributed` is false when every matching value was null or no row matched,
 /// so a decimal total of zero is formatted as `"0"` rather than at the schema
-/// scale. [`StatSum::Float`] is IEEE-754 addition in ingest order.
+/// scale, and an empty float sum is the JSON integer `0` rather than `0.0`.
+/// [`StatSum::Float`] is IEEE-754 addition in ingest order.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StatSum {
     Exact { total: i128, contributed: bool },
-    Float(f64),
+    Float { total: f64, contributed: bool },
 }
 
 /// Aggregates for one column. An absent `sum`, `min`, or `max` was not requested.
@@ -607,10 +608,12 @@ impl Store {
     /// An int, decimal, or timestamp sum uses a 128-bit accumulator and returns
     /// [`Error::Event`](Error::Event) if that accumulator would overflow. A
     /// float sum is IEEE-754 addition in ingest order inside a block and in
-    /// block order across the store. A non-finite float is
-    /// [`Error::Corrupt`](Error::Corrupt). At least one of `sum`, `min`, or
-    /// `max` is required. A bool, string, text, or json column is
-    /// [`Error::Schema`](Error::Schema). Checks run before the store is read.
+    /// block order across the store. A finished float sum that is not finite
+    /// returns [`Error::Event`](Error::Event) and no column stats. A non-finite
+    /// float already stored is [`Error::Corrupt`](Error::Corrupt). At least one
+    /// of `sum`, `min`, or `max` is required. A bool, string, text, or json
+    /// column is [`Error::Schema`](Error::Schema). Checks run before the store
+    /// is read.
     pub fn aggregate_with_filter(
         &self,
         from_ms: i64,
@@ -657,7 +660,7 @@ impl Store {
                 },
             )?;
         }
-        Ok(running.into_iter().map(RunningStat::finish).collect())
+        running.into_iter().map(RunningStat::finish).collect()
     }
 
     /// Delete every block whose maximum timestamp is strictly less than `cutoff_ms`.
@@ -1055,19 +1058,35 @@ impl RunningStat {
         Ok(())
     }
 
-    fn finish(self) -> ColumnStats {
-        ColumnStats {
-            field: self.spec.name,
-            sum: self.spec.sum.then(|| match self.spec.ty {
-                FieldType::Float => StatSum::Float(self.float_sum),
+    fn finish(self) -> Result<ColumnStats> {
+        let sum = if self.spec.sum {
+            Some(match self.spec.ty {
+                FieldType::Float => {
+                    if !self.float_sum.is_finite() {
+                        return Err(Error::event(format!(
+                            "sum of `{}` overflowed",
+                            self.spec.name
+                        )));
+                    }
+                    StatSum::Float {
+                        total: self.float_sum,
+                        contributed: self.contributed,
+                    }
+                }
                 _ => StatSum::Exact {
                     total: self.exact,
                     contributed: self.contributed,
                 },
-            }),
+            })
+        } else {
+            None
+        };
+        Ok(ColumnStats {
+            field: self.spec.name,
+            sum,
             min: self.spec.min.then_some(self.min),
             max: self.spec.max.then_some(self.max),
-        }
+        })
     }
 }
 
@@ -1164,7 +1183,10 @@ fn empty_column_stats(columns: &[ResolvedStat]) -> Vec<ColumnStats> {
         .map(|column| ColumnStats {
             field: column.name.clone(),
             sum: column.sum.then(|| match column.ty {
-                FieldType::Float => StatSum::Float(0.0),
+                FieldType::Float => StatSum::Float {
+                    total: 0.0,
+                    contributed: false,
+                },
                 _ => StatSum::Exact {
                     total: 0,
                     contributed: false,
@@ -5599,7 +5621,7 @@ mod tests {
         let column = columns.iter().find(|column| column.field == field).unwrap();
         match column.sum.unwrap() {
             StatSum::Exact { total, contributed } => (total, contributed),
-            StatSum::Float(value) => panic!("float sum {value} for {field}"),
+            StatSum::Float { total, .. } => panic!("float sum {total} for {field}"),
         }
     }
 
@@ -5690,7 +5712,13 @@ mod tests {
         assert_eq!(exact_sum(&empty, "user_id"), (0, false));
         assert_eq!(empty[0].min, Some(None));
         assert_eq!(empty[0].max, Some(None));
-        assert_eq!(empty[1].sum, Some(StatSum::Float(0.0)));
+        assert_eq!(
+            empty[1].sum,
+            Some(StatSum::Float {
+                total: 0.0,
+                contributed: false,
+            })
+        );
         assert_eq!(empty[1].min, Some(None));
         assert!(empty[1].max.is_none());
         assert_eq!(exact_sum(&empty, "amount"), (0, false));
@@ -5699,7 +5727,13 @@ mod tests {
         let scores = store
             .aggregate_with_filter(1000, 2000, &[], &[stat_req("score", true, true, true)])
             .unwrap();
-        assert_eq!(scores[0].sum, Some(StatSum::Float(0.75)));
+        assert_eq!(
+            scores[0].sum,
+            Some(StatSum::Float {
+                total: 0.75,
+                contributed: true,
+            })
+        );
         let timestamps = store
             .aggregate_with_filter(1000, 2000, &[], &[stat_req("ts", true, true, true)])
             .unwrap();
@@ -5820,7 +5854,66 @@ mod tests {
         let summed = store
             .aggregate_with_filter(0, 10, &[], &[stat_req("score", true, false, false)])
             .unwrap();
-        assert_eq!(summed[0].sum, Some(StatSum::Float(0.0)));
+        assert_eq!(
+            summed[0].sum,
+            Some(StatSum::Float {
+                total: 0.0,
+                contributed: true,
+            })
+        );
+        store.close().unwrap();
+
+        let overflowed = TempDir::new();
+        let schema = write_schema(overflowed.path());
+        let store =
+            Store::open_with(overflowed.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, score) in [(1i64, 1e308f64), (2, 1e308)] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": 1,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let overflow = store.aggregate_with_filter(
+            0,
+            10,
+            &[],
+            &[
+                stat_req("user_id", true, true, true),
+                stat_req("score", true, true, true),
+            ],
+        );
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("overflow")),
+            "{overflow:?}"
+        );
+        for (ts, score) in [(3i64, -1e308f64), (4, -1e308)] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": 1,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let negative =
+            store.aggregate_with_filter(3, 4, &[], &[stat_req("score", true, true, true)]);
+        assert!(
+            matches!(negative, Err(Error::Event(ref message)) if message.contains("overflow")),
+            "{negative:?}"
+        );
         store.close().unwrap();
     }
 }
