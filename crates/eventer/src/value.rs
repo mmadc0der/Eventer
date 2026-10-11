@@ -349,8 +349,17 @@ impl<'a> EventParser<'a> {
             self.skip_value()?;
             return Err(self.type_error(format!("field `{name}` must be a number")));
         }
-        let (start, end, _) = self.scan_number()?;
-        let lexeme = std::str::from_utf8(&self.bytes[start..end])
+        let (start, end, integer) = self.scan_number()?;
+        let raw = &self.bytes[start..end];
+        // An integer that fits in i64 follows `Number::as_f64` under
+        // `arbitrary_precision`: the lexeme is parsed as i64 first, so `-0`
+        // becomes `+0.0` rather than a signed zero from `f64` parsing.
+        if integer {
+            if let Some(value) = i64_from_lexeme(raw) {
+                return Ok(Scalar::Float(value as f64));
+            }
+        }
+        let lexeme = std::str::from_utf8(raw)
             .map_err(|_| ScanError::syntax("JSON number is not valid UTF-8"))?;
         match lexeme.parse::<f64>() {
             Ok(value) if value.is_finite() => Ok(Scalar::Float(value)),
@@ -1310,6 +1319,7 @@ mod tests {
             format!(r#"{{"ts":{}}}"#, i64::MIN).into_bytes(),
             format!(r#"{{"ts":{}}}"#, i64::MAX).into_bytes(),
             br#"{"ts":-0,"score":-0.0,"ok":false}"#.to_vec(),
+            br#"{"ts":1,"score":-0}"#.to_vec(),
             br#"{"ts":01}"#.to_vec(),
             br#"{"ts":1,}"#.to_vec(),
             br#"{"ts":1}{}"#.to_vec(),
