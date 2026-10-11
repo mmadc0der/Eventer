@@ -4,7 +4,7 @@ Relative size of the stock benchmark across shipped formats. Every row is one `c
 
 `stored_data_bytes` is the segment data file plus the dictionary sidecar. `stored_index_bytes` is the sparse index plus, from the zone-map version on, the zone file. "Smaller" is `(previous − this) / previous`. A negative index change is growth.
 
-The first store is the baseline for the last column. Current `main` (`7829a39`) keeps 3,639 data bytes against that baseline of 394,005 (108× fewer data bytes, 99.1% smaller) and 4,313 bytes of data plus index against 395,973 (91.8× fewer, 98.9% smaller).
+The first store is the baseline for the last column. `488f597` keeps 3,639 data bytes against that baseline of 394,005 (108× fewer data bytes, 99.1% smaller) and 4,209 bytes of data plus index against 395,973 (94.1× fewer, 98.9% smaller).
 
 | Commit | What changed | Data | vs previous data | Index | vs previous index | Data + index | vs previous total | Data vs first store |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -29,6 +29,7 @@ The first store is the baseline for the last column. Current `main` (`7829a39`) 
 | `3147df3` | Delta-coded sparse index | 3639 | 0% | 885 | 18.9% smaller | 4524 | 4.4% smaller | 99.1% smaller |
 | `305a4d5` | Time-bucket counts | 3639 | 0% | 885 | 0% | 4524 | 0% | 99.1% smaller |
 | `96e1ceb` | Timestamp zone bounds taken from the sparse index | 3639 | 0% | 674 | 23.8% smaller | 4313 | 4.7% smaller | 99.1% smaller |
+| `488f597` | Sparse index and zone file compressed at zstd level 19 | 3639 | 0% | 570 | 15.4% smaller | 4209 | 2.4% smaller | 99.1% smaller |
 
 JSON columns did not change this workload: the bench schema has no `json` field. Equality filters, schema append, retention, batch ingest, `limit`/`offset`, `GET /events/count`, numeric range predicates (`208c7b0`), and directory rewrite (`7829a39`) sit between these commits and do not change the encoder. HTTP drop (`d194464`), time-bucket counts (`305a4d5`), range predicates, and directory rewrite match the format commit they sit on.
 
