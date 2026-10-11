@@ -226,6 +226,7 @@ fn schema_lock_mismatch(reason: &str) -> Error {
 }
 
 /// Unix milliseconds. Accepts an integer, a digit string, or a UTC RFC3339 timestamp.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_timestamp_value(value: &Value) -> Result<i64> {
     match value {
         Value::Number(number) => number.as_i64().ok_or_else(|| {
