@@ -7,11 +7,26 @@ use crate::schema::{FieldType, Schema};
 use crate::value::{Row, Scalar};
 
 /// Uncompressed columnar block. `min_ts` / `max_ts` cover every row.
+///
+/// `slices` names ranges of `bytes` after the 4-byte row count. A json column
+/// is its own slice so a filter on an earlier column does not have to
+/// decompress it. The writer still stores one frame when that is smaller.
 pub struct EncodedBlock {
     pub bytes: Vec<u8>,
     pub min_ts: i64,
     pub max_ts: i64,
     pub row_count: u32,
+    pub slices: Vec<SliceSpan>,
+}
+
+/// One compression unit inside [`EncodedBlock::bytes`], not including the
+/// leading row count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceSpan {
+    pub start: u32,
+    pub end: u32,
+    pub first_column: u16,
+    pub last_column: u16,
 }
 
 pub fn encode_block(schema: &Schema, rows: &[Row]) -> Result<EncodedBlock> {
@@ -32,15 +47,39 @@ pub fn encode_block(schema: &Schema, rows: &[Row]) -> Result<EncodedBlock> {
     }
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    let mut column_ends = Vec::with_capacity(schema.fields.len());
     for (index, field) in schema.fields.iter().enumerate() {
         encode_column(&mut bytes, field.ty, rows, index)?;
+        column_ends.push(bytes.len() as u32);
     }
+    let slices = plan_slices(&column_ends);
     Ok(EncodedBlock {
         bytes,
         min_ts,
         max_ts,
         row_count: rows.len() as u32,
+        slices,
     })
+}
+
+/// Each column is its own slice so a filter stops after the predicate.
+///
+/// The writer falls back to one frame when the container grows too much.
+fn plan_slices(column_ends: &[u32]) -> Vec<SliceSpan> {
+    column_ends
+        .iter()
+        .enumerate()
+        .map(|(index, end)| SliceSpan {
+            start: if index == 0 {
+                4
+            } else {
+                column_ends[index - 1]
+            },
+            end: *end,
+            first_column: index as u16,
+            last_column: index as u16,
+        })
+        .collect()
 }
 
 pub fn block_row_count(bytes: &[u8]) -> Result<usize> {

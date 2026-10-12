@@ -22,12 +22,25 @@ const WRITE_BATCH_BLOCKS: usize = 8;
 type Ack = mpsc::Sender<Result<()>>;
 
 enum Cmd {
-    Event { json: Vec<u8>, ack: Option<Ack> },
+    Event {
+        json: Vec<u8>,
+        ack: Option<Ack>,
+    },
     /// A row already decoded from a store. Skips JSON parsing and the ingest cap.
-    Row { row: Row, ack: Option<Ack> },
-    Flush { ack: Ack },
-    DropBefore { cutoff_ms: i64, ack: Ack },
-    Shutdown { ack: mpsc::Sender<()> },
+    Row {
+        row: Row,
+        ack: Option<Ack>,
+    },
+    Flush {
+        ack: Ack,
+    },
+    DropBefore {
+        cutoff_ms: i64,
+        ack: Ack,
+    },
+    Shutdown {
+        ack: mpsc::Sender<()>,
+    },
 }
 
 struct Job {
@@ -60,6 +73,7 @@ enum EncoderMsg {
 struct BlockIn {
     seq: u64,
     raw: Vec<u8>,
+    slices: Vec<crate::codec::SliceSpan>,
     min_ts: i64,
     max_ts: i64,
     row_count: u32,
@@ -82,6 +96,7 @@ struct BlockOut {
     framed: Vec<u8>,
     /// Uncompressed sealed block. The writer samples these and may recompress them.
     raw: Vec<u8>,
+    slices: Vec<crate::codec::SliceSpan>,
     /// Dictionary the frame was compressed with, when `framed` is an `EVBD` block.
     dict: Option<Arc<Vec<u8>>>,
     epoch: u32,
@@ -869,6 +884,7 @@ fn emit_block(
                 let msg = CompIn::Block(BlockIn {
                     seq: *stage_seq,
                     raw: encoded.bytes,
+                    slices: encoded.slices,
                     min_ts: encoded.min_ts,
                     max_ts: encoded.max_ts,
                     row_count: encoded.row_count,
@@ -991,17 +1007,23 @@ fn compress_block(
                 }
             }
         }
-        match with_dict.as_mut().unwrap().1.compress(&block.raw) {
+        match segment::compress_block_bytes(
+            &mut with_dict.as_mut().unwrap().1,
+            &block.raw,
+            &block.slices,
+        ) {
             Ok(compressed) => Ok((compressed, true)),
             Err(err) => Err(Error::io(err)),
         }
     } else {
         match plain.as_mut() {
             None => Err(Error::io("zstd compressor failed to initialize")),
-            Some(compressor) => match compressor.compress(&block.raw) {
-                Ok(compressed) => Ok((compressed, false)),
-                Err(err) => Err(Error::io(err)),
-            },
+            Some(compressor) => {
+                match segment::compress_block_bytes(compressor, &block.raw, &block.slices) {
+                    Ok(compressed) => Ok((compressed, false)),
+                    Err(err) => Err(Error::io(err)),
+                }
+            }
         }
     };
     match compressed {
@@ -1017,6 +1039,7 @@ fn compress_block(
                 uncompressed_len: block.raw.len() as u32,
                 framed,
                 raw: block.raw,
+                slices: block.slices,
                 dict: if used_dict { dict } else { None },
                 epoch: block.epoch,
                 row_count: block.row_count,
@@ -1413,18 +1436,22 @@ impl Disk {
                 let compressor = segment::block_compressor(self.level, dict).map_err(Error::io)?;
                 self.dict_compressor = Some((Arc::clone(dict), compressor));
             }
-            self.dict_compressor
-                .as_mut()
-                .expect("dictionary compressor installed")
-                .1
-                .compress(&item.raw)
-                .map_err(Error::io)?
+            segment::compress_block_bytes(
+                &mut self
+                    .dict_compressor
+                    .as_mut()
+                    .expect("dictionary compressor installed")
+                    .1,
+                &item.raw,
+                &item.slices,
+            )
+            .map_err(Error::io)?
         } else {
             let compressor = self
                 .plain
                 .as_mut()
                 .ok_or_else(|| Error::io("zstd compressor failed to initialize"))?;
-            compressor.compress(&item.raw).map_err(Error::io)?
+            segment::compress_block_bytes(compressor, &item.raw, &item.slices).map_err(Error::io)?
         };
         if compressed.len() > u32::MAX as usize {
             return Err(Error::event("compressed block does not fit in u32"));

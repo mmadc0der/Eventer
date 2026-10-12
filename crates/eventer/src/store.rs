@@ -308,7 +308,7 @@ impl Store {
             if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let payload = self.load_scan_block(&block, &mut dictionaries, &resolved, true)?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
             if resolved.unfiltered()
@@ -430,7 +430,7 @@ impl Store {
             if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let payload = self.load_scan_block(&block, &mut dictionaries, &resolved, true)?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
             if resolved.unfiltered()
@@ -504,7 +504,8 @@ impl Store {
     ///
     /// A block the zone map can reject is not read. A block with no predicates
     /// contributes the number of payload timestamps inside the range and does
-    /// not decode the other columns. When every timestamp is inside, that
+    /// not decode the other columns. Columns after the last predicate are not
+    /// decompressed. When every timestamp is inside, that
     /// number is the block row count. A timestamp outside the range is not
     /// counted, even when the index min/max sit inside the range. Predicate
     /// blocks decode the timestamp and the predicate columns only.
@@ -525,7 +526,13 @@ impl Store {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let payload = self.read_block_bytes(
+                &block,
+                &mut dictionaries,
+                segment::BlockLoad {
+                    through_column: Some(needed_column(&self.schema, &resolved, None)),
+                },
+            )?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
             let matched = count_rows_filtered(
@@ -586,7 +593,13 @@ impl Store {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let payload = self.read_block_bytes(
+                &block,
+                &mut dictionaries,
+                segment::BlockLoad {
+                    through_column: Some(needed_column(&self.schema, &resolved, None)),
+                },
+            )?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
             accumulate_histogram_filtered(
@@ -643,7 +656,17 @@ impl Store {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let mut through = needed_column(&self.schema, &resolved, None);
+            for stat in &running {
+                through = through.max(stat.spec.index);
+            }
+            let payload = self.read_block_bytes(
+                &block,
+                &mut dictionaries,
+                segment::BlockLoad {
+                    through_column: Some(through),
+                },
+            )?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
             let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
@@ -1024,6 +1047,7 @@ impl Store {
         &self,
         block: &segment::BlockMeta,
         dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        load: segment::BlockLoad,
     ) -> Result<Vec<u8>> {
         let data_path = segment::data_path(&self.dir, block.segment_id);
         let uses_dict = segment::frame_uses_dictionary(&data_path, block)?;
@@ -1039,7 +1063,35 @@ impl Store {
         } else {
             None
         };
-        segment::read_block_payload(&data_path, block, dictionary)
+        segment::read_block_payload_with(&data_path, block, dictionary, load)
+    }
+
+    /// Materialize the columns a filtered scan needs, or the whole block when
+    /// the caller is going to return rows.
+    ///
+    /// Count, histogram, and aggregate pass `rows` false and stop after the
+    /// predicate column. A query passes `rows` true. The zone map has already
+    /// rejected blocks that cannot match, so the row path reads each surviving
+    /// block once.
+    fn load_scan_block(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        resolved: &ResolvedScan,
+        rows: bool,
+    ) -> Result<Vec<u8>> {
+        let through = if rows {
+            None
+        } else {
+            Some(needed_column(&self.schema, resolved, None))
+        };
+        self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: through,
+            },
+        )
     }
 
     fn blocks_in_range(
@@ -1700,6 +1752,16 @@ fn every_timestamp_in_range(
 }
 
 /// The remaining offset covers every row in the block, so a timestamp scan can decide a skip.
+fn needed_column(schema: &Schema, resolved: &ResolvedScan, extra: Option<usize>) -> usize {
+    resolved
+        .predicates
+        .iter()
+        .map(|predicate| predicate.index)
+        .chain(resolved.ranges.iter().map(|range| range.index))
+        .chain(extra)
+        .fold(schema.timestamp_index, usize::max)
+}
+
 fn offset_covers_block(offset: u64, skipped: u64, block_rows: u32) -> bool {
     let block_rows = u64::from(block_rows);
     block_rows > 0 && offset.saturating_sub(skipped) >= block_rows
@@ -3868,6 +3930,65 @@ mod tests {
             ]
         );
         narrow.close().unwrap();
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn filtered_read_keeps_json_when_each_column_is_its_own_frame() {
+        let dir = TempDir::new();
+        let schema_text = r#"{
+            "timestamp_field": "time",
+            "fields": [
+                {"name": "time", "type": "timestamp"},
+                {"name": "type", "type": "string"},
+                {"name": "data", "type": "json"}
+            ]
+        }"#;
+        let schema = dir.path().join("schema.json");
+        fs::write(&schema, schema_text).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(128)).unwrap();
+        let blob = "x".repeat(200);
+        for index in 0..128 {
+            let kind = if index < 64 {
+                "dev.genesis.run.accepted"
+            } else {
+                "dev.genesis.run.other"
+            };
+            let event = format!(
+                r#"{{"time":{index},"type":"{kind}","data":{{"n":{index},"blob":"{blob}"}}}}"#
+            );
+            store.append_json(event.as_bytes()).unwrap();
+        }
+        store.flush().unwrap();
+        let bytes = fs::read(segment::data_path(&data, 1)).unwrap();
+        assert!(
+            bytes.windows(4).any(|magic| magic == b"EVCS"),
+            "a large json column is its own slice"
+        );
+        let accepted = [Predicate::Eq(
+            "type".into(),
+            "dev.genesis.run.accepted".into(),
+        )];
+        assert_eq!(store.count_with_filter(0, 127, &accepted).unwrap(), 64);
+        let rows = store.query_with_filter(0, 127, &accepted).unwrap();
+        assert_eq!(rows.len(), 64);
+        for (offset, row) in rows.iter().enumerate() {
+            match &row.values[2] {
+                Scalar::Json(text) => {
+                    assert!(text.contains(&format!("\"n\":{offset}")));
+                    assert!(text.contains(&blob));
+                }
+                other => panic!("json column missing: {other:?}"),
+            }
+        }
+        let other = [Predicate::Eq("type".into(), "dev.genesis.run.other".into())];
+        let rows = store.query_with_filter(0, 127, &other).unwrap();
+        assert_eq!(rows.len(), 64);
+        match &rows[0].values[2] {
+            Scalar::Json(text) => assert!(text.contains("\"n\":64")),
+            other => panic!("json column missing: {other:?}"),
+        }
         store.close().unwrap();
     }
 
