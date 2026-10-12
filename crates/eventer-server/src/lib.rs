@@ -14,7 +14,8 @@
 //! `GET /events/histogram?from=&to=&bucket_ms=N` returns one count per epoch-aligned
 //! bucket that intersects that inclusive range.
 //! `GET /events/stats` returns `sum`, `min`, and `max` for numeric columns over
-//! that same range and the same filters, without the matching rows.
+//! that same range and the same filters, without the matching rows. `by=field`
+//! splits that result into one group per value of a single column.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
 //! with the caller's `before_ms`. The request `Content-Type` must be
 //! `application/json`, with an optional `charset=utf-8`. A block is removed
@@ -336,6 +337,15 @@ async fn stats_events(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    let by = match group_field(raw) {
+        Ok(by) => by,
+        Err(response) => return *response,
+    };
+    if let Some(field) = &by {
+        if let Err(response) = reject_group_field(state.store.schema(), field) {
+            return *response;
+        }
+    }
     let stats = match stat_requests(raw) {
         Ok(stats) => stats,
         Err(response) => return *response,
@@ -348,13 +358,33 @@ async fn stats_events(
         Err(response) => return *response,
     };
     let store = Arc::clone(&state.store);
-    let joined = tokio::task::spawn_blocking(move || {
-        store.aggregate_with_filter(from, to, &predicates, &stats)
-    })
-    .await;
+    let grouped_by = by.clone();
+    let joined = if let Some(by) = by {
+        tokio::task::spawn_blocking(move || {
+            store
+                .aggregate_grouped(from, to, &predicates, &stats, &by)
+                .map(StatsOutcome::Groups)
+        })
+        .await
+    } else {
+        tokio::task::spawn_blocking(move || {
+            store
+                .aggregate_with_filter(from, to, &predicates, &stats)
+                .map(StatsOutcome::Columns)
+        })
+        .await
+    };
     match joined {
-        Ok(Ok(columns)) => {
+        Ok(Ok(StatsOutcome::Columns(columns))) => {
             let body = stats_body(state.store.schema(), &columns);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Ok(Ok(StatsOutcome::Groups(groups))) => {
+            let body = groups_body(
+                state.store.schema(),
+                grouped_by.as_deref().unwrap_or(""),
+                &groups,
+            );
             (StatusCode::OK, Json(body)).into_response()
         }
         Ok(Err(err)) => error_response(&err),
@@ -364,6 +394,11 @@ async fn stats_events(
         )
             .into_response(),
     }
+}
+
+enum StatsOutcome {
+    Columns(Vec<eventer::ColumnStats>),
+    Groups(Vec<eventer::StatGroup>),
 }
 
 fn reject_stats_params(query: &str) -> std::result::Result<(), Box<Response>> {
@@ -437,6 +472,60 @@ fn stat_requests(query: &str) -> std::result::Result<Vec<eventer::StatRequest>, 
     Ok(requests)
 }
 
+fn group_field(query: &str) -> std::result::Result<Option<String>, Box<Response>> {
+    let mut found = None;
+    if query.is_empty() {
+        return Ok(None);
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some(pair) => pair,
+            None => {
+                let key = percent_decode(pair, "query")?;
+                if key == "by" {
+                    return Err(bad_request("`by` is missing a field name"));
+                }
+                continue;
+            }
+        };
+        let key = percent_decode(key, "query")?;
+        if key != "by" {
+            continue;
+        }
+        if found.is_some() {
+            return Err(bad_request("`by` was given more than once"));
+        }
+        let field = percent_decode(value, "by")?;
+        if field.is_empty() {
+            return Err(bad_request("`by` is missing a field name"));
+        }
+        found = Some(field);
+    }
+    Ok(found)
+}
+
+fn reject_group_field(
+    schema: &eventer::Schema,
+    name: &str,
+) -> std::result::Result<(), Box<Response>> {
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(bad_request(&format!("unknown group field `{name}`")));
+    };
+    if matches!(
+        field.ty,
+        eventer::FieldType::Float | eventer::FieldType::Json
+    ) {
+        return Err(bad_request(&format!(
+            "`by` does not apply to {} column `{name}`",
+            field.ty.name()
+        )));
+    }
+    Ok(())
+}
+
 fn reject_stat_fields(
     schema: &eventer::Schema,
     stats: &[eventer::StatRequest],
@@ -470,6 +559,35 @@ fn reject_stat_fields(
 }
 
 fn stats_body(schema: &eventer::Schema, columns: &[eventer::ColumnStats]) -> Value {
+    Value::Object(Map::from_iter([(
+        "columns".to_string(),
+        Value::Object(columns_object(schema, columns)),
+    )]))
+}
+
+fn groups_body(schema: &eventer::Schema, by: &str, groups: &[eventer::StatGroup]) -> Value {
+    let ty = schema
+        .fields
+        .iter()
+        .find(|field| field.name == by)
+        .map(|field| field.ty)
+        .unwrap_or(eventer::FieldType::String);
+    let list = groups
+        .iter()
+        .map(|group| {
+            json!({
+                "key": group_key_json(ty, &group.key),
+                "columns": columns_object(schema, &group.columns),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"groups": list})
+}
+
+fn columns_object(
+    schema: &eventer::Schema,
+    columns: &[eventer::ColumnStats],
+) -> Map<String, Value> {
     let mut out = Map::new();
     for column in columns {
         let Some(field) = schema
@@ -491,10 +609,23 @@ fn stats_body(schema: &eventer::Schema, columns: &[eventer::ColumnStats]) -> Val
         }
         out.insert(column.field.clone(), Value::Object(body));
     }
-    Value::Object(Map::from_iter([(
-        "columns".to_string(),
-        Value::Object(out),
-    )]))
+    out
+}
+
+fn group_key_json(ty: eventer::FieldType, value: &eventer::Scalar) -> Value {
+    match (ty, value) {
+        (_, eventer::Scalar::Null) => Value::Null,
+        (eventer::FieldType::Int, eventer::Scalar::Int(number)) => json!(number),
+        (eventer::FieldType::Timestamp, eventer::Scalar::Timestamp(number)) => json!(number),
+        (eventer::FieldType::Decimal { scale }, eventer::Scalar::Decimal(number)) => {
+            Value::String(eventer::format_decimal(*number, scale))
+        }
+        (eventer::FieldType::Bool, eventer::Scalar::Bool(flag)) => json!(flag),
+        (eventer::FieldType::String | eventer::FieldType::Text, eventer::Scalar::Str(text)) => {
+            Value::String(text.clone())
+        }
+        _ => Value::Null,
+    }
 }
 
 fn sum_json(ty: eventer::FieldType, sum: eventer::StatSum) -> Value {
@@ -2083,6 +2214,168 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.get("columns").is_none(), "{body}");
 
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stats_group_by_one_column() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-stats-by-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "amount", "type": "decimal", "scale": 2},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(8, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        for row in [
+            r#"{"ts":1000,"user_id":1,"score":0.5,"ok":true,"action":"click","amount":"1.00","props":{"n":1}}"#,
+            r#"{"ts":2000,"user_id":5,"score":0.25,"ok":true,"action":"click","amount":"2.00","props":{"n":2}}"#,
+            r#"{"ts":3000,"user_id":9,"score":1.0,"ok":false,"action":"view","amount":"4.00","props":{"n":3}}"#,
+        ] {
+            let (status, body) = post(&app, row).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&by=action&sum=amount&min=amount&max=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let groups = body["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["key"], json!("click"));
+        assert_eq!(groups[0]["columns"]["amount"]["sum"], json!("3.00"));
+        assert_eq!(groups[0]["columns"]["amount"]["min"], json!("1.00"));
+        assert_eq!(groups[0]["columns"]["amount"]["max"], json!("2.00"));
+        assert_eq!(groups[1]["key"], json!("view"));
+        assert_eq!(groups[1]["columns"]["amount"]["sum"], json!("4.00"));
+        assert_eq!(groups[1]["columns"]["amount"]["min"], json!("4.00"));
+        assert_eq!(groups[1]["columns"]["amount"]["max"], json!("4.00"));
+
+        let (status, plain) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&sum=amount&min=amount&max=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{plain}");
+        assert_eq!(plain["columns"]["amount"]["sum"], json!("7.00"));
+        assert!(plain.get("groups").is_none(), "{plain}");
+
+        let (status, empty) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&eq=action=missing&by=action&sum=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert_eq!(empty["groups"], json!([]));
+        assert!(empty.get("columns").is_none(), "{empty}");
+
+        let (status, same) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&by=user_id&sum=user_id&max=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{same}");
+        assert_eq!(same["groups"][0]["key"], json!(1));
+        assert_eq!(same["groups"][0]["columns"]["user_id"]["sum"], json!("1"));
+        assert_eq!(same["groups"][0]["columns"]["amount"]["max"], json!("1.00"));
+
+        for uri in [
+            "/events/stats?from=1000&to=3000&by=score&sum=user_id",
+            "/events/stats?from=1000&to=3000&by=props&sum=user_id",
+            "/events/stats?from=1000&to=3000&by=&sum=amount",
+            "/events/stats?from=1000&to=3000&by&sum=amount",
+            "/events/stats?from=1000&to=3000&by=missing&sum=amount",
+            "/events/stats?from=1000&to=3000&by=action&by=ok&sum=amount",
+            "/events/stats?from=1000&to=3000&by=action&sum=amount&limit=1",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+            assert!(body.get("groups").is_none(), "{uri} -> {body}");
+            assert!(body.get("columns").is_none(), "{uri} -> {body}");
+        }
+
+        let data = root.join("data");
+        let dat = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("dat"))
+            .unwrap();
+        let mut bytes = fs::read(&dat).unwrap();
+        bytes[16] ^= 0xff;
+        fs::write(&dat, &bytes).unwrap();
+        let (status, unread) =
+            get_json(&app, "/events/stats?from=1000&to=3000&by=score&sum=user_id").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unread}");
+        assert!(unread.get("groups").is_none(), "{unread}");
+        let message = unread["error"].as_str().unwrap_or("");
+        assert!(
+            !message.contains("corrupt"),
+            "float group read the store: {unread}"
+        );
+        let (status, read) = get_json(&app, "/events/stats?from=1000&to=3000&sum=user_id").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{read}");
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-stats-by-cap-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(8192, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        for id in 0..4097i64 {
+            store
+                .append_json(format!(r#"{{"ts":{id},"user_id":{id},"amount":"1.00"}}"#).as_bytes())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let (status, body) =
+            get_json(&app, "/events/stats?from=0&to=4096&by=user_id&sum=amount").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.get("groups").is_none(), "{body}");
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
