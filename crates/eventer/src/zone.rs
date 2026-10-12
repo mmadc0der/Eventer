@@ -47,8 +47,13 @@ const ZONE_HEADER_LEN: usize = 16;
 const ZONE_TRAILER_LEN: usize = 4;
 /// Plain zstd frame magic. Distinct from [`ZONE_MAGIC`].
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-/// Level 1. The zone file is small and rewritten as a whole at the end of a batch.
-const ZONE_ZSTD_LEVEL: i32 = 1;
+/// Level 19 while the raw zone image is at most 8 KiB. The stock 100k image
+/// is 6,635 bytes and still compresses to the measured 310-byte frame. A
+/// larger rewrite, which happens on the writer thread for every durable
+/// append, uses level 1.
+const ZONE_ZSTD_LEVEL_HIGH: i32 = 19;
+const ZONE_ZSTD_LEVEL_FAST: i32 = 1;
+const ZONE_ZSTD_HIGH_MAX_RAW: usize = 8 * 1024;
 /// Cap for a decompressed zone frame. A larger claim is treated as corrupt and
 /// the segment is summarized again from its payloads.
 const MAX_ZONE_UNCOMPRESSED: usize = 512 * 1024 * 1024;
@@ -581,8 +586,16 @@ fn is_zstd_frame(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[..4] == ZSTD_MAGIC
 }
 
+fn zone_zstd_level(raw_len: usize) -> i32 {
+    if raw_len <= ZONE_ZSTD_HIGH_MAX_RAW {
+        ZONE_ZSTD_LEVEL_HIGH
+    } else {
+        ZONE_ZSTD_LEVEL_FAST
+    }
+}
+
 fn compress_zone_if_smaller(raw: &[u8]) -> Vec<u8> {
-    match zstd::bulk::compress(raw, ZONE_ZSTD_LEVEL) {
+    match zstd::bulk::compress(raw, zone_zstd_level(raw.len())) {
         Ok(frame) if frame.len() < raw.len() && is_zstd_frame(&frame) => frame,
         _ => raw.to_vec(),
     }
@@ -1122,6 +1135,25 @@ mod tests {
     use super::*;
     use crate::schema::parse_schema;
     use crate::value::parse_event;
+
+    #[test]
+    fn zone_zstd_level_drops_after_eight_kib() {
+        let stock = vec![7u8; 6635];
+        let at_cap = vec![7u8; ZONE_ZSTD_HIGH_MAX_RAW];
+        let over = vec![7u8; ZONE_ZSTD_HIGH_MAX_RAW + 1];
+        assert_eq!(
+            compress_zone_if_smaller(&stock),
+            zstd::bulk::compress(&stock, ZONE_ZSTD_LEVEL_HIGH).unwrap()
+        );
+        assert_eq!(
+            compress_zone_if_smaller(&at_cap),
+            zstd::bulk::compress(&at_cap, ZONE_ZSTD_LEVEL_HIGH).unwrap()
+        );
+        assert_eq!(
+            compress_zone_if_smaller(&over),
+            zstd::bulk::compress(&over, ZONE_ZSTD_LEVEL_FAST).unwrap()
+        );
+    }
 
     fn schema() -> Schema {
         parse_schema(
