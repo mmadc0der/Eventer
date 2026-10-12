@@ -80,6 +80,17 @@ pub struct StatGroup {
     pub columns: Vec<ColumnStats>,
 }
 
+/// One epoch-aligned bucket from [`Store::aggregate_buckets`].
+///
+/// `columns` is the ungrouped result for the rows whose own timestamp falls in
+/// that bucket. An empty bucket still carries the requested stats: null `min`
+/// and `max`, and a zero sum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatBucket {
+    pub start_ms: i64,
+    pub columns: Vec<ColumnStats>,
+}
+
 /// Counters for the bytes sitting in segment files after the last flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
@@ -690,6 +701,88 @@ impl Store {
         running.into_iter().map(RunningStat::finish).collect()
     }
 
+    /// [`Store::aggregate_with_filter`] split into epoch-aligned time buckets.
+    ///
+    /// `bucket_ms` uses the same alignment and the same
+    /// [`MAX_HISTOGRAM_BUCKETS`] cap as [`Store::histogram_with_filter`].
+    /// Bucket `i` starts at `floor(from_ms / bucket_ms) * bucket_ms + i * bucket_ms`,
+    /// using division that rounds toward negative infinity. The list is every
+    /// bucket that intersects the inclusive range, in increasing start time,
+    /// including a bucket whose matching row count is zero. A row contributes
+    /// to the bucket that contains its own timestamp.
+    ///
+    /// `sum`, `min`, and `max` follow the same types, nulls, overflow, and
+    /// non-finite float rules as [`Store::aggregate_with_filter`], applied per
+    /// bucket. A float sum is IEEE-754 addition in ingest order inside that
+    /// bucket. An empty bucket has null `min` and `max` and a zero sum.
+    ///
+    /// A non-positive `bucket_ms`, or more than [`MAX_HISTOGRAM_BUCKETS`]
+    /// buckets, is an error and does not read the store. A block the sparse
+    /// index places outside the range is not read. A block the zone map can
+    /// reject is not read. An empty bucket does not by itself read a block.
+    pub fn aggregate_buckets(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        bucket_ms: i64,
+        predicates: &[Predicate],
+        stats: &[StatRequest],
+    ) -> Result<Vec<StatBucket>> {
+        let specs = resolve_stat_requests(&self.schema, stats)?;
+        let Some(span) = histogram_span(from_ms, to_ms, bucket_ms)? else {
+            return Ok(Vec::new());
+        };
+        let fresh = || specs.iter().cloned().map(RunningStat::new).collect();
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
+            let buckets = span.buckets;
+            return finish_stat_buckets(span, (0..buckets).map(|_| fresh()).collect());
+        };
+        let _retention = self.pipeline.lock_for_read();
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+        let mut running: Vec<Vec<RunningStat>> = (0..span.buckets).map(|_| fresh()).collect();
+        let mut dictionaries = HashMap::new();
+        for block in blocks {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
+                return Err(Error::event("query response size limit exceeded"));
+            }
+            let mut through = needed_column(&self.schema, &resolved, None);
+            for stat in &specs {
+                through = through.max(stat.index);
+            }
+            let payload = self.read_block_bytes(
+                &block,
+                &mut dictionaries,
+                segment::BlockLoad {
+                    through_column: Some(through),
+                },
+            )?;
+            let nrows = block_row_count(&payload)?;
+            require_header_row_count(block.row_count, nrows)?;
+            let mut captures = capture_columns(specs.iter().map(|stat| stat.index));
+            visit_matching_timestamps(
+                &self.schema,
+                &payload,
+                from_ms,
+                to_ms,
+                &resolved.predicates,
+                &resolved.ranges,
+                &mut captures,
+                |ts, row, captured| {
+                    let index = stat_bucket_index(ts, bucket_ms, span.first_start)?;
+                    let bucket = running
+                        .get_mut(index)
+                        .ok_or_else(|| Error::corrupt("histogram bucket index"))?;
+                    for stat in bucket {
+                        let value = stat_value(&self.schema, stat, ts, row, captured)?;
+                        stat.absorb(value)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        finish_stat_buckets(span, running)
+    }
+
     /// Group [`Store::aggregate_with_filter`] by one column.
     ///
     /// `by` is a bool, string, text, int, timestamp, or decimal field. A float
@@ -738,10 +831,10 @@ impl Store {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let through = indexes.iter().copied().fold(
-                needed_column(&self.schema, &resolved, None),
-                usize::max,
-            );
+            let through = indexes
+                .iter()
+                .copied()
+                .fold(needed_column(&self.schema, &resolved, None), usize::max);
             let payload = self.read_block_bytes(
                 &block,
                 &mut dictionaries,
@@ -1849,6 +1942,32 @@ fn histogram_span(from_ms: i64, to_ms: i64, bucket_ms: i64) -> Result<Option<His
 fn histogram_buckets(span: HistogramSpan) -> Result<Vec<HistogramBucket>> {
     let zeros = vec![0; span.buckets];
     buckets_from_counts(span, &zeros)
+}
+
+fn stat_bucket_index(ts: i64, bucket_ms: i64, first_start: i128) -> Result<usize> {
+    let start = (ts as i128).div_euclid(i128::from(bucket_ms)) * i128::from(bucket_ms);
+    let index = (start - first_start) / i128::from(bucket_ms);
+    usize::try_from(index).map_err(|_| Error::corrupt("histogram bucket index"))
+}
+
+fn finish_stat_buckets(
+    span: HistogramSpan,
+    running: Vec<Vec<RunningStat>>,
+) -> Result<Vec<StatBucket>> {
+    let mut out = Vec::with_capacity(span.buckets);
+    for (index, columns) in running.into_iter().enumerate() {
+        let start = span.first_start + i128::from(index as u64) * i128::from(span.bucket_ms);
+        let start_ms = i64::try_from(start)
+            .map_err(|_| Error::event("histogram bucket start is outside i64"))?;
+        out.push(StatBucket {
+            start_ms,
+            columns: columns
+                .into_iter()
+                .map(RunningStat::finish)
+                .collect::<Result<Vec<_>>>()?,
+        });
+    }
+    Ok(out)
 }
 
 fn buckets_from_counts(span: HistogramSpan, counts: &[u64]) -> Result<Vec<HistogramBucket>> {
@@ -6392,6 +6511,294 @@ mod tests {
         assert!(
             matches!(negative, Err(Error::Event(ref message)) if message.contains("overflow")),
             "{negative:?}"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn aggregate_buckets_keep_empty_buckets_and_skip_unread_blocks() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, user, action, score, amount) in [
+            (1500i64, Some(1i64), "buy", 1e16f64, "1.50"),
+            (2500, Some(1), "buy", 1.0, "2.25"),
+            (3000, None, "other", -1e16, "9.00"),
+            (-1500, Some(1), "buy", 1.0, "1.00"),
+            (10_000, Some(9), "later", 4.0, "4.00"),
+            (10_001, Some(8), "later", 4.0, "4.00"),
+        ] {
+            let mut obj = serde_json::json!({
+                "ts": ts,
+                "score": score,
+                "ok": user.is_some(),
+                "action": action,
+                "amount": amount,
+            });
+            if let Some(user) = user {
+                obj["user_id"] = serde_json::json!(user);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        let stats = [
+            stat_req("user_id", true, true, true),
+            stat_req("amount", true, false, false),
+            stat_req("score", true, false, false),
+        ];
+        let buy = [Predicate::Eq("action".into(), "buy".into())];
+        let buckets = store
+            .aggregate_buckets(1500, 3000, 1000, &buy, &stats)
+            .unwrap();
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0].start_ms, 1000);
+        assert_eq!(exact_sum(&buckets[0].columns, "user_id"), (1, true));
+        assert_eq!(buckets[0].columns[0].min, Some(Some(Scalar::Int(1))));
+        assert_eq!(buckets[0].columns[0].max, Some(Some(Scalar::Int(1))));
+        assert_eq!(exact_sum(&buckets[0].columns, "amount"), (150, true));
+        assert_eq!(buckets[1].start_ms, 2000);
+        assert_eq!(exact_sum(&buckets[1].columns, "user_id"), (1, true));
+        assert_eq!(exact_sum(&buckets[1].columns, "amount"), (225, true));
+        assert_eq!(buckets[2].start_ms, 3000);
+        assert_eq!(exact_sum(&buckets[2].columns, "user_id"), (0, false));
+        assert_eq!(buckets[2].columns[0].min, Some(None));
+        assert_eq!(buckets[2].columns[0].max, Some(None));
+        assert_eq!(exact_sum(&buckets[2].columns, "amount"), (0, false));
+        let bucket_users: i128 = buckets
+            .iter()
+            .map(|bucket| exact_sum(&bucket.columns, "user_id").0)
+            .sum();
+        let whole = store
+            .aggregate_with_filter(1500, 3000, &buy, &stats)
+            .unwrap();
+        assert_eq!(bucket_users, exact_sum(&whole, "user_id").0);
+        assert_eq!(
+            bucket_users as u64,
+            store.count_with_filter(1500, 3000, &buy).unwrap()
+        );
+
+        let with_null = store
+            .aggregate_buckets(
+                1500,
+                3000,
+                1000,
+                &[],
+                &[stat_req("user_id", true, false, false)],
+            )
+            .unwrap();
+        let null_users: i128 = with_null
+            .iter()
+            .map(|bucket| exact_sum(&bucket.columns, "user_id").0)
+            .sum();
+        let unbucketed = store
+            .aggregate_with_filter(1500, 3000, &[], &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(null_users, exact_sum(&unbucketed, "user_id").0);
+        assert_ne!(
+            null_users as u64,
+            store.count_with_filter(1500, 3000, &[]).unwrap()
+        );
+
+        let scores = store
+            .aggregate_buckets(
+                2500,
+                3000,
+                1000,
+                &[],
+                &[stat_req("score", true, false, false)],
+            )
+            .unwrap();
+        assert_eq!(
+            scores[0].columns[0].sum,
+            Some(StatSum::Float {
+                total: 1.0,
+                contributed: true,
+            })
+        );
+        assert_eq!(
+            scores[1].columns[0].sum,
+            Some(StatSum::Float {
+                total: -1e16,
+                contributed: true,
+            })
+        );
+        let cancelled = store
+            .aggregate_buckets(
+                1500,
+                3000,
+                10_000,
+                &[],
+                &[stat_req("score", true, false, false)],
+            )
+            .unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].start_ms, 0);
+        assert_eq!(
+            cancelled[0].columns[0].sum,
+            Some(StatSum::Float {
+                total: 0.0,
+                contributed: true,
+            })
+        );
+
+        let negative = store
+            .aggregate_buckets(
+                -1500,
+                -100,
+                1000,
+                &[],
+                &[stat_req("user_id", true, true, true)],
+            )
+            .unwrap();
+        assert_eq!(negative.len(), 2);
+        assert_eq!(negative[0].start_ms, -2000);
+        assert_eq!(exact_sum(&negative[0].columns, "user_id"), (1, true));
+        assert_eq!(negative[1].start_ms, -1000);
+        assert_eq!(exact_sum(&negative[1].columns, "user_id"), (0, false));
+        assert_eq!(negative[1].columns[0].min, Some(None));
+
+        assert!(store
+            .aggregate_buckets(10, 1, 1000, &[], &stats)
+            .unwrap()
+            .is_empty());
+        let too_many = store
+            .aggregate_buckets(0, 4096, 1, &[], &stats)
+            .unwrap_err();
+        assert!(too_many.to_string().contains("4096"), "{too_many}");
+
+        let later = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.min_ts >= 10_000)
+            .cloned()
+            .unwrap();
+        let path = segment::data_path(&data, later.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        let flip_at = later.offset as usize + segment::BLOCK_HEADER_LEN + 4;
+        bytes[flip_at] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let gapped = store
+            .aggregate_buckets(
+                1500,
+                5000,
+                1000,
+                &[],
+                &[stat_req("user_id", true, false, false)],
+            )
+            .unwrap();
+        assert!(gapped.len() > 2);
+        assert!(gapped
+            .iter()
+            .skip(2)
+            .all(|bucket| { exact_sum(&bucket.columns, "user_id") == (0, false) }));
+        assert!(store
+            .aggregate_buckets(
+                later.min_ts,
+                later.max_ts,
+                1000,
+                &[],
+                &[stat_req("user_id", true, false, false)]
+            )
+            .is_err());
+        store.close().unwrap();
+
+        let zoned = TempDir::new();
+        let schema = write_schema(zoned.path());
+        let data = zoned.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, user) in [(10i64, 1i64), (11, 2), (20, 10), (21, 11)] {
+            store
+                .append_json(&event(ts, Some(user), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let gt = [Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(5))];
+        let resolved = resolve_predicates(store.schema(), &gt).unwrap();
+        assert_eq!(store.blocks_in_range(0, 100, &resolved).len(), 1);
+        let victim = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.max_ts <= 11)
+            .cloned()
+            .unwrap();
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[victim.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let kept = store
+            .aggregate_buckets(0, 100, 32, &gt, &[stat_req("user_id", true, true, true)])
+            .unwrap();
+        assert!(kept.iter().any(|bucket| bucket.start_ms == 0));
+        let summed: i128 = kept
+            .iter()
+            .map(|bucket| exact_sum(&bucket.columns, "user_id").0)
+            .sum();
+        assert_eq!(summed, 21);
+        assert!(kept.iter().any(|bucket| {
+            bucket.start_ms > 0 && exact_sum(&bucket.columns, "user_id") == (0, false)
+        }));
+        assert!(store
+            .aggregate_buckets(
+                victim.min_ts,
+                victim.max_ts,
+                32,
+                &[],
+                &[stat_req("user_id", true, false, false)]
+            )
+            .is_err());
+        store.close().unwrap();
+
+        let wide = TempDir::new();
+        let schema_path = wide.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "amount", "type": "decimal", "scale": 0}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let store =
+            Store::open_with(wide.path().join("data"), &schema_path, test_options(8)).unwrap();
+        let huge = i128::MAX.to_string();
+        for (ts, amount) in [(1000i64, huge.as_str()), (2000, huge.as_str())] {
+            store
+                .append_json(format!(r#"{{"ts":{ts},"amount":"{amount}"}}"#).as_bytes())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let split = store
+            .aggregate_buckets(
+                1000,
+                2000,
+                1000,
+                &[],
+                &[stat_req("amount", true, false, false)],
+            )
+            .unwrap();
+        assert_eq!(exact_sum(&split[0].columns, "amount"), (i128::MAX, true));
+        assert_eq!(exact_sum(&split[1].columns, "amount"), (i128::MAX, true));
+        store
+            .append_json(format!(r#"{{"ts":1001,"amount":"1"}}"#).as_bytes())
+            .unwrap();
+        store.flush().unwrap();
+        let overflow = store.aggregate_buckets(
+            1000,
+            1001,
+            1000,
+            &[],
+            &[stat_req("amount", true, true, false)],
+        );
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("overflow")),
+            "{overflow:?}"
         );
         store.close().unwrap();
     }

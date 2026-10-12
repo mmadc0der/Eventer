@@ -16,6 +16,7 @@
 //! `GET /events/stats` returns `sum`, `min`, and `max` for numeric columns over
 //! that same range and the same filters, without the matching rows. `by=field`
 //! splits that result into one group per value of a single column.
+//! `bucket_ms` splits it into the same epoch-aligned buckets as the histogram.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
 //! with the caller's `before_ms`. The request `Content-Type` must be
 //! `application/json`, with an optional `charset=utf-8`. A block is removed
@@ -105,7 +106,15 @@ fn ingest(store: &eventer::Store, body: &[u8]) -> eventer::Result<Ingest> {
     }
 }
 
-async fn post_drop(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn post_drop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = reject_bucket_param(raw.as_deref().unwrap_or(""), "/events/drop") {
+        return *response;
+    }
     if let Err(response) = require_json_content_type(headers.get(CONTENT_TYPE)) {
         return *response;
     }
@@ -167,6 +176,11 @@ fn parse_before_ms(body: &[u8]) -> std::result::Result<i64, Box<Response>> {
     let Some(object) = value.as_object() else {
         return Err(bad_request("drop body must be a JSON object"));
     };
+    if object.contains_key("bucket_ms") {
+        return Err(bad_request(
+            "`bucket_ms` is not a parameter of /events/drop",
+        ));
+    }
     let Some(before) = object.get("before_ms") else {
         return Err(bad_request("missing `before_ms`"));
     };
@@ -201,6 +215,9 @@ async fn get_events(
         Err(response) => return *response,
     };
     let raw_query = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_bucket_param(raw_query, "/events") {
+        return *response;
+    }
     let (offset, limit) = match page_params(raw_query) {
         Ok(page) => page,
         Err(response) => return *response,
@@ -237,6 +254,9 @@ async fn count_events(
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
     if let Err(response) = reject_page_params(raw, "/events/count") {
+        return *response;
+    }
+    if let Err(response) = reject_bucket_param(raw, "/events/count") {
         return *response;
     }
     let from = match parse_bound(params.from, "from") {
@@ -329,6 +349,10 @@ async fn stats_events(
     if let Err(response) = reject_stats_params(raw) {
         return *response;
     }
+    let bucket_ms = match optional_bucket_ms(raw) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
     let from = match parse_bound(params.from, "from") {
         Ok(value) => value,
         Err(response) => return *response,
@@ -337,10 +361,18 @@ async fn stats_events(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    if let Some(bucket_ms) = bucket_ms {
+        if let Err(response) = reject_wide_histogram(from, to, bucket_ms) {
+            return *response;
+        }
+    }
     let by = match group_field(raw) {
         Ok(by) => by,
         Err(response) => return *response,
     };
+    if by.is_some() && bucket_ms.is_some() {
+        return *bad_request("`by` cannot be combined with `bucket_ms`");
+    }
     if let Some(field) = &by {
         if let Err(response) = reject_group_field(state.store.schema(), field) {
             return *response;
@@ -366,6 +398,13 @@ async fn stats_events(
                 .map(StatsOutcome::Groups)
         })
         .await
+    } else if let Some(bucket_ms) = bucket_ms {
+        tokio::task::spawn_blocking(move || {
+            store
+                .aggregate_buckets(from, to, bucket_ms, &predicates, &stats)
+                .map(StatsOutcome::Buckets)
+        })
+        .await
     } else {
         tokio::task::spawn_blocking(move || {
             store
@@ -377,6 +416,10 @@ async fn stats_events(
     match joined {
         Ok(Ok(StatsOutcome::Columns(columns))) => {
             let body = stats_body(state.store.schema(), &columns);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Ok(Ok(StatsOutcome::Buckets(buckets))) => {
+            let body = stat_buckets_body(state.store.schema(), &buckets);
             (StatusCode::OK, Json(body)).into_response()
         }
         Ok(Ok(StatsOutcome::Groups(groups))) => {
@@ -398,6 +441,7 @@ async fn stats_events(
 
 enum StatsOutcome {
     Columns(Vec<eventer::ColumnStats>),
+    Buckets(Vec<eventer::StatBucket>),
     Groups(Vec<eventer::StatGroup>),
 }
 
@@ -411,7 +455,7 @@ fn reject_stats_params(query: &str) -> std::result::Result<(), Box<Response>> {
         }
         let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
         let key = percent_decode(key, "query")?;
-        if key == "limit" || key == "offset" || key == "bucket_ms" {
+        if key == "limit" || key == "offset" {
             return Err(bad_request(&format!(
                 "`{key}` is not a parameter of /events/stats"
             )));
@@ -565,6 +609,19 @@ fn stats_body(schema: &eventer::Schema, columns: &[eventer::ColumnStats]) -> Val
     )]))
 }
 
+fn stat_buckets_body(schema: &eventer::Schema, buckets: &[eventer::StatBucket]) -> Value {
+    let list = buckets
+        .iter()
+        .map(|bucket| {
+            json!({
+                "start_ms": bucket.start_ms,
+                "columns": columns_object(schema, &bucket.columns),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"buckets": list})
+}
+
 fn groups_body(schema: &eventer::Schema, by: &str, groups: &[eventer::StatGroup]) -> Value {
     let ty = schema
         .fields
@@ -697,6 +754,12 @@ fn reject_wide_histogram(
 }
 
 fn bucket_ms_param(query: &str) -> std::result::Result<i64, Box<Response>> {
+    optional_bucket_ms(query)?.ok_or_else(|| bad_request("missing `bucket_ms` query parameter"))
+}
+
+/// `None` when `bucket_ms` is absent. A present value that is not a positive
+/// integer is an error, including zero, a negative, and a non-integer.
+fn optional_bucket_ms(query: &str) -> std::result::Result<Option<i64>, Box<Response>> {
     let mut found = None;
     if !query.is_empty() {
         for pair in query.split('&') {
@@ -725,7 +788,26 @@ fn bucket_ms_param(query: &str) -> std::result::Result<i64, Box<Response>> {
             found = Some(parsed);
         }
     }
-    found.ok_or_else(|| bad_request("missing `bucket_ms` query parameter"))
+    Ok(found)
+}
+
+fn reject_bucket_param(query: &str, route: &str) -> std::result::Result<(), Box<Response>> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = percent_decode(key, "query")?;
+        if key == "bucket_ms" {
+            return Err(bad_request(&format!(
+                "`bucket_ms` is not a parameter of {route}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn reject_page_params(query: &str, route: &str) -> std::result::Result<(), Box<Response>> {
@@ -2144,11 +2226,16 @@ mod tests {
             "/events/stats?from=1000&to=3000&min=ok",
             "/events/stats?from=1000&to=3000&sum=user_id&limit=1",
             "/events/stats?from=1000&to=3000&sum=user_id&offset=0",
-            "/events/stats?from=1000&to=3000&sum=user_id&bucket_ms=1",
+            "/events/stats?from=1000&to=3000&sum=user_id&bucket_ms=0",
+            "/events/stats?from=1000&to=3000&sum=user_id&bucket_ms=-1",
+            "/events/stats?from=1000&to=3000&sum=user_id&bucket_ms=1.5",
+            "/events/stats?from=1000&to=3000&sum=user_id&bucket_ms=nope",
+            "/events/stats?from=1000&to=3000&sum=user_id&by=action&bucket_ms=1000",
         ] {
             let (status, body) = get_json(&app, uri).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
             assert!(body.get("columns").is_none(), "{uri} -> {body}");
+            assert!(body.get("buckets").is_none(), "{uri} -> {body}");
         }
         let (status, body) = get_json(
             &app,
@@ -2213,6 +2300,273 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.get("columns").is_none(), "{body}");
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stats_bucket_numeric_columns_and_keep_empty_buckets() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-stats-bucket-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(2, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        for row in [
+            r#"{"ts":1500,"user_id":1,"score":1e16,"ok":true,"action":"buy","amount":"1.50"}"#,
+            r#"{"ts":2500,"user_id":1,"score":1.0,"ok":true,"action":"buy","amount":"2.25"}"#,
+            r#"{"ts":3000,"score":-1e16,"ok":false,"action":"other","amount":"9.00"}"#,
+            r#"{"ts":10000,"user_id":9,"score":1.0,"ok":true,"action":"later","amount":"4.00"}"#,
+        ] {
+            let (status, body) = post(&app, row).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let (status, counted) =
+            get_json(&app, "/events/count?from=1500&to=3000&eq=action=buy").await;
+        assert_eq!(status, StatusCode::OK, "{counted}");
+        let (status, whole) = get_json(
+            &app,
+            "/events/stats?from=1500&to=3000&eq=action=buy&sum=user_id&min=user_id&max=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{whole}");
+        assert!(whole.get("buckets").is_none(), "{whole}");
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1500&to=3000&bucket_ms=1000&eq=action=buy&sum=user_id&min=user_id&max=user_id&sum=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("columns").is_none(), "{body}");
+        let buckets = body["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0]["start_ms"], json!(1000));
+        assert_eq!(buckets[0]["columns"]["user_id"]["sum"], json!("1"));
+        assert_eq!(buckets[0]["columns"]["user_id"]["min"], json!(1));
+        assert_eq!(buckets[0]["columns"]["user_id"]["max"], json!(1));
+        assert_eq!(buckets[0]["columns"]["amount"]["sum"], json!("1.50"));
+        assert_eq!(buckets[1]["start_ms"], json!(2000));
+        assert_eq!(buckets[1]["columns"]["user_id"]["sum"], json!("1"));
+        assert_eq!(buckets[1]["columns"]["amount"]["sum"], json!("2.25"));
+        assert_eq!(buckets[2]["start_ms"], json!(3000));
+        assert_eq!(buckets[2]["columns"]["user_id"]["sum"], json!("0"));
+        assert_eq!(buckets[2]["columns"]["user_id"]["min"], Value::Null);
+        assert_eq!(buckets[2]["columns"]["user_id"]["max"], Value::Null);
+        assert_eq!(buckets[2]["columns"]["amount"]["sum"], json!("0"));
+        let bucket_sum: i64 = buckets
+            .iter()
+            .map(|bucket| {
+                bucket["columns"]["user_id"]["sum"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(bucket_sum, 2);
+        assert_eq!(whole["columns"]["user_id"]["sum"], json!("2"));
+        assert_eq!(json!(bucket_sum), counted["count"]);
+
+        let (status, with_null) = get_json(
+            &app,
+            "/events/stats?from=1500&to=3000&bucket_ms=1000&sum=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{with_null}");
+        let null_sum: i64 = with_null["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bucket| {
+                bucket["columns"]["user_id"]["sum"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+            })
+            .sum();
+        let (status, unbucketed) =
+            get_json(&app, "/events/stats?from=1500&to=3000&sum=user_id").await;
+        assert_eq!(status, StatusCode::OK, "{unbucketed}");
+        assert_eq!(
+            unbucketed["columns"]["user_id"]["sum"],
+            json!(null_sum.to_string())
+        );
+        let (status, all_count) = get_json(&app, "/events/count?from=1500&to=3000").await;
+        assert_eq!(status, StatusCode::OK, "{all_count}");
+        assert_ne!(json!(null_sum), all_count["count"]);
+
+        let (status, scores) = get_json(
+            &app,
+            "/events/stats?from=2500&to=3000&bucket_ms=1000&sum=score",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{scores}");
+        assert_eq!(scores["buckets"][0]["start_ms"], json!(2000));
+        assert_eq!(scores["buckets"][0]["columns"]["score"]["sum"], json!(1.0));
+        assert_eq!(scores["buckets"][1]["start_ms"], json!(3000));
+        assert_eq!(
+            scores["buckets"][1]["columns"]["score"]["sum"],
+            json!(-1e16)
+        );
+
+        let (status, empty_float) = get_json(
+            &app,
+            "/events/stats?from=4000&to=4000&bucket_ms=1000&sum=score&min=score&max=score",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{empty_float}");
+        assert_eq!(empty_float["buckets"][0]["start_ms"], json!(4000));
+        assert_eq!(
+            empty_float["buckets"][0]["columns"]["score"]["sum"],
+            json!(0)
+        );
+        assert_eq!(
+            empty_float["buckets"][0]["columns"]["score"]["min"],
+            Value::Null
+        );
+        assert_eq!(
+            empty_float["buckets"][0]["columns"]["score"]["max"],
+            Value::Null
+        );
+
+        let (status, histogram) =
+            get_json(&app, "/events/histogram?from=1500&to=3000&bucket_ms=1000").await;
+        assert_eq!(status, StatusCode::OK, "{histogram}");
+        assert_eq!(histogram["buckets"][0]["count"], json!(1));
+        assert!(histogram["buckets"][0].get("columns").is_none());
+
+        for uri in [
+            "/events?from=1500&to=3000&bucket_ms=1000",
+            "/events/count?from=1500&to=3000&bucket_ms=1000",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+        }
+        let (status, dropped) =
+            post_json(&app, "/events/drop?bucket_ms=1000", r#"{"before_ms":1}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+        let (status, dropped) =
+            post_json(&app, "/events/drop", r#"{"before_ms":1,"bucket_ms":1000}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+        let (status, still) = get_json(&app, "/events/count?from=1500&to=10000").await;
+        assert_eq!(status, StatusCode::OK, "{still}");
+        assert_eq!(still["count"], json!(4));
+
+        let data = root.join("data");
+        let dat = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("dat"))
+            .unwrap();
+        let mut bytes = fs::read(&dat).unwrap();
+        bytes[16] ^= 0xff;
+        fs::write(&dat, &bytes).unwrap();
+        for uri in [
+            "/events/stats?from=0&to=4096&bucket_ms=1&sum=user_id",
+            "/events/stats?from=1500&to=3000&sum=user_id&by=action&bucket_ms=1000",
+            "/events/stats?from=1500&to=3000&sum=user_id&bucket_ms=0",
+            "/events/stats?from=1500&to=3000&sum=user_id&limit=1&bucket_ms=1000",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+            assert!(body.get("buckets").is_none(), "{uri} -> {body}");
+            let message = body["error"].as_str().unwrap_or("");
+            assert!(!message.contains("corrupt"), "{uri} read the store: {body}");
+        }
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-stats-bucket-overflow-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "amount", "type": "decimal", "scale": 0}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(8, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        let huge = i128::MAX.to_string();
+        for (ts, amount) in [(1000i64, huge.as_str()), (2000, huge.as_str())] {
+            let (status, body) = post(
+                &app,
+                &format!(r#"{{"ts":{ts},"user_id":1,"score":1e308,"amount":"{amount}"}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        let (status, split) = get_json(
+            &app,
+            "/events/stats?from=1000&to=2000&bucket_ms=1000&sum=amount&sum=score",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{split}");
+        assert_eq!(split["buckets"][0]["columns"]["amount"]["sum"], json!(huge));
+        assert_eq!(split["buckets"][1]["columns"]["amount"]["sum"], json!(huge));
+        assert_eq!(split["buckets"][0]["columns"]["score"]["sum"], json!(1e308));
+        assert_eq!(split["buckets"][1]["columns"]["score"]["sum"], json!(1e308));
+        let (status, body) = post(
+            &app,
+            r#"{"ts":1001,"user_id":1,"score":1e308,"amount":"1"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, overflow) = get_json(
+            &app,
+            "/events/stats?from=1000&to=1001&bucket_ms=1000&sum=amount&min=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{overflow}");
+        assert!(overflow.get("buckets").is_none(), "{overflow}");
+        let (status, flooded) = get_json(
+            &app,
+            "/events/stats?from=1000&to=1001&bucket_ms=1000&sum=score",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{flooded}");
+        assert!(flooded.get("buckets").is_none(), "{flooded}");
 
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);

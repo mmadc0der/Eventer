@@ -23,6 +23,8 @@
 //! window, without building the rows.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
+//! [`Store::aggregate_buckets`](store::Store::aggregate_buckets) splits it into
+//! the same epoch-aligned buckets as the histogram.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares
@@ -45,8 +47,8 @@ mod zone;
 pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
 pub use store::{
-    CmpOp, ColumnStats, HistogramBucket, Predicate, RewriteReport, StatGroup, StatRequest, StatSum,
-    Stats, Store, StoreOptions, StoredBytes, MAX_HISTOGRAM_BUCKETS,
+    CmpOp, ColumnStats, HistogramBucket, Predicate, RewriteReport, StatBucket, StatGroup,
+    StatRequest, StatSum, Stats, Store, StoreOptions, StoredBytes, MAX_HISTOGRAM_BUCKETS,
 };
 pub use value::format_decimal;
 pub use value::{scalar_from_literal, Scalar};
