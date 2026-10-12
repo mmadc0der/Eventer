@@ -738,7 +738,17 @@ impl Store {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = self.read_block_bytes(&block, &mut dictionaries)?;
+            let through = indexes.iter().copied().fold(
+                needed_column(&self.schema, &resolved, None),
+                usize::max,
+            );
+            let payload = self.read_block_bytes(
+                &block,
+                &mut dictionaries,
+                segment::BlockLoad {
+                    through_column: Some(through),
+                },
+            )?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
             let mut captures = capture_columns(indexes.iter().copied());
