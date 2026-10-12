@@ -305,7 +305,7 @@ impl Store {
                 rows_out.len(),
                 block.row_count,
             );
-            if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget) {
+            if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget, true) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = self.load_scan_block(&block, &mut dictionaries, &resolved, true)?;
@@ -467,7 +467,12 @@ impl Store {
                 row_count,
                 block.row_count,
             );
-            if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget) {
+            if block_exceeds_read_budget(
+                block.uncompressed_len,
+                whole,
+                string_budget,
+                keep.is_none(),
+            ) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let loaded = if let Some(mask) = &load_mask {
@@ -589,7 +594,7 @@ impl Store {
         let mut total = 0u64;
         let mut dictionaries = HashMap::new();
         for block in blocks {
-            if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = self.read_block_bytes(
@@ -657,7 +662,7 @@ impl Store {
         let mut counts = vec![0u64; span.buckets];
         let mut dictionaries = HashMap::new();
         for block in blocks {
-            if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let payload = self.read_block_bytes(
@@ -721,7 +726,7 @@ impl Store {
         let mut running: Vec<RunningStat> = specs.into_iter().map(RunningStat::new).collect();
         let mut dictionaries = HashMap::new();
         for block in blocks {
-            if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let mut through = needed_column(&self.schema, &resolved, None);
@@ -804,7 +809,7 @@ impl Store {
         let text_group = matches!(group.ty, FieldType::String | FieldType::Text);
         let mut dictionaries = HashMap::new();
         for block in blocks {
-            if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                 return Err(Error::event("query response size limit exceeded"));
             }
             let through = indexes
@@ -1813,10 +1818,17 @@ fn take_match(offset: u64, limit: Option<u64>, skipped: &mut u64, emitted: usize
 
 /// The frame header's uncompressed length is not covered by the payload CRC.
 /// Every read refuses a length above [`MAX_QUERY_BYTES`]. A block that will be
-/// returned in full also refuses a length the shrinking response budget cannot hold.
-fn block_exceeds_read_budget(uncompressed_len: u32, whole: bool, string_budget: usize) -> bool {
+/// returned in full, with every column, also refuses a length the shrinking
+/// response budget cannot hold. A projected scan leaves that check to the
+/// per-row JSON length, because unread columns inflate `uncompressed_len`.
+fn block_exceeds_read_budget(
+    uncompressed_len: u32,
+    whole: bool,
+    string_budget: usize,
+    full_columns: bool,
+) -> bool {
     let declared = uncompressed_len as usize;
-    declared > MAX_QUERY_BYTES || (whole && declared > string_budget)
+    declared > MAX_QUERY_BYTES || (full_columns && whole && declared > string_budget)
 }
 
 /// `block.row_count` is the frame header. The payload CRC does not cover it.
@@ -2963,6 +2975,49 @@ mod tests {
                 .to_string()
                 .contains("query response size limit exceeded"),
             "{count}"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn projected_scan_ignores_unread_columns_in_the_response_budget() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(2);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        store
+            .append_json(&event(10, Some(1), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(20, Some(2), "view", None, "1.00"))
+            .unwrap();
+        store.close().unwrap();
+
+        patch_block_header(&data, 1, Some(MAX_QUERY_BYTES as u32), None);
+
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let full = store.query_json_window(10, 20, &[], 0, None).unwrap_err();
+        assert!(
+            full.to_string()
+                .contains("query response size limit exceeded"),
+            "{full}"
+        );
+        let projected = store
+            .query_json_columns(10, 20, &[], 0, None, &[0])
+            .unwrap();
+        assert_eq!(projected, br#"[{"ts":10},{"ts":20}]"#);
+        store.close().unwrap();
+
+        patch_block_header(&data, 1, Some(MAX_QUERY_BYTES as u32 + 1), None);
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        let over = store
+            .query_json_columns(10, 20, &[], 0, None, &[0])
+            .unwrap_err();
+        assert!(
+            over.to_string()
+                .contains("query response size limit exceeded"),
+            "{over}"
         );
         store.close().unwrap();
     }

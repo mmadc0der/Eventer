@@ -833,7 +833,9 @@ fn projection(
             key.as_str(),
             "from" | "to" | "limit" | "offset" | "eq" | "gt" | "ge" | "lt" | "le" | "select"
         ) {
-            return Err(bad_request(&format!("`{key}` is not a field name")));
+            return Err(bad_request(&format!(
+                "`{key}` is not a parameter of /events"
+            )));
         }
     }
     indexes.sort_unstable();
@@ -2615,6 +2617,11 @@ mod tests {
             all[0].as_object().unwrap().keys().collect::<Vec<_>>(),
             full[0].as_object().unwrap().keys().collect::<Vec<_>>()
         );
+
+        let (status, note) =
+            get_json(&app, "/events?from=1000&to=1000&select=action&note=landing").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{note}");
+        assert_eq!(note["error"], "`note` is not a parameter of /events");
 
         for uri in [
             "/events?from=1000&to=1000&select=missing",
