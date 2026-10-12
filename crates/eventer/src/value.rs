@@ -810,9 +810,8 @@ impl Serialize for RowSerializable<'_> {
 /// the stored lexeme survived. Use [`row_to_json_bytes`] or [`RowSerializable`]
 /// when the original text, including duplicate keys, has to round-trip.
 pub fn row_to_json(schema: &Schema, row: &Row) -> Result<Value> {
-    let bytes = serde_json::to_vec(&RowSerializable { schema, row }).map_err(|err| {
-        Error::corrupt(format!("failed to encode row JSON: {err}"))
-    })?;
+    let bytes = serde_json::to_vec(&RowSerializable { schema, row })
+        .map_err(|err| Error::corrupt(format!("failed to encode row JSON: {err}")))?;
     value_from_row_json_bytes(&bytes, schema)
 }
 
@@ -874,27 +873,45 @@ fn parse_row_object_key(bytes: &[u8], start: usize) -> Result<(String, usize)> {
     let inner = bytes
         .get(start + 1..end - 1)
         .ok_or_else(|| Error::corrupt("truncated row object key"))?;
-    let key = decode_json_string(inner).map_err(|err| {
-        Error::corrupt(format!("row object key is not valid UTF-8: {err}"))
-    })?;
+    let key = decode_json_string(inner)
+        .map_err(|err| Error::corrupt(format!("row object key is not valid UTF-8: {err}")))?;
     Ok((key, end))
 }
 
 fn json_lexeme_to_value(raw: &[u8]) -> Result<Value> {
-    let text = std::str::from_utf8(raw)
-        .map_err(|_| Error::corrupt("json column is not valid UTF-8"))?;
+    let text =
+        std::str::from_utf8(raw).map_err(|_| Error::corrupt("json column is not valid UTF-8"))?;
     validate_json_structure(text)?;
-    serde_json::from_str(text).map_err(|err| Error::corrupt(format!("json column is invalid: {err}")))
+    serde_json::from_str(text)
+        .map_err(|err| Error::corrupt(format!("json column is invalid: {err}")))
 }
 
 /// Serializes a row to JSON bytes, preserving raw `json` column text from ingest.
 pub fn row_to_json_bytes(schema: &Schema, row: &Row) -> Result<Vec<u8>> {
+    write_row_json(schema, row, None)
+}
+
+/// Same bytes as [`row_to_json_bytes`] for the fields `keep` marks.
+///
+/// A false field is absent. A true field that is null is JSON `null`. Field
+/// order is the schema order. `keep` aligned with every column matches
+/// [`row_to_json_bytes`].
+pub fn row_to_json_bytes_selected(schema: &Schema, row: &Row, keep: &[bool]) -> Result<Vec<u8>> {
+    write_row_json(schema, row, Some(keep))
+}
+
+fn write_row_json(schema: &Schema, row: &Row, keep: Option<&[bool]>) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.push(b'{');
+    let mut written = 0usize;
     for (index, (field, scalar)) in schema.fields.iter().zip(row.values.iter()).enumerate() {
-        if index > 0 {
+        if keep.is_some_and(|keep| !keep.get(index).copied().unwrap_or(false)) {
+            continue;
+        }
+        if written > 0 {
             out.push(b',');
         }
+        written += 1;
         serde_json::to_writer(&mut out, &field.name)
             .map_err(|err| Error::corrupt(format!("failed to encode field name: {err}")))?;
         out.push(b':');
@@ -917,11 +934,9 @@ fn scalar_to_json_value(field: &Field, scalar: &Scalar) -> Result<Value> {
     match (field.ty, scalar) {
         (_, Scalar::Null) => Ok(Value::Null),
         (FieldType::Int, Scalar::Int(v)) => Ok(Value::Number((*v).into())),
-        (FieldType::Float, Scalar::Float(v)) => {
-            Number::from_f64(*v)
-                .map(Value::Number)
-                .ok_or_else(|| Error::corrupt(format!("field `{}` is not a finite float", field.name)))
-        }
+        (FieldType::Float, Scalar::Float(v)) => Number::from_f64(*v)
+            .map(Value::Number)
+            .ok_or_else(|| Error::corrupt(format!("field `{}` is not a finite float", field.name))),
         (FieldType::Bool, Scalar::Bool(v)) => Ok(Value::Bool(*v)),
         (FieldType::String | FieldType::Text, Scalar::Str(v)) => Ok(Value::String(v.clone())),
         (FieldType::Decimal { scale }, Scalar::Decimal(v)) => {
@@ -1044,11 +1059,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let row = parse_event(
-            &schema,
-            br#"{"ts":1,"props":{"a":1},"props":{"a":2}}"#,
-        )
-        .unwrap();
+        let row = parse_event(&schema, br#"{"ts":1,"props":{"a":1},"props":{"a":2}}"#).unwrap();
         match &row.values[1] {
             Scalar::Json(raw) => assert_eq!(raw, r#"{"a":2}"#),
             other => panic!("unexpected {other:?}"),
@@ -1096,11 +1107,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let row = parse_event(
-            &schema,
-            br#"{"ts":1,"\uD83D\uDE00x":1,"props":2}"#,
-        )
-        .unwrap();
+        let row = parse_event(&schema, br#"{"ts":1,"\uD83D\uDE00x":1,"props":2}"#).unwrap();
         match &row.values[1] {
             Scalar::Json(raw) => assert_eq!(raw, "1"),
             other => panic!("unexpected {other:?}"),
@@ -1123,11 +1130,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let row = parse_event(
-            &schema,
-            br#"{"ts":1,"\uD83D\uDE00":9,"props":2}"#,
-        )
-        .unwrap();
+        let row = parse_event(&schema, br#"{"ts":1,"\uD83D\uDE00":9,"props":2}"#).unwrap();
         match &row.values[1] {
             Scalar::Json(raw) => assert_eq!(raw, "2"),
             other => panic!("unexpected {other:?}"),

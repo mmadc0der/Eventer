@@ -8,15 +8,15 @@ use std::time::Duration;
 
 use crate::codec::{
     accumulate_histogram_filtered, block_row_count, cmp_numeric, count_rows_filtered,
-    decode_rows_filtered, range_impossible, range_matches, read_timestamp_column, tighter_lower,
-    tighter_upper, visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd,
-    RangeFilter,
+    decode_rows_filtered, decode_rows_included, range_impossible, range_matches,
+    read_timestamp_column, read_timestamp_column_included, tighter_lower, tighter_upper,
+    visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd, RangeFilter,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, FieldType, Schema};
 use crate::segment::{self, Catalog};
-use crate::value::{self, row_to_json_bytes, Row, Scalar};
+use crate::value::{self, row_to_json_bytes, row_to_json_bytes_selected, Row, Scalar};
 
 /// Maximum JSON bytes a single query may materialize in the response buffer.
 pub const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
@@ -396,12 +396,52 @@ impl Store {
         offset: u64,
         limit: Option<u64>,
     ) -> Result<Vec<u8>> {
+        self.query_json_projected(from_ms, to_ms, predicates, offset, limit, None)
+    }
+
+    /// [`Store::query_json_window`] with a column list.
+    ///
+    /// Each object contains `columns` in schema order, once each. A selected
+    /// null is JSON `null`. A field that is not selected is absent. Filters may
+    /// name a column that is not selected. A sliced block does not decompress
+    /// a column that is neither selected nor needed by a filter. A single-frame
+    /// block is decoded in full and the omitted values are dropped after that.
+    /// An index past the schema is [`Error::Schema`](Error::Schema) and does
+    /// not read the store.
+    pub fn query_json_columns(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        offset: u64,
+        limit: Option<u64>,
+        columns: &[usize],
+    ) -> Result<Vec<u8>> {
+        self.query_json_projected(from_ms, to_ms, predicates, offset, limit, Some(columns))
+    }
+
+    fn query_json_projected(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        offset: u64,
+        limit: Option<u64>,
+        columns: Option<&[usize]>,
+    ) -> Result<Vec<u8>> {
         if limit == Some(0) {
             return Err(Error::event("query limit must be a positive integer"));
         }
+        let keep = match columns {
+            None => None,
+            Some(indexes) => Some(select_keep(&self.schema, indexes)?),
+        };
         let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
             return Ok(b"[]".to_vec());
         };
+        let load_mask = keep
+            .as_ref()
+            .map(|keep| columns_to_load(&self.schema, &resolved, keep));
         let _retention = self.pipeline.lock_for_read();
         let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut out = Vec::from(b"[");
@@ -430,30 +470,52 @@ impl Store {
             if block_exceeds_read_budget(block.uncompressed_len, whole, string_budget) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let payload = self.load_scan_block(&block, &mut dictionaries, &resolved, true)?;
-            let nrows = block_row_count(&payload)?;
+            let loaded = if let Some(mask) = &load_mask {
+                self.read_loaded_block(
+                    &block,
+                    &mut dictionaries,
+                    segment::BlockLoad {
+                        through_column: None,
+                        columns: Some(mask),
+                    },
+                )?
+            } else {
+                segment::LoadedBlock {
+                    bytes: self.load_scan_block(&block, &mut dictionaries, &resolved, true)?,
+                    included: None,
+                }
+            };
+            let payload = &loaded.bytes;
+            let nrows = block_row_count(payload)?;
             require_header_row_count(block.row_count, nrows)?;
             if resolved.unfiltered()
                 && contained
                 && offset_covers_block(offset, skipped, block.row_count)
             {
-                if every_timestamp_in_range(&self.schema, &payload, from_ms, to_ms)?
-                    && skip_whole_block(offset, block.row_count, &mut skipped)
-                {
+                let covered = match &loaded.included {
+                    Some(included) => {
+                        let timestamps =
+                            read_timestamp_column_included(&self.schema, payload, included)?;
+                        timestamps.iter().all(|ts| *ts >= from_ms && *ts <= to_ms)
+                    }
+                    None => every_timestamp_in_range(&self.schema, payload, from_ms, to_ms)?,
+                };
+                if covered && skip_whole_block(offset, block.row_count, &mut skipped) {
                     continue;
                 }
             }
             if whole && row_count + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
-            let rows = decode_rows_filtered(
+            let rows = decode_rows_included(
                 &self.schema,
-                &payload,
+                payload,
                 from_ms,
                 to_ms,
                 string_budget,
                 &resolved.predicates,
                 &resolved.ranges,
+                loaded.included.as_deref(),
             )?;
             let mut page_done = false;
             for row in rows {
@@ -469,7 +531,11 @@ impl Store {
                     if row_count >= MAX_QUERY_ROWS {
                         return Err(Error::event("query row limit exceeded"));
                     }
-                    let row_bytes = row_to_json_bytes(&self.schema, &row)?;
+                    let row_bytes = if let Some(keep) = &keep {
+                        row_to_json_bytes_selected(&self.schema, &row, keep)?
+                    } else {
+                        row_to_json_bytes(&self.schema, &row)?
+                    };
                     let next_len = out
                         .len()
                         .checked_add(row_bytes.len())
@@ -531,6 +597,7 @@ impl Store {
                 &mut dictionaries,
                 segment::BlockLoad {
                     through_column: Some(needed_column(&self.schema, &resolved, None)),
+                    columns: None,
                 },
             )?;
             let nrows = block_row_count(&payload)?;
@@ -598,6 +665,7 @@ impl Store {
                 &mut dictionaries,
                 segment::BlockLoad {
                     through_column: Some(needed_column(&self.schema, &resolved, None)),
+                    columns: None,
                 },
             )?;
             let nrows = block_row_count(&payload)?;
@@ -665,6 +733,7 @@ impl Store {
                 &mut dictionaries,
                 segment::BlockLoad {
                     through_column: Some(through),
+                    columns: None,
                 },
             )?;
             let nrows = block_row_count(&payload)?;
@@ -738,15 +807,16 @@ impl Store {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let through = indexes.iter().copied().fold(
-                needed_column(&self.schema, &resolved, None),
-                usize::max,
-            );
+            let through = indexes
+                .iter()
+                .copied()
+                .fold(needed_column(&self.schema, &resolved, None), usize::max);
             let payload = self.read_block_bytes(
                 &block,
                 &mut dictionaries,
                 segment::BlockLoad {
                     through_column: Some(through),
+                    columns: None,
                 },
             )?;
             let nrows = block_row_count(&payload)?;
@@ -1057,8 +1127,17 @@ impl Store {
         &self,
         block: &segment::BlockMeta,
         dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
-        load: segment::BlockLoad,
+        load: segment::BlockLoad<'_>,
     ) -> Result<Vec<u8>> {
+        Ok(self.read_loaded_block(block, dictionaries, load)?.bytes)
+    }
+
+    fn read_loaded_block(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        load: segment::BlockLoad<'_>,
+    ) -> Result<segment::LoadedBlock> {
         let data_path = segment::data_path(&self.dir, block.segment_id);
         let uses_dict = segment::frame_uses_dictionary(&data_path, block)?;
         if uses_dict && !dictionaries.contains_key(&block.segment_id) {
@@ -1100,6 +1179,7 @@ impl Store {
             dictionaries,
             segment::BlockLoad {
                 through_column: through,
+                columns: None,
             },
         )
     }
@@ -1762,6 +1842,37 @@ fn every_timestamp_in_range(
 }
 
 /// The remaining offset covers every row in the block, so a timestamp scan can decide a skip.
+/// Selected fields, in schema order, with duplicates collapsed.
+fn select_keep(schema: &Schema, columns: &[usize]) -> Result<Vec<bool>> {
+    let mut keep = vec![false; schema.fields.len()];
+    for index in columns {
+        let Some(slot) = keep.get_mut(*index) else {
+            return Err(Error::schema("unknown select field"));
+        };
+        *slot = true;
+    }
+    Ok(keep)
+}
+
+/// Timestamp, filter columns, and selected columns. Anything else stays compressed.
+fn columns_to_load(schema: &Schema, resolved: &ResolvedScan, keep: &[bool]) -> Vec<bool> {
+    let mut load = keep.to_vec();
+    if let Some(slot) = load.get_mut(schema.timestamp_index) {
+        *slot = true;
+    }
+    for predicate in &resolved.predicates {
+        if let Some(slot) = load.get_mut(predicate.index) {
+            *slot = true;
+        }
+    }
+    for range in &resolved.ranges {
+        if let Some(slot) = load.get_mut(range.index) {
+            *slot = true;
+        }
+    }
+    load
+}
+
 fn needed_column(schema: &Schema, resolved: &ResolvedScan, extra: Option<usize>) -> usize {
     resolved
         .predicates
@@ -4000,6 +4111,213 @@ mod tests {
             other => panic!("json column missing: {other:?}"),
         }
         store.close().unwrap();
+    }
+
+    #[test]
+    fn select_skips_a_slice_it_does_not_need_and_projects_a_single_frame() {
+        let dir = TempDir::new();
+        let schema_text = r#"{
+            "timestamp_field": "time",
+            "fields": [
+                {"name": "time", "type": "timestamp"},
+                {"name": "type", "type": "string"},
+                {"name": "data", "type": "json"}
+            ]
+        }"#;
+        let schema = dir.path().join("schema.json");
+        fs::write(&schema, schema_text).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(128)).unwrap();
+        let blob = "x".repeat(200);
+        for index in 0..128 {
+            let event = format!(
+                r#"{{"time":{index},"type":"click","data":{{"n":{index},"blob":"{blob}"}}}}"#
+            );
+            store.append_json(event.as_bytes()).unwrap();
+        }
+        store.flush().unwrap();
+        let path = segment::data_path(&data, 1);
+        let mut bytes = fs::read(&path).unwrap();
+        assert!(
+            bytes.windows(4).any(|magic| magic == b"EVCS"),
+            "a large json column is its own slice"
+        );
+        let from = 0;
+        let to = 127;
+        let projected = store
+            .query_json_columns(from, to, &[], 0, None, &[0, 1])
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&projected).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 128);
+        assert!(rows[0].get("data").is_none(), "{rows}");
+        assert_eq!(rows[0]["time"], 0);
+        assert_eq!(rows[0]["type"], "click");
+        let filtered = [Predicate::Eq("type".into(), "click".into())];
+        let times = store
+            .query_json_columns(from, to, &filtered, 0, Some(1), &[0])
+            .unwrap();
+        assert_eq!(times, br#"[{"time":0}]"#);
+
+        flip_column_slice(&mut bytes, 1);
+        fs::write(&path, &bytes).unwrap();
+        let skipped = store.query_json_columns(from, to, &[], 0, None, &[0]);
+        assert!(
+            skipped.is_ok(),
+            "type slice was decompressed: {}",
+            skipped.unwrap_err()
+        );
+        flip_column_slice(&mut bytes, 1);
+        flip_column_slice(&mut bytes, 2);
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            store
+                .query_json_columns(from, to, &[], 0, None, &[0, 2])
+                .is_err(),
+            "selected json slice was not read"
+        );
+        let still = store.query_json_columns(from, to, &[], 0, None, &[0, 1]);
+        assert!(
+            still.is_ok(),
+            "json slice was decompressed: {}",
+            still.unwrap_err()
+        );
+        store.close().unwrap();
+
+        let plain = TempDir::new();
+        let plain_schema = write_schema(plain.path());
+        let plain_store =
+            Store::open_with(plain.path().join("data"), &plain_schema, test_options(8)).unwrap();
+        plain_store
+            .append_json(&event(10, Some(1), "click", Some("landing"), "1.00"))
+            .unwrap();
+        plain_store.flush().unwrap();
+        let dat = fs::read(segment::data_path(&plain.path().join("data"), 1)).unwrap();
+        assert!(
+            !dat.windows(4).any(|magic| magic == b"EVCS"),
+            "a short block stays one frame"
+        );
+        let one = plain_store
+            .query_json_columns(10, 10, &[], 0, None, &[4])
+            .unwrap();
+        assert_eq!(one, br#"[{"action":"click"}]"#);
+        let full = plain_store.query_json(10, 10).unwrap();
+        assert!(full.windows(6).any(|window| window == b"\"note\""));
+        plain_store.close().unwrap();
+    }
+
+    /// Release-only check from the column-projection contract. Debug builds
+    /// do not meet the timing, so `cargo test` leaves this ignored.
+    #[test]
+    #[ignore]
+    fn projected_select_is_at_least_twice_as_fast_on_wide_json() {
+        let dir = TempDir::new();
+        let schema = dir.path().join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "time",
+                "fields": [
+                    {"name": "time", "type": "timestamp"},
+                    {"name": "type", "type": "string"},
+                    {"name": "data", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = StoreOptions {
+            block_rows: 2048,
+            zstd_level: 3,
+            ..test_options(2048)
+        };
+        let store = Store::open_with(dir.path().join("data"), &schema, options).unwrap();
+        let count = 8192usize;
+        for index in 0..count {
+            let mut blob = String::with_capacity(640);
+            while blob.len() < 640 {
+                blob.push_str(&format!("{index:08x}{:08x}", blob.len()));
+            }
+            let event = format!(
+                r#"{{"time":{index},"type":"click","data":{{"n":{index},"blob":"{blob}"}}}}"#
+            );
+            store.append_json(event.as_bytes()).unwrap();
+        }
+        store.flush().unwrap();
+        let from = 0i64;
+        let to = count as i64;
+        let time_one = |projected: bool| {
+            let started = std::time::Instant::now();
+            let bytes = if projected {
+                store
+                    .query_json_columns(from, to, &[], 0, None, &[0, 1])
+                    .unwrap()
+            } else {
+                store.query_json(from, to).unwrap()
+            };
+            (started.elapsed(), bytes)
+        };
+        let _ = time_one(false);
+        let _ = time_one(true);
+        let mut full = Vec::new();
+        let mut narrow = Vec::new();
+        for _ in 0..3 {
+            let (elapsed, bytes) = time_one(false);
+            let rows: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(rows.as_array().unwrap().len(), count);
+            full.push(elapsed);
+            let (elapsed, bytes) = time_one(true);
+            let rows: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(rows.as_array().unwrap().len(), count);
+            assert!(rows[0].get("data").is_none(), "{rows}");
+            assert!(rows[0].get("time").is_some());
+            assert!(rows[0].get("type").is_some());
+            narrow.push(elapsed);
+        }
+        full.sort();
+        narrow.sort();
+        let full_median = full[1];
+        let narrow_median = narrow[1];
+        eprintln!(
+            "full median {full_median:?} ({full:?}); select median {narrow_median:?} ({narrow:?})"
+        );
+        assert!(
+            full_median >= narrow_median * 2,
+            "select median {narrow_median:?} was not twice as fast as {full_median:?}"
+        );
+        store.close().unwrap();
+    }
+
+    fn flip_column_slice(bytes: &mut [u8], column: u16) {
+        let start = bytes
+            .windows(4)
+            .position(|magic| magic == b"EVCS")
+            .expect("column container");
+        let mut cursor = start + 4;
+        assert_eq!(bytes[cursor], 1, "slice version");
+        cursor += 1 + 4;
+        let n_slices = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap()) as usize;
+        cursor += 2;
+        for _ in 0..n_slices {
+            let first = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap());
+            cursor += 4;
+            cursor += 1;
+            cursor += 4;
+            let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if first == column {
+                bytes[cursor] ^= 0xff;
+                // The frame CRC covers every slice. Repair it so a skipped
+                // slice is the only thing that can fail, and only if read.
+                let header = start - segment::BLOCK_HEADER_LEN;
+                let compressed_len =
+                    u32::from_le_bytes(bytes[header + 4..header + 8].try_into().unwrap()) as usize;
+                let payload = start;
+                let crc = crc32fast::hash(&bytes[payload..payload + compressed_len]);
+                bytes[header + 8..header + 12].copy_from_slice(&crc.to_le_bytes());
+                return;
+            }
+            cursor += len;
+        }
+        panic!("column {column} was not a slice");
     }
 
     #[test]
