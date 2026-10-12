@@ -388,17 +388,32 @@ pub(crate) fn block_compressor(
 /// How much of a sliced block to materialize.
 ///
 /// `through_column` stops after that schema column, inclusive. Later slices
-/// stay compressed. A legacy single-frame payload ignores it and returns the
-/// whole block.
+/// stay compressed. `columns`, when set, is stricter: a slice whose columns
+/// are all false is not decompressed, including a slice that sits before the
+/// last column the caller still needs. A legacy single-frame payload ignores
+/// both and returns the whole block.
 #[derive(Clone, Copy)]
-pub struct BlockLoad {
+pub struct BlockLoad<'a> {
     pub through_column: Option<usize>,
+    pub columns: Option<&'a [bool]>,
 }
 
-impl BlockLoad {
-    pub const FULL: BlockLoad = BlockLoad {
+impl BlockLoad<'static> {
+    pub const FULL: BlockLoad<'static> = BlockLoad {
         through_column: None,
+        columns: None,
     };
+}
+
+/// Decompressed block image.
+///
+/// `included` is `None` when `bytes` is a normal column image: stored columns
+/// in order, and a column past the end was not in this block. `Some` means
+/// those flags name the schema columns whose encodings were concatenated, so
+/// a false column is a hole and is not in `bytes`.
+pub struct LoadedBlock {
+    pub bytes: Vec<u8>,
+    pub included: Option<Vec<bool>>,
 }
 
 /// Compress `raw` as one zstd frame, or as column slices when a later column
@@ -507,7 +522,7 @@ fn decompress_cap(frame: &ScannedBlock) -> usize {
 
 fn decompress_payload(payload: &[u8], dictionary: Option<&[u8]>, cap: usize) -> Result<Vec<u8>> {
     if payload.starts_with(&SLICE_MAGIC) {
-        return expand_column_slices(payload, dictionary, cap, BlockLoad::FULL);
+        return Ok(expand_column_slices(payload, dictionary, cap, BlockLoad::FULL)?.bytes);
     }
     decompress_zstd_stream(payload, dictionary, cap)
 }
@@ -552,8 +567,8 @@ fn expand_column_slices(
     payload: &[u8],
     dictionary: Option<&[u8]>,
     cap: usize,
-    load: BlockLoad,
-) -> Result<Vec<u8>> {
+    load: BlockLoad<'_>,
+) -> Result<LoadedBlock> {
     if payload.len() < 4 + 1 + 4 + 2 || payload[..4] != SLICE_MAGIC {
         return Err(Error::corrupt("column slice header is truncated"));
     }
@@ -565,13 +580,14 @@ fn expand_column_slices(
     cursor += 4;
     let n_slices = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
     cursor += 2;
+    let mut included = load.columns.map(|columns| vec![false; columns.len()]);
     for _ in 0..n_slices {
         if payload.len() < cursor + 2 + 2 + 1 + 4 + 4 {
             return Err(Error::corrupt("truncated column slice"));
         }
         let first_column = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap());
         cursor += 2;
-        let _last_column = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap());
+        let last_column = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap());
         cursor += 2;
         let kind = payload[cursor];
         cursor += 1;
@@ -587,11 +603,21 @@ fn expand_column_slices(
         }
         let body = &payload[cursor..end];
         cursor = end;
-        if load
-            .through_column
-            .is_some_and(|through| usize::from(first_column) > through)
-        {
-            break;
+        let first = usize::from(first_column);
+        let last = usize::from(last_column);
+        let keep_slice = if let Some(columns) = load.columns {
+            (first..=last).any(|index| columns.get(index).copied().unwrap_or(false))
+        } else if let Some(through) = load.through_column {
+            first <= through
+        } else {
+            true
+        };
+        if !keep_slice {
+            // A prefix load can stop. A column set may still need a later slice.
+            if load.columns.is_none() {
+                break;
+            }
+            continue;
         }
         if raw_len > cap.saturating_sub(out.len()) {
             return Err(Error::corrupt("block exceeds the decompress bound"));
@@ -607,11 +633,21 @@ fn expand_column_slices(
             }
             _ => return Err(Error::corrupt("unknown column slice kind")),
         }
+        if let Some(included) = &mut included {
+            for index in first..=last {
+                if let Some(slot) = included.get_mut(index) {
+                    *slot = true;
+                }
+            }
+        }
         if out.len() > cap {
             return Err(Error::corrupt("block exceeds the decompress bound"));
         }
     }
-    Ok(out)
+    Ok(LoadedBlock {
+        bytes: out,
+        included,
+    })
 }
 
 fn read_compressed_frame(
@@ -1685,15 +1721,15 @@ pub fn read_block_payload(
     meta: &BlockMeta,
     dictionary: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    read_block_payload_with(path, meta, dictionary, BlockLoad::FULL)
+    Ok(read_block_payload_with(path, meta, dictionary, BlockLoad::FULL)?.bytes)
 }
 
 pub fn read_block_payload_with(
     path: &Path,
     meta: &BlockMeta,
     dictionary: Option<&[u8]>,
-    load: BlockLoad,
-) -> Result<Vec<u8>> {
+    load: BlockLoad<'_>,
+) -> Result<LoadedBlock> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     if meta.offset >= file_len {
@@ -1760,16 +1796,22 @@ pub fn read_block_payload_with(
     if compressed.starts_with(&SLICE_MAGIC) {
         return expand_column_slices(compressed, dictionary, uncompressed_len as usize, load);
     }
+    // One frame has no column boundary. The caller drops fields after decode.
     let _ = load;
-    decompress_block_payload(compressed, uncompressed_len as usize, dictionary).map_err(|err| {
-        if dictionary_frame {
-            Error::corrupt(format!(
-                "zstd dictionary decompress failed at offset {} in segment {}: {err}",
-                meta.offset, meta.segment_id
-            ))
-        } else {
-            Error::corrupt(format!("zstd decompress failed: {err}"))
-        }
+    let bytes = decompress_block_payload(compressed, uncompressed_len as usize, dictionary)
+        .map_err(|err| {
+            if dictionary_frame {
+                Error::corrupt(format!(
+                    "zstd dictionary decompress failed at offset {} in segment {}: {err}",
+                    meta.offset, meta.segment_id
+                ))
+            } else {
+                Error::corrupt(format!("zstd decompress failed: {err}"))
+            }
+        })?;
+    Ok(LoadedBlock {
+        bytes,
+        included: None,
     })
 }
 

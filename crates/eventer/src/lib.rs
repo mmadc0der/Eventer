@@ -16,6 +16,9 @@
 //! timestamps only. Each column is its own zstd frame when that container is
 //! at most a quarter larger than one frame, so a filter does not decompress
 //! columns after the predicate.
+//! [`Store::query_json_columns`](store::Store::query_json_columns) returns
+//! the same rows with only the requested fields. A column that is neither
+//! selected nor needed by a filter stays compressed.
 //! [`Store::histogram_with_filter`](store::Store::histogram_with_filter) counts
 //! the same rows into fixed epoch-aligned time buckets.
 //! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums

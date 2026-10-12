@@ -9,6 +9,7 @@
 //! `gt` and `lt` are exclusive. `ge` and `le` are inclusive.
 //! `limit` keeps the first matching rows and `offset` skips matches before that.
 //! Omitting both returns the full match set.
+//! Repeat `select=field` to return only those fields, in schema order.
 //! `GET /events/count` and `GET /events/histogram` use that same range and those
 //! same filters. `limit` and `offset` are rejected on both.
 //! `GET /events/histogram?from=&to=&bucket_ms=N` returns one count per epoch-aligned
@@ -105,7 +106,15 @@ fn ingest(store: &eventer::Store, body: &[u8]) -> eventer::Result<Ingest> {
     }
 }
 
-async fn post_drop(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn post_drop(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = reject_select(raw.as_deref().unwrap_or(""), "/events/drop") {
+        return *response;
+    }
     if let Err(response) = require_json_content_type(headers.get(CONTENT_TYPE)) {
         return *response;
     }
@@ -209,9 +218,14 @@ async fn get_events(
         Ok(predicates) => predicates,
         Err(response) => return *response,
     };
+    let columns = match projection(state.store.schema(), raw_query) {
+        Ok(columns) => columns,
+        Err(response) => return *response,
+    };
     let store = Arc::clone(&state.store);
-    let joined = tokio::task::spawn_blocking(move || {
-        store.query_json_window(from, to, &predicates, offset, limit)
+    let joined = tokio::task::spawn_blocking(move || match columns {
+        None => store.query_json_window(from, to, &predicates, offset, limit),
+        Some(columns) => store.query_json_columns(from, to, &predicates, offset, limit, &columns),
     })
     .await;
     match joined {
@@ -411,7 +425,7 @@ fn reject_stats_params(query: &str) -> std::result::Result<(), Box<Response>> {
         }
         let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
         let key = percent_decode(key, "query")?;
-        if key == "limit" || key == "offset" || key == "bucket_ms" {
+        if key == "limit" || key == "offset" || key == "bucket_ms" || key == "select" {
             return Err(bad_request(&format!(
                 "`{key}` is not a parameter of /events/stats"
             )));
@@ -738,13 +752,94 @@ fn reject_page_params(query: &str, route: &str) -> std::result::Result<(), Box<R
         }
         let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
         let key = percent_decode(key, "query")?;
-        if key == "limit" || key == "offset" {
+        if key == "limit" || key == "offset" || key == "select" {
             return Err(bad_request(&format!(
                 "`{key}` is not a parameter of {route}"
             )));
         }
     }
     Ok(())
+}
+
+fn reject_select(query: &str, route: &str) -> std::result::Result<(), Box<Response>> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = percent_decode(key, "query")?;
+        if key == "select" {
+            return Err(bad_request(&format!(
+                "`select` is not a parameter of {route}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `None` keeps every column. `Some` is schema indexes, duplicates removed.
+///
+/// An empty name, an unknown field, or a query parameter other than the
+/// existing filters and page bounds is rejected before the store is read.
+fn projection(
+    schema: &eventer::Schema,
+    query: &str,
+) -> std::result::Result<Option<Vec<usize>>, Box<Response>> {
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let mut saw = false;
+    let mut indexes = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some((key, value)) => (key, Some(value)),
+            None => (pair, None),
+        };
+        let key = percent_decode(key, "query")?;
+        if key != "select" {
+            continue;
+        }
+        saw = true;
+        let Some(value) = value else {
+            return Err(bad_request("`select` is missing a field name"));
+        };
+        let name = percent_decode(value, "select")?;
+        if name.is_empty() {
+            return Err(bad_request("`select` is missing a field name"));
+        }
+        let Some(index) = schema.fields.iter().position(|field| field.name == name) else {
+            return Err(bad_request(&format!("unknown field `{name}`")));
+        };
+        if !indexes.contains(&index) {
+            indexes.push(index);
+        }
+    }
+    if !saw {
+        return Ok(None);
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = percent_decode(key, "query")?;
+        if !matches!(
+            key.as_str(),
+            "from" | "to" | "limit" | "offset" | "eq" | "gt" | "ge" | "lt" | "le" | "select"
+        ) {
+            return Err(bad_request(&format!(
+                "`{key}` is not a parameter of /events"
+            )));
+        }
+    }
+    indexes.sort_unstable();
+    Ok(Some(indexes))
 }
 
 fn eq_specs(query: &str) -> std::result::Result<Vec<String>, Box<Response>> {
@@ -2425,6 +2520,150 @@ mod tests {
             .iter()
             .map(|row| row["ts"].as_i64().unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn select_returns_only_the_named_fields() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-select-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "text"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(8, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        for _ in 0..3 {
+            let (status, body) =
+                post(&app, r#"{"ts":1000,"action":"click","note":"landing"}"#).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        let (status, missing_note) = post(&app, r#"{"ts":1000,"action":"click"}"#).await;
+        assert_eq!(status, StatusCode::CREATED, "{missing_note}");
+
+        let (status, projected) = get_json(&app, "/events?from=1000&to=1000&select=action").await;
+        assert_eq!(status, StatusCode::OK, "{projected}");
+        assert_eq!(
+            projected,
+            json!([
+                {"action": "click"},
+                {"action": "click"},
+                {"action": "click"},
+                {"action": "click"}
+            ])
+        );
+        let (status, full) = get_json(&app, "/events?from=1000&to=1000").await;
+        assert_eq!(status, StatusCode::OK, "{full}");
+        assert_eq!(full[0]["note"], json!("landing"));
+        assert_eq!(full[0]["action"], json!("click"));
+
+        let (status, ordered) = get_json(
+            &app,
+            "/events?from=1000&to=1000&select=note&select=action&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ordered}");
+        assert_eq!(
+            ordered[0].as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["action", "note"]
+        );
+        let (status, twice) = get_json(
+            &app,
+            "/events?from=1000&to=1000&select=action&select=action&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{twice}");
+        assert_eq!(twice, json!([{"action": "click"}]));
+
+        let (status, null_note) =
+            get_json(&app, "/events?from=1000&to=1000&select=note&offset=3").await;
+        assert_eq!(status, StatusCode::OK, "{null_note}");
+        assert_eq!(null_note, json!([{"note": null}]));
+
+        let (status, filtered) = get_json(
+            &app,
+            "/events?from=1000&to=1000&eq=note=landing&select=action",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{filtered}");
+        assert_eq!(filtered.as_array().unwrap().len(), 3);
+        assert!(filtered[0].get("note").is_none(), "{filtered}");
+
+        let (status, all) = get_json(
+            &app,
+            "/events?from=1000&to=1000&select=note&select=ts&select=action&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(
+            all[0].as_object().unwrap().keys().collect::<Vec<_>>(),
+            full[0].as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+
+        let (status, note) =
+            get_json(&app, "/events?from=1000&to=1000&select=action&note=landing").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{note}");
+        assert_eq!(note["error"], "`note` is not a parameter of /events");
+
+        for uri in [
+            "/events?from=1000&to=1000&select=missing",
+            "/events?from=1000&to=1000&select=",
+            "/events?from=1000&to=1000&select",
+            "/events?from=1000&to=1000&select=action&bogus=1",
+            "/events/count?from=1000&to=1000&select=action",
+            "/events/histogram?from=1000&to=1000&bucket_ms=1000&select=action",
+            "/events/stats?from=1000&to=1000&sum=ts&select=action",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+        }
+        let (status, dropped) =
+            post_json(&app, "/events/drop?select=action", r#"{"before_ms":1}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+
+        let data = root.join("data");
+        let dat = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("dat"))
+            .unwrap();
+        let mut bytes = fs::read(&dat).unwrap();
+        bytes[16] ^= 0xff;
+        fs::write(&dat, &bytes).unwrap();
+        let (status, unread) = get_json(&app, "/events?from=1000&to=1000&select=missing").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unread}");
+        let message = unread["error"].as_str().unwrap_or("");
+        assert!(
+            !message.contains("corrupt"),
+            "unknown select read the store: {unread}"
+        );
+        let (status, count) = get_json(&app, "/events/count?from=1000&to=1000&select=action").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{count}");
+        assert!(
+            !count["error"].as_str().unwrap_or("").contains("corrupt"),
+            "select on count read the store: {count}"
+        );
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     async fn post(app: &Router, body: &str) -> (StatusCode, Value) {

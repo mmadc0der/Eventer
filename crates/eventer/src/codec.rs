@@ -235,7 +235,35 @@ pub(crate) fn decode_rows_filtered(
     predicates: &[ColumnPredicate],
     ranges: &[RangeFilter],
 ) -> Result<Vec<Row>> {
-    if predicates.is_empty() && ranges.is_empty() {
+    decode_rows_included(
+        schema,
+        bytes,
+        from_ms,
+        to_ms,
+        max_string_bytes,
+        predicates,
+        ranges,
+        None,
+    )
+}
+
+/// Decode like [`decode_rows_filtered`].
+///
+/// `included` is the column set a sliced read actually decompressed. A false
+/// column is a hole: it is null, and its bytes are not in `bytes`. `None`
+/// means the bytes are a normal block image. Columns the caller does not want
+/// are still decoded when they are present; the caller drops them afterwards.
+pub(crate) fn decode_rows_included(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    max_string_bytes: usize,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+    included: Option<&[bool]>,
+) -> Result<Vec<Row>> {
+    if included.is_none() && predicates.is_empty() && ranges.is_empty() {
         return decode_rows(schema, bytes, Some((from_ms, to_ms)), max_string_bytes);
     }
     if from_ms > to_ms
@@ -253,6 +281,20 @@ pub(crate) fn decode_rows_filtered(
     let mut budget = max_string_bytes;
 
     for (index, field) in schema.fields.iter().enumerate() {
+        if included.is_some_and(|included| !included.get(index).copied().unwrap_or(false)) {
+            let nulls = vec![Scalar::Null; nrows];
+            if let Some(predicate) = predicates.iter().find(|pred| pred.index == index) {
+                apply_eq(&mut mask, &nulls, &predicate.allowed);
+            }
+            if ranges.iter().any(|range| range.index == index) {
+                mask.fill(false);
+            }
+            columns[index] = Some(nulls);
+            if !mask.iter().any(|keep| *keep) {
+                return finish_empty(schema, bytes, &mut cursor, index + 1, included);
+            }
+            continue;
+        }
         if column_was_not_stored(bytes, cursor) {
             if index <= schema.timestamp_index {
                 return Err(Error::corrupt("timestamp column is missing"));
@@ -281,7 +323,7 @@ pub(crate) fn decode_rows_filtered(
 
         if is_filter {
             if is_timestamp && timestamp_range_misses(bytes, cursor, nrows, from_ms, to_ms)? {
-                return finish_empty(schema, bytes, &mut cursor, index);
+                return finish_empty(schema, bytes, &mut cursor, index, included);
             }
             if let Some(predicate) = predicate {
                 if matches!(
@@ -295,7 +337,7 @@ pub(crate) fn decode_rows_filtered(
                         mask.fill(false);
                     }
                     if !mask.iter().any(|keep| *keep) {
-                        return finish_empty(schema, bytes, &mut cursor, index + 1);
+                        return finish_empty(schema, bytes, &mut cursor, index + 1, included);
                     }
                     // Clone only after every later predicate has updated `mask`.
                     deferred.push((index, field.ty == FieldType::Json, spans));
@@ -305,7 +347,7 @@ pub(crate) fn decode_rows_filtered(
             if (predicate.is_some() || range.is_some())
                 && column_misses(field.ty, bytes, cursor, nrows, predicate, range)?
             {
-                return finish_empty(schema, bytes, &mut cursor, index);
+                return finish_empty(schema, bytes, &mut cursor, index, included);
             }
             let values = decode_column(field.ty, bytes, &mut cursor, nrows, &mask, &mut budget)?;
             if is_timestamp {
@@ -327,7 +369,7 @@ pub(crate) fn decode_rows_filtered(
             apply_constraints(&mut mask, &values, predicate, range);
             columns[index] = Some(values);
             if !mask.iter().any(|keep| *keep) {
-                return finish_empty(schema, bytes, &mut cursor, index + 1);
+                return finish_empty(schema, bytes, &mut cursor, index + 1, included);
             }
         } else if filters_remain {
             let start = cursor;
@@ -1813,6 +1855,59 @@ pub(crate) fn read_timestamp_column(schema: &Schema, bytes: &[u8]) -> Result<Vec
     Err(Error::corrupt("timestamp column is missing"))
 }
 
+/// [`read_timestamp_column`] for a sliced payload that left holes.
+///
+/// A false `included` column has no bytes. The timestamp itself has to be set.
+pub(crate) fn read_timestamp_column_included(
+    schema: &Schema,
+    bytes: &[u8],
+    included: &[bool],
+) -> Result<Vec<i64>> {
+    let nrows = block_row_count(bytes)?;
+    let mut cursor = 4;
+    for (index, field) in schema.fields.iter().enumerate() {
+        if !included.get(index).copied().unwrap_or(false) {
+            if index == schema.timestamp_index {
+                return Err(Error::corrupt("timestamp column is missing"));
+            }
+            continue;
+        }
+        if index == schema.timestamp_index {
+            let present = read_present(bytes, &mut cursor, nrows)?;
+            let present_count = match &present {
+                None => nrows,
+                Some(flags) => flags.iter().filter(|flag| **flag).count(),
+            };
+            if field.ty != FieldType::Timestamp {
+                return Err(Error::corrupt("timestamp column has the wrong type"));
+            }
+            let nums = decode_i64s(bytes, &mut cursor, present_count)?;
+            if nums.len() != present_count {
+                return Err(Error::corrupt(
+                    "column value count does not match the null bitmap",
+                ));
+            }
+            let mut out = Vec::with_capacity(nrows);
+            let mut next = 0;
+            for row in 0..nrows {
+                let is_present = match &present {
+                    None => true,
+                    Some(flags) => flags[row],
+                };
+                if is_present {
+                    out.push(nums[next]);
+                    next += 1;
+                } else {
+                    return Err(Error::corrupt("timestamp column is null or the wrong type"));
+                }
+            }
+            return Ok(out);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Err(Error::corrupt("timestamp column is missing"))
+}
+
 /// True when `cursor` is at the end of a block, so this column was not stored.
 fn column_was_not_stored(bytes: &[u8], cursor: usize) -> bool {
     cursor == bytes.len()
@@ -2666,10 +2761,14 @@ fn finish_empty(
     bytes: &[u8],
     cursor: &mut usize,
     from_index: usize,
+    included: Option<&[bool]>,
 ) -> Result<Vec<Row>> {
     let nrows = block_row_count(bytes)?;
     for (offset, field) in schema.fields[from_index..].iter().enumerate() {
         let index = from_index + offset;
+        if included.is_some_and(|included| !included.get(index).copied().unwrap_or(false)) {
+            continue;
+        }
         skip_column(
             field.ty,
             bytes,
