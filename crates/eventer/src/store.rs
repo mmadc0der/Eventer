@@ -241,10 +241,12 @@ impl Store {
     /// Inclusive time range plus equality predicates and numeric ranges.
     ///
     /// Blocks whose zone map cannot contain the requested values are not read.
-    /// An integer or decimal zone whose max is below a lower bound, or whose min
-    /// is above an upper bound, is not read, including exclusive bounds. A float
-    /// zone is not a skip. Each predicate on a block that is read is applied
-    /// while the block is decoded. Nulls do not match a range.
+    /// An integer, decimal, or float zone whose max is below a lower bound, or
+    /// whose min is above an upper bound, is not read, including exclusive
+    /// bounds. A float equality still reads a block whose range contains the
+    /// value. JSON and a float column stored as tag `0` are not a skip. Each
+    /// predicate on a block that is read is applied while the block is decoded.
+    /// Nulls do not match a range.
     /// If a filter column's constant or dictionary cannot contain the requested value,
     /// the rest of that block is not decoded. Unknown fields and values of the wrong
     /// column type return [`Error::Schema`]. Checks run before [`Store::flush`].
@@ -4039,7 +4041,79 @@ mod tests {
                 Scalar::Float(5.0),
             )],
         );
-        assert!(read.is_err(), "a float zone is not a skip");
+        assert_eq!(read.unwrap().len(), 1, "the low float block is skipped");
+        let equality =
+            store.query_with_filter(0, 10, &[Predicate::Eq("score".into(), Scalar::Float(1.0))]);
+        assert!(
+            equality.is_err(),
+            "equality reads a block whose float range contains the value"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn old_float_zone_tag_returns_the_same_rows_and_does_not_skip() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(1);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        for (ts, score) in [(1i64, 1.0), (2, 9.0)] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": ts,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let above = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(5.0),
+        )];
+        let fresh = store.query_with_filter(0, 10, &above).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(row_value(&store, &fresh[0])["score"].as_f64(), Some(9.0));
+        let bounds: Vec<(i64, i64)> = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .map(|block| (block.min_ts, block.max_ts))
+            .collect();
+        let schema_ref = store.schema().clone();
+        store.close().unwrap();
+
+        let zone_file = crate::zone::zone_path(&data, 1);
+        crate::zone::rewrite_float_zones_unknown(
+            &zone_file,
+            crate::zone::schema_crc(&schema_ref),
+            crate::zone::field_count(&schema_ref).unwrap(),
+            &bounds,
+        )
+        .unwrap();
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        let again = store.query_with_filter(0, 10, &above).unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(row_value(&store, &again[0])["score"].as_f64(), Some(9.0));
+        let resolved = resolve_predicates(store.schema(), &above).unwrap();
+        assert_eq!(
+            store.blocks_in_range(0, 10, &resolved).len(),
+            2,
+            "tag 0 does not skip the float column"
+        );
+        let low = store.catalog().segments[0].blocks[0].clone();
+        assert!(low.max_ts <= 1);
+        let path = segment::data_path(&data, low.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[low.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let read = store.query_with_filter(0, 10, &above);
+        assert!(read.is_err(), "an unknown float tag still reads the block");
         store.close().unwrap();
     }
 
