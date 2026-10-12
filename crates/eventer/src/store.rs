@@ -16,7 +16,9 @@ use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
 use crate::schema::{self, FieldType, Schema};
 use crate::segment::{self, Catalog};
-use crate::value::{self, row_to_json_bytes, row_to_json_bytes_selected, Row, Scalar};
+use crate::value::{
+    self, append_row_json, row_to_json_bytes, row_to_json_bytes_selected, Row, Scalar,
+};
 
 /// Maximum JSON bytes a single query may materialize in the response buffer.
 pub const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
@@ -536,26 +538,31 @@ impl Store {
                     if row_count >= MAX_QUERY_ROWS {
                         return Err(Error::event("query row limit exceeded"));
                     }
-                    let row_bytes = if let Some(keep) = &keep {
-                        row_to_json_bytes_selected(&self.schema, &row, keep)?
-                    } else {
-                        row_to_json_bytes(&self.schema, &row)?
-                    };
-                    let next_len = out
-                        .len()
-                        .checked_add(row_bytes.len())
-                        .and_then(|n| n.checked_add(if wrote { 1 } else { 0 }))
-                        .and_then(|n| n.checked_add(1))
-                        .ok_or_else(|| Error::event("query response size overflow"))?;
-                    if next_len > MAX_QUERY_BYTES {
-                        return Err(Error::event("query response size limit exceeded"));
-                    }
+                    let mark = out.len();
                     if wrote {
                         out.push(b',');
                     }
+                    let appended = if let Some(keep) = &keep {
+                        row_to_json_bytes_selected(&self.schema, &row, keep).map(|bytes| {
+                            out.extend_from_slice(&bytes);
+                        })
+                    } else {
+                        append_row_json(&mut out, &self.schema, &row, None)
+                    };
+                    if let Err(err) = appended {
+                        out.truncate(mark);
+                        return Err(err);
+                    }
+                    let next_len = out
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| Error::event("query response size overflow"))?;
+                    if next_len > MAX_QUERY_BYTES {
+                        out.truncate(mark);
+                        return Err(Error::event("query response size limit exceeded"));
+                    }
                     wrote = true;
                     row_count += 1;
-                    out.extend_from_slice(&row_bytes);
                 }
             }
             if page_done {
