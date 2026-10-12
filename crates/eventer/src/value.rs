@@ -1,12 +1,13 @@
+use std::borrow::Cow;
+
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
 
 use crate::error::{Error, Result};
 use crate::json_scan::{
-    decode_json_string, end_of_json_string, extract_object_field_raw_last, skip_json_whitespace,
-    validate_json_structure,
+    decode_json_string, end_of_json_string, skip_json_whitespace, validate_json_structure,
 };
-use crate::schema::{parse_timestamp_value, Field, FieldType, Schema};
+use crate::schema::{parse_timestamp_str, Field, FieldType, Schema};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
@@ -103,46 +104,58 @@ pub struct Row {
     pub ts: i64,
 }
 
+/// Scan one JSON object straight into a [`Row`].
+///
+/// Unknown top-level keys are ignored. A repeated key keeps the last value.
+/// A missing key and JSON null are column nulls. The schema timestamp is required.
 pub fn parse_event(schema: &Schema, json: &[u8]) -> Result<Row> {
     if json.len() > 1024 * 1024 {
         return Err(Error::event("event JSON exceeds 1 MiB"));
     }
-    let value: Value = serde_json::from_slice(json)?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| Error::event("event must be a JSON object"))?;
-    let mut values = Vec::with_capacity(schema.fields.len());
-    for field in &schema.fields {
-        let raw = obj.get(&field.name);
-        let scalar = match raw {
-            None | Some(Value::Null) => {
-                if field.ty == FieldType::Timestamp && field.name == schema.timestamp_field {
-                    return Err(Error::event(format!(
-                        "missing timestamp field `{}`",
-                        field.name
-                    )));
-                }
-                Scalar::Null
-            }
-            Some(item) => {
-                if field.ty == FieldType::Json {
-                    match extract_object_field_raw_last(json, &field.name)? {
-                        None => Scalar::Null,
-                        Some(raw) if raw.as_bytes() == b"null" => Scalar::Null,
-                        Some(raw) => {
-                            validate_json_structure(&raw)?;
-                            Scalar::Json(raw)
-                        }
-                    }
-                } else {
-                    parse_field(&field.name, field.ty, item)?
-                }
-            }
-        };
-        values.push(scalar);
+    let mut parser = EventParser {
+        bytes: json,
+        i: 0,
+        depth: 0,
+    };
+    parser.skip_ws();
+    if parser.peek() != Some(b'{') {
+        if parser.i >= parser.bytes.len() {
+            return Err(Error::json("EOF while parsing a JSON value"));
+        }
+        parser.skip_value().map_err(ScanError::into_error)?;
+        parser.skip_ws();
+        if parser.i != parser.bytes.len() {
+            return Err(Error::json("trailing characters after a JSON value"));
+        }
+        return Err(Error::event("event must be a JSON object"));
     }
-    let ts = match &values[schema.timestamp_index] {
-        Scalar::Timestamp(ts) => *ts,
+
+    let n = schema.fields.len();
+    let mut values = vec![Scalar::Null; n];
+    let mut errors: Vec<Option<Error>> = Vec::new();
+    parser
+        .parse_object(schema, &mut values, &mut errors)
+        .map_err(ScanError::into_error)?;
+    parser.skip_ws();
+    if parser.i != parser.bytes.len() {
+        return Err(Error::json("trailing characters after a JSON value"));
+    }
+
+    for (index, field) in schema.fields.iter().enumerate() {
+        if let Some(err) = errors.get_mut(index).and_then(Option::take) {
+            return Err(err);
+        }
+        if field.ty == FieldType::Timestamp && field.name == schema.timestamp_field {
+            if !matches!(values[index], Scalar::Timestamp(_)) {
+                return Err(Error::event(format!(
+                    "missing timestamp field `{}`",
+                    field.name
+                )));
+            }
+        }
+    }
+    let ts = match values.get(schema.timestamp_index) {
+        Some(Scalar::Timestamp(ts)) => *ts,
         _ => {
             return Err(Error::event(format!(
                 "missing timestamp field `{}`",
@@ -153,48 +166,537 @@ pub fn parse_event(schema: &Schema, json: &[u8]) -> Result<Row> {
     Ok(Row { values, ts })
 }
 
-fn parse_field(name: &str, ty: FieldType, value: &Value) -> Result<Scalar> {
-    match ty {
-        FieldType::Int => {
-            let number = value
-                .as_i64()
-                .ok_or_else(|| Error::event(format!("field `{name}` must be an integer")))?;
-            Ok(Scalar::Int(number))
+/// serde_json starts a depth counter at 128 and rejects a container that would
+/// drive it to 0, so 127 nested containers are the deepest document it accepts.
+const MAX_JSON_DEPTH: u32 = 127;
+
+enum ScanError {
+    /// The document is not JSON. A later key cannot repair it.
+    Syntax(Error),
+    /// The document is JSON, but the last value does not match the field.
+    Type(Error),
+}
+
+impl ScanError {
+    fn into_error(self) -> Error {
+        match self {
+            ScanError::Syntax(err) | ScanError::Type(err) => err,
         }
-        FieldType::Float => {
-            let number = value
-                .as_f64()
-                .ok_or_else(|| Error::event(format!("field `{name}` must be a number")))?;
-            if !number.is_finite() {
-                return Err(Error::event(format!("field `{name}` must be finite")));
+    }
+
+    fn syntax(message: impl Into<String>) -> Self {
+        ScanError::Syntax(Error::json(message.into()))
+    }
+}
+
+struct EventParser<'a> {
+    bytes: &'a [u8],
+    i: usize,
+    depth: u32,
+}
+
+impl<'a> EventParser<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.i).copied()
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        if self.peek() == Some(byte) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.i += 1;
+        }
+    }
+
+    fn enter(&mut self) -> std::result::Result<(), ScanError> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(ScanError::syntax("JSON recursion limit exceeded"));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    fn parse_object(
+        &mut self,
+        schema: &Schema,
+        values: &mut [Scalar],
+        errors: &mut Vec<Option<Error>>,
+    ) -> std::result::Result<(), ScanError> {
+        if !self.eat(b'{') {
+            return Err(ScanError::syntax("event must be a JSON object"));
+        }
+        self.enter()?;
+        self.skip_ws();
+        if self.eat(b'}') {
+            self.leave();
+            return Ok(());
+        }
+        loop {
+            let index = self.match_field(schema)?;
+            self.skip_ws();
+            if !self.eat(b':') {
+                return Err(ScanError::syntax("malformed JSON object"));
             }
-            Ok(Scalar::Float(number))
+            self.skip_ws();
+            if let Some(index) = index {
+                match self.parse_typed(&schema.fields[index]) {
+                    Ok(scalar) => {
+                        values[index] = scalar;
+                        if let Some(slot) = errors.get_mut(index) {
+                            *slot = None;
+                        }
+                    }
+                    Err(ScanError::Type(err)) => {
+                        if errors.is_empty() {
+                            errors.resize_with(values.len(), || None);
+                        }
+                        errors[index] = Some(err);
+                    }
+                    Err(err) => return Err(err),
+                }
+            } else {
+                self.skip_value()?;
+            }
+            self.skip_ws();
+            if self.eat(b',') {
+                self.skip_ws();
+                continue;
+            }
+            if self.eat(b'}') {
+                self.leave();
+                return Ok(());
+            }
+            return Err(ScanError::syntax("malformed JSON object"));
         }
-        FieldType::Bool => {
-            let flag = value
-                .as_bool()
-                .ok_or_else(|| Error::event(format!("field `{name}` must be a boolean")))?;
-            Ok(Scalar::Bool(flag))
+    }
+
+    fn match_field(&mut self, schema: &Schema) -> std::result::Result<Option<usize>, ScanError> {
+        if self.peek() != Some(b'"') {
+            return Err(ScanError::syntax("JSON object key must be a string"));
         }
-        FieldType::String | FieldType::Text => {
-            let text = value
-                .as_str()
-                .ok_or_else(|| Error::event(format!("field `{name}` must be a string")))?;
-            Ok(Scalar::Str(text.to_string()))
+        let (inner, escaped) = self.scan_string()?;
+        if escaped {
+            let owned = decode_json_string(inner).map_err(ScanError::Syntax)?;
+            Ok(schema.fields.iter().position(|field| field.name == owned))
+        } else if std::str::from_utf8(inner).is_err() {
+            Err(ScanError::syntax("JSON object key is not valid UTF-8"))
+        } else {
+            Ok(schema
+                .fields
+                .iter()
+                .position(|field| field.name.as_bytes() == inner))
         }
-        FieldType::Decimal { scale } => {
-            let text = value
-                .as_str()
-                .ok_or_else(|| Error::event(format!("field `{name}` decimal must be a string")))?;
-            Ok(Scalar::Decimal(parse_decimal(text, scale).map_err(
-                |err| Error::event(format!("field `{name}`: {err}")),
-            )?))
+    }
+
+    fn skip_key(&mut self) -> std::result::Result<(), ScanError> {
+        if self.peek() != Some(b'"') {
+            return Err(ScanError::syntax("JSON object key must be a string"));
         }
-        FieldType::Timestamp => Ok(Scalar::Timestamp(
-            parse_timestamp_value(value)
-                .map_err(|err| Error::event(format!("field `{name}`: {err}")))?,
-        )),
-        FieldType::Json => Err(Error::event("json fields are parsed from raw event bytes")),
+        self.skip_string()
+    }
+
+    fn parse_typed(&mut self, field: &Field) -> std::result::Result<Scalar, ScanError> {
+        if self.consume_null()? {
+            return Ok(Scalar::Null);
+        }
+        match field.ty {
+            FieldType::Int => self.parse_int(&field.name),
+            FieldType::Float => self.parse_float(&field.name),
+            FieldType::Bool => self.parse_bool(&field.name),
+            FieldType::String | FieldType::Text => self.parse_text(&field.name),
+            FieldType::Decimal { scale } => self.parse_decimal_field(&field.name, scale),
+            FieldType::Timestamp => self.parse_timestamp_field(&field.name),
+            FieldType::Json => self.parse_json_field(),
+        }
+    }
+
+    fn consume_null(&mut self) -> std::result::Result<bool, ScanError> {
+        if self.peek() != Some(b'n') {
+            return Ok(false);
+        }
+        self.consume_literal(b"null")?;
+        Ok(true)
+    }
+
+    fn parse_int(&mut self, name: &str) -> std::result::Result<Scalar, ScanError> {
+        if !self.starts_number() {
+            self.skip_value()?;
+            return Err(self.type_error(format!("field `{name}` must be an integer")));
+        }
+        let (start, end, integer) = self.scan_number()?;
+        if !integer {
+            return Err(self.type_error(format!("field `{name}` must be an integer")));
+        }
+        match i64_from_lexeme(&self.bytes[start..end]) {
+            Some(value) => Ok(Scalar::Int(value)),
+            None => Err(self.type_error(format!("field `{name}` must be an integer"))),
+        }
+    }
+
+    fn parse_float(&mut self, name: &str) -> std::result::Result<Scalar, ScanError> {
+        if !self.starts_number() {
+            self.skip_value()?;
+            return Err(self.type_error(format!("field `{name}` must be a number")));
+        }
+        let (start, end, integer) = self.scan_number()?;
+        let raw = &self.bytes[start..end];
+        // An integer that fits in i64 follows `Number::as_f64` under
+        // `arbitrary_precision`: the lexeme is parsed as i64 first, so `-0`
+        // becomes `+0.0` rather than a signed zero from `f64` parsing.
+        if integer {
+            if let Some(value) = i64_from_lexeme(raw) {
+                return Ok(Scalar::Float(value as f64));
+            }
+        }
+        let lexeme = std::str::from_utf8(raw)
+            .map_err(|_| ScanError::syntax("JSON number is not valid UTF-8"))?;
+        match lexeme.parse::<f64>() {
+            Ok(value) if value.is_finite() => Ok(Scalar::Float(value)),
+            Ok(_) => Err(self.type_error(format!("field `{name}` must be finite"))),
+            Err(_) => Err(self.type_error(format!("field `{name}` must be a number"))),
+        }
+    }
+
+    fn parse_bool(&mut self, name: &str) -> std::result::Result<Scalar, ScanError> {
+        match self.peek() {
+            Some(b't') => {
+                self.consume_literal(b"true")?;
+                Ok(Scalar::Bool(true))
+            }
+            Some(b'f') => {
+                self.consume_literal(b"false")?;
+                Ok(Scalar::Bool(false))
+            }
+            Some(_) => {
+                self.skip_value()?;
+                Err(self.type_error(format!("field `{name}` must be a boolean")))
+            }
+            None => Err(ScanError::syntax("truncated JSON value")),
+        }
+    }
+
+    fn parse_text(&mut self, name: &str) -> std::result::Result<Scalar, ScanError> {
+        if self.peek() != Some(b'"') {
+            self.skip_value()?;
+            return Err(self.type_error(format!("field `{name}` must be a string")));
+        }
+        Ok(Scalar::Str(self.take_string()?.into_owned()))
+    }
+
+    fn parse_decimal_field(
+        &mut self,
+        name: &str,
+        scale: u32,
+    ) -> std::result::Result<Scalar, ScanError> {
+        if self.peek() != Some(b'"') {
+            self.skip_value()?;
+            return Err(self.type_error(format!("field `{name}` decimal must be a string")));
+        }
+        let text = self.take_string()?;
+        match parse_decimal(&text, scale) {
+            Ok(value) => Ok(Scalar::Decimal(value)),
+            Err(err) => Err(self.type_error(format!("field `{name}`: {err}"))),
+        }
+    }
+
+    fn parse_timestamp_field(&mut self, name: &str) -> std::result::Result<Scalar, ScanError> {
+        if self.starts_number() {
+            let (start, end, integer) = self.scan_number()?;
+            let lexeme = std::str::from_utf8(&self.bytes[start..end])
+                .map_err(|_| ScanError::syntax("JSON number is not valid UTF-8"))?;
+            if integer {
+                if let Some(value) = i64_from_lexeme(&self.bytes[start..end]) {
+                    return Ok(Scalar::Timestamp(value));
+                }
+            }
+            return Err(self.type_error(format!(
+                "field `{name}`: event error: timestamp {lexeme} is not an i64 millisecond value"
+            )));
+        }
+        if self.peek() == Some(b'"') {
+            let text = self.take_string()?;
+            return match parse_timestamp_str(&text) {
+                Ok(value) => Ok(Scalar::Timestamp(value)),
+                Err(err) => Err(self.type_error(format!("field `{name}`: {err}"))),
+            };
+        }
+        let start = self.i;
+        self.skip_value()?;
+        let raw = self.lexeme(start);
+        Err(self.type_error(format!(
+            "field `{name}`: event error: timestamp must be a number or string, got {raw}"
+        )))
+    }
+
+    fn parse_json_field(&mut self) -> std::result::Result<Scalar, ScanError> {
+        let start = self.i;
+        self.skip_value()?;
+        let raw = &self.bytes[start..self.i];
+        let text = std::str::from_utf8(raw)
+            .map_err(|_| ScanError::syntax("json field is not valid UTF-8"))?;
+        Ok(Scalar::Json(text.to_owned()))
+    }
+
+    fn take_string(&mut self) -> std::result::Result<Cow<'a, str>, ScanError> {
+        let (inner, escaped) = self.scan_string()?;
+        if escaped {
+            let owned = decode_json_string(inner).map_err(ScanError::Syntax)?;
+            Ok(Cow::Owned(owned))
+        } else {
+            let text = std::str::from_utf8(inner)
+                .map_err(|_| ScanError::syntax("JSON string is not valid UTF-8"))?;
+            Ok(Cow::Borrowed(text))
+        }
+    }
+
+    fn type_error(&self, message: String) -> ScanError {
+        ScanError::Type(Error::event(message))
+    }
+
+    fn starts_number(&self) -> bool {
+        matches!(self.peek(), Some(b'-' | b'0'..=b'9'))
+    }
+
+    fn lexeme(&self, start: usize) -> Cow<'a, str> {
+        let raw = self.bytes.get(start..self.i).unwrap_or(&[]);
+        match std::str::from_utf8(raw) {
+            Ok(text) => Cow::Borrowed(text),
+            Err(_) => Cow::Owned(String::from_utf8_lossy(raw).into_owned()),
+        }
+    }
+
+    fn skip_value(&mut self) -> std::result::Result<(), ScanError> {
+        match self.peek() {
+            Some(b'"') => self.skip_string(),
+            Some(b'{') => self.skip_object(),
+            Some(b'[') => self.skip_array(),
+            Some(b't') => self.consume_literal(b"true"),
+            Some(b'f') => self.consume_literal(b"false"),
+            Some(b'n') => self.consume_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => {
+                self.scan_number()?;
+                Ok(())
+            }
+            Some(_) => Err(ScanError::syntax("malformed JSON value")),
+            None => Err(ScanError::syntax("truncated JSON value")),
+        }
+    }
+
+    fn skip_object(&mut self) -> std::result::Result<(), ScanError> {
+        if !self.eat(b'{') {
+            return Err(ScanError::syntax("malformed JSON object"));
+        }
+        self.enter()?;
+        self.skip_ws();
+        if self.eat(b'}') {
+            self.leave();
+            return Ok(());
+        }
+        loop {
+            self.skip_key()?;
+            self.skip_ws();
+            if !self.eat(b':') {
+                return Err(ScanError::syntax("malformed JSON object"));
+            }
+            self.skip_ws();
+            self.skip_value()?;
+            self.skip_ws();
+            if self.eat(b',') {
+                self.skip_ws();
+                continue;
+            }
+            if self.eat(b'}') {
+                self.leave();
+                return Ok(());
+            }
+            return Err(ScanError::syntax("malformed JSON object"));
+        }
+    }
+
+    fn skip_array(&mut self) -> std::result::Result<(), ScanError> {
+        if !self.eat(b'[') {
+            return Err(ScanError::syntax("malformed JSON array"));
+        }
+        self.enter()?;
+        self.skip_ws();
+        if self.eat(b']') {
+            self.leave();
+            return Ok(());
+        }
+        loop {
+            self.skip_value()?;
+            self.skip_ws();
+            if self.eat(b',') {
+                self.skip_ws();
+                continue;
+            }
+            if self.eat(b']') {
+                self.leave();
+                return Ok(());
+            }
+            return Err(ScanError::syntax("malformed JSON array"));
+        }
+    }
+
+    fn skip_string(&mut self) -> std::result::Result<(), ScanError> {
+        let (inner, escaped) = self.scan_string()?;
+        if escaped {
+            decode_json_string(inner).map_err(ScanError::Syntax)?;
+        } else if std::str::from_utf8(inner).is_err() {
+            return Err(ScanError::syntax("JSON string is not valid UTF-8"));
+        }
+        Ok(())
+    }
+
+    /// `i` sits on the opening quote. Returns the raw interior and whether it has an escape.
+    fn scan_string(&mut self) -> std::result::Result<(&'a [u8], bool), ScanError> {
+        if !self.eat(b'"') {
+            return Err(ScanError::syntax("expected JSON string"));
+        }
+        let start = self.i;
+        let mut escaped = false;
+        while let Some(byte) = self.peek() {
+            if byte == b'"' {
+                let inner = &self.bytes[start..self.i];
+                self.i += 1;
+                return Ok((inner, escaped));
+            }
+            if byte < 0x20 {
+                return Err(ScanError::syntax("control character in JSON string"));
+            }
+            if byte == b'\\' {
+                escaped = true;
+                self.i += 1;
+                let esc = self
+                    .peek()
+                    .ok_or_else(|| ScanError::syntax("truncated JSON string"))?;
+                self.i += 1;
+                match esc {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                    b'u' => {
+                        for _ in 0..4 {
+                            let hex = self.peek().ok_or_else(|| {
+                                ScanError::syntax("truncated JSON unicode escape")
+                            })?;
+                            if !hex.is_ascii_hexdigit() {
+                                return Err(ScanError::syntax("invalid JSON unicode escape"));
+                            }
+                            self.i += 1;
+                        }
+                    }
+                    _ => return Err(ScanError::syntax("invalid JSON string escape")),
+                }
+                continue;
+            }
+            self.i += 1;
+        }
+        Err(ScanError::syntax("truncated JSON string"))
+    }
+
+    fn consume_literal(&mut self, literal: &[u8]) -> std::result::Result<(), ScanError> {
+        let end = self.i + literal.len();
+        if self.bytes.get(self.i..end) != Some(literal) {
+            return Err(ScanError::syntax("malformed JSON literal"));
+        }
+        if self
+            .bytes
+            .get(end)
+            .is_some_and(|byte| !is_value_boundary(*byte))
+        {
+            return Err(ScanError::syntax("malformed JSON literal"));
+        }
+        self.i = end;
+        Ok(())
+    }
+
+    /// Returns `(start, end, integer lexeme)`.
+    fn scan_number(&mut self) -> std::result::Result<(usize, usize, bool), ScanError> {
+        let start = self.i;
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        let first = self
+            .peek()
+            .ok_or_else(|| ScanError::syntax("malformed JSON number"))?;
+        if !first.is_ascii_digit() {
+            return Err(ScanError::syntax("malformed JSON number"));
+        }
+        self.i += 1;
+        if first == b'0' {
+            if self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                return Err(ScanError::syntax("malformed JSON number"));
+            }
+        } else {
+            while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.i += 1;
+            }
+        }
+        let mut integer = true;
+        if self.peek() == Some(b'.') {
+            integer = false;
+            self.i += 1;
+            let mark = self.i;
+            while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.i += 1;
+            }
+            if self.i == mark {
+                return Err(ScanError::syntax("malformed JSON number"));
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            integer = false;
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            let mark = self.i;
+            while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.i += 1;
+            }
+            if self.i == mark {
+                return Err(ScanError::syntax("malformed JSON number"));
+            }
+        }
+        Ok((start, self.i, integer))
+    }
+}
+
+fn is_value_boundary(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\n' | b'\r' | b'\t' | b',' | b'}' | b']' | b':'
+    )
+}
+
+/// Integer lexeme, including a leading `-`. `i64::MIN` is accumulated as a negative.
+fn i64_from_lexeme(lexeme: &[u8]) -> Option<i64> {
+    let (negative, digits) = if lexeme.first() == Some(&b'-') {
+        (true, &lexeme[1..])
+    } else {
+        (false, lexeme)
+    };
+    if digits.is_empty() || !digits.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &byte in digits {
+        value = value.checked_mul(10)?.checked_sub(i64::from(byte - b'0'))?;
+    }
+    if negative {
+        Some(value)
+    } else {
+        value.checked_neg()
     }
 }
 
@@ -675,5 +1177,198 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(row_to_json_bytes(&schema, &row).unwrap(), input);
+    }
+
+    /// The previous parser: `serde_json::from_slice` into a DOM, then field walks.
+    fn parse_event_dom(schema: &Schema, json: &[u8]) -> Result<Row> {
+        if json.len() > 1024 * 1024 {
+            return Err(Error::event("event JSON exceeds 1 MiB"));
+        }
+        let value: Value = serde_json::from_slice(json)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| Error::event("event must be a JSON object"))?;
+        let mut values = Vec::with_capacity(schema.fields.len());
+        for field in &schema.fields {
+            let raw = obj.get(&field.name);
+            let scalar = match raw {
+                None | Some(Value::Null) => {
+                    if field.ty == FieldType::Timestamp && field.name == schema.timestamp_field {
+                        return Err(Error::event(format!(
+                            "missing timestamp field `{}`",
+                            field.name
+                        )));
+                    }
+                    Scalar::Null
+                }
+                Some(item) => {
+                    if field.ty == FieldType::Json {
+                        match crate::json_scan::extract_object_field_raw_last(json, &field.name)? {
+                            None => Scalar::Null,
+                            Some(raw) if raw.as_bytes() == b"null" => Scalar::Null,
+                            Some(raw) => {
+                                validate_json_structure(&raw)?;
+                                Scalar::Json(raw)
+                            }
+                        }
+                    } else {
+                        dom_field(&field.name, field.ty, item)?
+                    }
+                }
+            };
+            values.push(scalar);
+        }
+        let ts = match &values[schema.timestamp_index] {
+            Scalar::Timestamp(ts) => *ts,
+            _ => {
+                return Err(Error::event(format!(
+                    "missing timestamp field `{}`",
+                    schema.timestamp_field
+                )))
+            }
+        };
+        Ok(Row { values, ts })
+    }
+
+    fn dom_field(name: &str, ty: FieldType, value: &Value) -> Result<Scalar> {
+        match ty {
+            FieldType::Int => value
+                .as_i64()
+                .map(Scalar::Int)
+                .ok_or_else(|| Error::event(format!("field `{name}` must be an integer"))),
+            FieldType::Float => {
+                let number = value
+                    .as_f64()
+                    .ok_or_else(|| Error::event(format!("field `{name}` must be a number")))?;
+                if !number.is_finite() {
+                    return Err(Error::event(format!("field `{name}` must be finite")));
+                }
+                Ok(Scalar::Float(number))
+            }
+            FieldType::Bool => value
+                .as_bool()
+                .map(Scalar::Bool)
+                .ok_or_else(|| Error::event(format!("field `{name}` must be a boolean"))),
+            FieldType::String | FieldType::Text => value
+                .as_str()
+                .map(|text| Scalar::Str(text.to_string()))
+                .ok_or_else(|| Error::event(format!("field `{name}` must be a string"))),
+            FieldType::Decimal { scale } => {
+                let text = value.as_str().ok_or_else(|| {
+                    Error::event(format!("field `{name}` decimal must be a string"))
+                })?;
+                Ok(Scalar::Decimal(parse_decimal(text, scale).map_err(
+                    |err| Error::event(format!("field `{name}`: {err}")),
+                )?))
+            }
+            FieldType::Timestamp => Ok(Scalar::Timestamp(
+                crate::schema::parse_timestamp_value(value)
+                    .map_err(|err| Error::event(format!("field `{name}`: {err}")))?,
+            )),
+            FieldType::Json => Err(Error::event("json fields are parsed from raw event bytes")),
+        }
+    }
+
+    fn scalars_match(left: &Scalar, right: &Scalar) -> bool {
+        match (left, right) {
+            (Scalar::Float(a), Scalar::Float(b)) => a.to_bits() == b.to_bits(),
+            _ => left == right,
+        }
+    }
+
+    fn assert_same_parse(schema: &Schema, json: &[u8]) {
+        let dom = parse_event_dom(schema, json);
+        let scan = parse_event(schema, json);
+        match (dom, scan) {
+            (Ok(dom), Ok(scan)) => {
+                assert_eq!(dom.ts, scan.ts, "{}", String::from_utf8_lossy(json));
+                assert_eq!(dom.values.len(), scan.values.len());
+                for (index, (left, right)) in dom.values.iter().zip(scan.values.iter()).enumerate()
+                {
+                    assert!(
+                        scalars_match(left, right),
+                        "field {index} {json:?}: {left:?} vs {right:?}"
+                    );
+                }
+            }
+            (Err(_), Err(_)) => {}
+            (Ok(_), Err(err)) => panic!("scan rejected {}: {err}", String::from_utf8_lossy(json)),
+            (Err(err), Ok(_)) => panic!("scan accepted {}: {err}", String::from_utf8_lossy(json)),
+        }
+    }
+
+    #[test]
+    fn scan_accepts_and_rejects_the_same_events_as_the_dom_parser() {
+        let schema = sample_schema();
+        let json_schema = parse_schema(
+            r#"{"timestamp_field":"ts","fields":[{"name":"ts","type":"timestamp"},{"name":"props","type":"json"},{"name":"café","type":"string"}]}"#,
+        )
+        .unwrap();
+        let mut samples: Vec<Vec<u8>> = vec![
+            br#"{"ts":1}"#.to_vec(),
+            br#"{"ts":1,"user_id":null}"#.to_vec(),
+            br#"{"user_id":"x","user_id":2,"ts":1}"#.to_vec(),
+            br#"{"ts":1,"user_id":2,"user_id":"x"}"#.to_vec(),
+            br#"{"ts":"2024-01-02T03:04:05.123Z","user_id":7,"score":1.5,"ok":true,"action":"buy","note":"hi","amount":"19.99"}"#.to_vec(),
+            br#"{"ts":1,"score":1e2}"#.to_vec(),
+            br#"{"ts":1,"score":1e309}"#.to_vec(),
+            br#"{"ts":1,"score":1e10000}"#.to_vec(),
+            br#"{"ts":1,"user_id":1.5}"#.to_vec(),
+            br#"{"ts":1,"user_id":9223372036854775807}"#.to_vec(),
+            br#"{"ts":1,"user_id":9223372036854775808}"#.to_vec(),
+            format!(r#"{{"ts":{}}}"#, i64::MIN).into_bytes(),
+            format!(r#"{{"ts":{}}}"#, i64::MAX).into_bytes(),
+            br#"{"ts":-0,"score":-0.0,"ok":false}"#.to_vec(),
+            br#"{"ts":1,"score":-0}"#.to_vec(),
+            br#"{"ts":01}"#.to_vec(),
+            br#"{"ts":1,}"#.to_vec(),
+            br#"{"ts":1}{}"#.to_vec(),
+            br#"[]"#.to_vec(),
+            br#"null"#.to_vec(),
+            br#""#.to_vec(),
+            br#"{"ts":1,"note":"a\nb"}"#.to_vec(),
+            br#"{"ts":1,"note":"\u0000"}"#.to_vec(),
+            br#"{"ts":1,"ok":false,"extra":{"a":1},"amount":"1.00"}"#.to_vec(),
+            br#"{"ts": "1700"}"#.to_vec(),
+            br#"{"ts":1,"action":{"nested":true}}"#.to_vec(),
+            br#"{"ts":1,"amount":1}"#.to_vec(),
+            br#"{"ts":1,"amount":".5"}"#.to_vec(),
+            br#"{"ts":1,"amount":"1e2"}"#.to_vec(),
+            br#"{"ts":true}"#.to_vec(),
+            br#"{"ts":1,"score":"1"}"#.to_vec(),
+            br#"{"a":1}"#.to_vec(),
+            br#"  {"ts":1}  "#.to_vec(),
+            br#"{"ts":1,"note":"caf\u00e9"}"#.to_vec(),
+            br#"{"ts":1, "props": {"b":1, "a":[true, null]}, "props": [1, "z"]}"#.to_vec(),
+            br#"{"ts":1,"props":null,"props":{"a":1}}"#.to_vec(),
+            br#"{"ts":1,"caf\u00e9":"ok","props":1}"#.to_vec(),
+            br#"{"ts":1,"\uD83D\uDE00":9,"props":2}"#.to_vec(),
+            br#"{"ts":1,"props":"\uD83D\uDE00"}"#.to_vec(),
+            br#"{"ts":1,"props":{"a":1,}}"#.to_vec(),
+            b"{\"ts\":1,\"note\":\"\x0c\"}".to_vec(),
+            b"{\x0c\"ts\":1}".to_vec(),
+            br#"{"ts":1,"user_id":-}"#.to_vec(),
+            br#"{"ts":+1}"#.to_vec(),
+            br#"{"ts":1e2}"#.to_vec(),
+            br#"{"ts":"1e2"}"#.to_vec(),
+            br#"{"ts":1,"amount":" 12.30 "}"#.to_vec(),
+            br#"{"ts":1,"ok":truee}"#.to_vec(),
+            br#"{"ts":1,"note":"\uD800"}"#.to_vec(),
+            br#"{"ts":1,"score":0e0}"#.to_vec(),
+            br#"{"ts":1,"user_id":0e0}"#.to_vec(),
+        ];
+        for depth in [1usize, 127, 128, 129, 200] {
+            let mut nested = "[".repeat(depth);
+            nested.push('1');
+            nested.push_str(&"]".repeat(depth));
+            samples.push(format!(r#"{{"ts":1,"extra":{nested}}}"#).into_bytes());
+            samples.push(format!(r#"{{"ts":1,"props":{nested}}}"#).into_bytes());
+        }
+        let big = vec![b' '; 1024 * 1024 + 1];
+        samples.push(big);
+        for sample in &samples {
+            assert_same_parse(&schema, sample);
+            assert_same_parse(&json_schema, sample);
+        }
     }
 }

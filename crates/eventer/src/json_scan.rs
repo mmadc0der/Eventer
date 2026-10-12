@@ -11,6 +11,7 @@ pub fn validate_json_structure(text: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn skip_json_whitespace(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -20,6 +21,7 @@ pub fn skip_json_whitespace(bytes: &[u8], start: usize) -> usize {
 }
 
 /// Returns the raw UTF-8 JSON text of the last top-level object field named `key`, if any.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn extract_object_field_raw_last(document: &[u8], key: &str) -> Result<Option<String>> {
     let mut cursor = skip_json_whitespace(document, 0);
     if document.get(cursor) != Some(&b'{') {
@@ -62,6 +64,7 @@ pub fn extract_object_field_raw_last(document: &[u8], key: &str) -> Result<Optio
     Err(Error::event("malformed JSON object"))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn end_of_json_string(bytes: &[u8], start: usize) -> Result<usize> {
     if bytes.get(start) != Some(&b'"') {
         return Err(Error::event("expected JSON string"));
@@ -167,6 +170,7 @@ pub fn decode_json_string(bytes: &[u8]) -> Result<String> {
     Ok(out)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_json_string_token(bytes: &[u8], start: usize) -> Result<(String, usize)> {
     if bytes.get(start) != Some(&b'"') {
         return Err(Error::event("JSON object key must be a string"));
@@ -179,6 +183,7 @@ fn parse_json_string_token(bytes: &[u8], start: usize) -> Result<(String, usize)
     Ok((decoded, end))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn end_of_json_value(bytes: &[u8], start: usize) -> Result<usize> {
     let byte = *bytes
         .get(start)
@@ -213,6 +218,7 @@ pub fn end_of_json_value(bytes: &[u8], start: usize) -> Result<usize> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn end_of_json_container(bytes: &[u8], start: usize, open: u8, close: u8) -> Result<usize> {
     let mut depth = 0usize;
     let mut i = start;
@@ -246,6 +252,7 @@ fn end_of_json_container(bytes: &[u8], start: usize, open: u8, close: u8) -> Res
     Err(Error::event("truncated JSON value"))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn end_of_json_number(bytes: &[u8], start: usize) -> Result<usize> {
     let mut i = start;
     if bytes.get(i) == Some(&b'-') {
@@ -294,6 +301,7 @@ mod tests {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn consume_json_digits(bytes: &[u8], start: usize, allow_empty: bool) -> Result<usize> {
     let mut i = start;
     let mut saw = false;
