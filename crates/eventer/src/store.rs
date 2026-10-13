@@ -1107,9 +1107,12 @@ impl Store {
     /// and does not read the store. A non-finite float is corrupt.
     ///
     /// Retained samples are one `i64` or `f64` (8 bytes) or one `i128` (16
-    /// bytes) per non-null match. The next sample that would push that total
-    /// past [`MAX_QUERY_BYTES`] returns [`Error::Event`](Error::Event) and no
-    /// rank. A prefix of the rows is not a result.
+    /// bytes) per non-null match. A sample count already at [`MAX_QUERY_ROWS`]
+    /// returns [`Error::Event`](Error::Event) (`query row limit exceeded`)
+    /// before that sample is stored. The next sample that would push retained
+    /// bytes past [`MAX_QUERY_BYTES`] returns the same error kind (`query
+    /// response size limit exceeded`). Either refusal returns no rank. A prefix
+    /// of the rows is not a result.
     pub fn quantile_with_filter(
         &self,
         from_ms: i64,
@@ -2279,15 +2282,21 @@ impl QuantileSamples {
 }
 
 fn push_sample<T>(samples: &mut Vec<T>, value: T) -> Result<()> {
-    let width = std::mem::size_of::<T>();
-    let retained = samples
-        .len()
+    if samples.len() >= MAX_QUERY_ROWS {
+        return Err(Error::event("query row limit exceeded"));
+    }
+    retain_sample_bytes(samples.len(), std::mem::size_of::<T>())?;
+    samples.push(value);
+    Ok(())
+}
+
+fn retain_sample_bytes(len: usize, width: usize) -> Result<()> {
+    let retained = len
         .checked_mul(width)
         .ok_or_else(|| Error::event("query response size limit exceeded"))?;
     if width > MAX_QUERY_BYTES.saturating_sub(retained) {
         return Err(Error::event("query response size limit exceeded"));
     }
-    samples.push(value);
     Ok(())
 }
 
@@ -8410,25 +8419,30 @@ mod tests {
 
     #[test]
     fn quantile_refuses_samples_past_the_query_byte_ceiling() {
-        let mut ints = QuantileSamples::new(FieldType::Int);
-        let fit = MAX_QUERY_BYTES / std::mem::size_of::<i64>();
-        for value in 0..fit as i64 {
-            ints.push(Scalar::Int(value)).unwrap();
-        }
-        let overflow = ints.push(Scalar::Int(0));
+        let width = std::mem::size_of::<i64>();
+        let fit = MAX_QUERY_BYTES / width;
+        retain_sample_bytes(fit, width).unwrap_err();
+        retain_sample_bytes(fit - 1, width).unwrap();
+
+        let width = std::mem::size_of::<i128>();
+        let fit = MAX_QUERY_BYTES / width;
+        let overflow = retain_sample_bytes(fit, width);
         assert!(
             matches!(overflow, Err(Error::Event(ref message)) if message.contains("query response size limit exceeded")),
             "{overflow:?}"
         );
+        retain_sample_bytes(fit - 1, width).unwrap();
+    }
 
-        let mut decimals = QuantileSamples::new(FieldType::Decimal { scale: 2 });
-        let fit = MAX_QUERY_BYTES / std::mem::size_of::<i128>();
-        for value in 0..fit as i128 {
-            decimals.push(Scalar::Decimal(value)).unwrap();
+    #[test]
+    fn quantile_refuses_samples_past_the_query_row_ceiling() {
+        let mut ints = QuantileSamples::new(FieldType::Int);
+        for value in 0..MAX_QUERY_ROWS as i64 {
+            ints.push(Scalar::Int(value)).unwrap();
         }
-        let overflow = decimals.push(Scalar::Decimal(0));
+        let overflow = ints.push(Scalar::Int(0));
         assert!(
-            matches!(overflow, Err(Error::Event(ref message)) if message.contains("query response size limit exceeded")),
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("query row limit exceeded")),
             "{overflow:?}"
         );
     }
