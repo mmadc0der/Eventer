@@ -1105,6 +1105,11 @@ impl Store {
     /// timestamp, decimal, or float uses that column's scalar. A bool, string,
     /// text, or json column, an empty name, or an unknown field is an error
     /// and does not read the store. A non-finite float is corrupt.
+    ///
+    /// Retained samples are one `i64` or `f64` (8 bytes) or one `i128` (16
+    /// bytes) per non-null match. The next sample that would push that total
+    /// past [`MAX_QUERY_BYTES`] returns [`Error::Event`](Error::Event) and no
+    /// rank. A prefix of the rows is not a result.
     pub fn quantile_with_filter(
         &self,
         from_ms: i64,
@@ -2226,24 +2231,14 @@ impl QuantileSamples {
     fn push(&mut self, value: Scalar) -> Result<()> {
         match (self, value) {
             (_, Scalar::Null) => Ok(()),
-            (Self::Int(samples), Scalar::Int(value)) => {
-                samples.push(value);
-                Ok(())
-            }
-            (Self::Timestamp(samples), Scalar::Timestamp(value)) => {
-                samples.push(value);
-                Ok(())
-            }
-            (Self::Decimal(samples), Scalar::Decimal(value)) => {
-                samples.push(value);
-                Ok(())
-            }
+            (Self::Int(samples), Scalar::Int(value)) => push_sample(samples, value),
+            (Self::Timestamp(samples), Scalar::Timestamp(value)) => push_sample(samples, value),
+            (Self::Decimal(samples), Scalar::Decimal(value)) => push_sample(samples, value),
             (Self::Float(samples), Scalar::Float(value)) => {
                 if !value.is_finite() {
                     return Err(Error::corrupt("quantile float is not finite"));
                 }
-                samples.push(value);
-                Ok(())
+                push_sample(samples, value)
             }
             _ => Err(Error::corrupt(
                 "quantile value does not match its column type",
@@ -2281,6 +2276,19 @@ impl QuantileSamples {
         };
         Ok(Some(value))
     }
+}
+
+fn push_sample<T>(samples: &mut Vec<T>, value: T) -> Result<()> {
+    let width = std::mem::size_of::<T>();
+    let retained = samples
+        .len()
+        .checked_mul(width)
+        .ok_or_else(|| Error::event("query response size limit exceeded"))?;
+    if width > MAX_QUERY_BYTES.saturating_sub(retained) {
+        return Err(Error::event("query response size limit exceeded"));
+    }
+    samples.push(value);
+    Ok(())
 }
 
 fn resolve_group_field(schema: &Schema, by: &str) -> Result<ResolvedGroup> {
@@ -8398,6 +8406,31 @@ mod tests {
         assert!(parse_quantile_p("").is_err());
         let almost = parse_quantile_p(&format!("0.{}", "9".repeat(38))).unwrap();
         assert_eq!(quantile_rank(almost, usize::MAX), Some(usize::MAX - 1));
+    }
+
+    #[test]
+    fn quantile_refuses_samples_past_the_query_byte_ceiling() {
+        let mut ints = QuantileSamples::new(FieldType::Int);
+        let fit = MAX_QUERY_BYTES / std::mem::size_of::<i64>();
+        for value in 0..fit as i64 {
+            ints.push(Scalar::Int(value)).unwrap();
+        }
+        let overflow = ints.push(Scalar::Int(0));
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("query response size limit exceeded")),
+            "{overflow:?}"
+        );
+
+        let mut decimals = QuantileSamples::new(FieldType::Decimal { scale: 2 });
+        let fit = MAX_QUERY_BYTES / std::mem::size_of::<i128>();
+        for value in 0..fit as i128 {
+            decimals.push(Scalar::Decimal(value)).unwrap();
+        }
+        let overflow = decimals.push(Scalar::Decimal(0));
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("query response size limit exceeded")),
+            "{overflow:?}"
+        );
     }
 
     #[test]
