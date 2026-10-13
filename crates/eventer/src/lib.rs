@@ -30,6 +30,8 @@
 //! window, without building the rows.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
+//! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
+//! row for each value of one column, in that same key order.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares
