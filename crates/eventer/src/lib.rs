@@ -27,7 +27,9 @@
 //! the same rows into fixed epoch-aligned time buckets.
 //! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums
 //! and finds the minimum and maximum of numeric columns over that same filtered
-//! window, without building the rows.
+//! window, without building the rows. `min` and `max` with no `sum` and no row
+//! predicate take int, decimal, and float extremes from the zone when every
+//! payload timestamp in the block is inside the range.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
 //! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
