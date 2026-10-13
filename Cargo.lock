@@ -240,8 +240,10 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "crossbeam-channel",
+ "itoa",
  "serde",
  "serde_json",
+ "zmij",
  "zstd",
 ]
 

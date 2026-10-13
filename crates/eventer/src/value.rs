@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use serde::Serialize;
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
 use crate::json_scan::{
@@ -762,24 +762,33 @@ pub fn parse_decimal(text: &str, scale: u32) -> Result<i128> {
 }
 
 pub fn format_decimal(value: i128, scale: u32) -> String {
-    let neg = value < 0;
-    let digits = value.unsigned_abs().to_string();
-    let body = if scale == 0 {
-        digits
+    let mut out = Vec::new();
+    write_decimal_lexeme(&mut out, value, scale);
+    String::from_utf8(out).expect("decimal lexeme is ASCII")
+}
+
+/// Decimal digits `format_decimal` would return. No sign other than a leading `-`, and no exponent.
+fn write_decimal_lexeme(out: &mut Vec<u8>, value: i128, scale: u32) {
+    if value < 0 {
+        out.push(b'-');
+    }
+    let mut buf = itoa::Buffer::new();
+    let digits = buf.format(value.unsigned_abs()).as_bytes();
+    let scale = scale as usize;
+    if scale == 0 {
+        out.extend_from_slice(digits);
+        return;
+    }
+    if digits.len() <= scale {
+        out.push(b'0');
+        out.push(b'.');
+        out.resize(out.len() + (scale - digits.len()), b'0');
+        out.extend_from_slice(digits);
     } else {
-        let scale = scale as usize;
-        let (int_part, frac) = if digits.len() <= scale {
-            ("0".to_string(), format!("{digits:0>scale$}"))
-        } else {
-            let split = digits.len() - scale;
-            (digits[..split].to_string(), digits[split..].to_string())
-        };
-        format!("{int_part}.{frac}")
-    };
-    if neg {
-        format!("-{body}")
-    } else {
-        body
+        let split = digits.len() - scale;
+        out.extend_from_slice(&digits[..split]);
+        out.push(b'.');
+        out.extend_from_slice(&digits[split..]);
     }
 }
 
@@ -888,7 +897,9 @@ fn json_lexeme_to_value(raw: &[u8]) -> Result<Value> {
 
 /// Serializes a row to JSON bytes, preserving raw `json` column text from ingest.
 pub fn row_to_json_bytes(schema: &Schema, row: &Row) -> Result<Vec<u8>> {
-    write_row_json(schema, row, None)
+    let mut out = Vec::new();
+    append_row_json(&mut out, schema, row, None)?;
+    Ok(out)
 }
 
 /// Same bytes as [`row_to_json_bytes`] for the fields `keep` marks.
@@ -897,11 +908,19 @@ pub fn row_to_json_bytes(schema: &Schema, row: &Row) -> Result<Vec<u8>> {
 /// order is the schema order. `keep` aligned with every column matches
 /// [`row_to_json_bytes`].
 pub fn row_to_json_bytes_selected(schema: &Schema, row: &Row, keep: &[bool]) -> Result<Vec<u8>> {
-    write_row_json(schema, row, Some(keep))
+    let mut out = Vec::new();
+    append_row_json(&mut out, schema, row, Some(keep))?;
+    Ok(out)
 }
 
-fn write_row_json(schema: &Schema, row: &Row, keep: Option<&[bool]>) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+/// Appends one row object. A `json` column is copied as stored. Every other scalar is written
+/// as the same lexeme `serde_json` would emit for that value, without building a `Value`.
+pub(crate) fn append_row_json(
+    out: &mut Vec<u8>,
+    schema: &Schema,
+    row: &Row,
+    keep: Option<&[bool]>,
+) -> Result<()> {
     out.push(b'{');
     let mut written = 0usize;
     for (index, (field, scalar)) in schema.fields.iter().zip(row.values.iter()).enumerate() {
@@ -912,43 +931,105 @@ fn write_row_json(schema: &Schema, row: &Row, keep: Option<&[bool]>) -> Result<V
             out.push(b',');
         }
         written += 1;
-        serde_json::to_writer(&mut out, &field.name)
-            .map_err(|err| Error::corrupt(format!("failed to encode field name: {err}")))?;
+        write_json_string(out, &field.name);
         out.push(b':');
-        match (field.ty, scalar) {
-            (FieldType::Json, Scalar::Json(raw)) => {
-                out.extend_from_slice(raw.as_bytes());
-            }
-            _ => {
-                let value = scalar_to_json_value(field, scalar)?;
-                serde_json::to_writer(&mut out, &value)
-                    .map_err(|err| Error::corrupt(format!("failed to encode field: {err}")))?;
-            }
-        }
+        write_scalar_json(out, field, scalar)?;
     }
     out.push(b'}');
-    Ok(out)
+    Ok(())
 }
 
-fn scalar_to_json_value(field: &Field, scalar: &Scalar) -> Result<Value> {
+fn write_scalar_json(out: &mut Vec<u8>, field: &Field, scalar: &Scalar) -> Result<()> {
     match (field.ty, scalar) {
-        (_, Scalar::Null) => Ok(Value::Null),
-        (FieldType::Int, Scalar::Int(v)) => Ok(Value::Number((*v).into())),
-        (FieldType::Float, Scalar::Float(v)) => Number::from_f64(*v)
-            .map(Value::Number)
-            .ok_or_else(|| Error::corrupt(format!("field `{}` is not a finite float", field.name))),
-        (FieldType::Bool, Scalar::Bool(v)) => Ok(Value::Bool(*v)),
-        (FieldType::String | FieldType::Text, Scalar::Str(v)) => Ok(Value::String(v.clone())),
-        (FieldType::Decimal { scale }, Scalar::Decimal(v)) => {
-            Ok(Value::String(format_decimal(*v, scale)))
+        (_, Scalar::Null) => out.extend_from_slice(b"null"),
+        (FieldType::Bool, Scalar::Bool(true)) => out.extend_from_slice(b"true"),
+        (FieldType::Bool, Scalar::Bool(false)) => out.extend_from_slice(b"false"),
+        (FieldType::Int, Scalar::Int(value)) | (FieldType::Timestamp, Scalar::Timestamp(value)) => {
+            let mut buf = itoa::Buffer::new();
+            out.extend_from_slice(buf.format(*value).as_bytes());
         }
-        (FieldType::Timestamp, Scalar::Timestamp(v)) => Ok(Value::Number((*v).into())),
-        _ => Err(Error::corrupt(format!(
-            "field `{}` has a value that does not match its type",
-            field.name
-        ))),
+        (FieldType::Float, Scalar::Float(value)) => {
+            if !value.is_finite() {
+                return Err(Error::corrupt(format!(
+                    "field `{}` is not a finite float",
+                    field.name
+                )));
+            }
+            // `Number::from_f64` stores this text. `+0.0`, which is what an integer lexeme
+            // `-0` becomes, is `0.0`. A stored signed zero is `-0.0`.
+            let mut buf = zmij::Buffer::new();
+            out.extend_from_slice(buf.format_finite(*value).as_bytes());
+        }
+        (FieldType::String | FieldType::Text, Scalar::Str(value)) => {
+            write_json_string(out, value);
+        }
+        (FieldType::Decimal { scale }, Scalar::Decimal(value)) => {
+            out.push(b'"');
+            write_decimal_lexeme(out, *value, scale);
+            out.push(b'"');
+        }
+        (FieldType::Json, Scalar::Json(raw)) => out.extend_from_slice(raw.as_bytes()),
+        _ => {
+            return Err(Error::corrupt(format!(
+                "field `{}` has a value that does not match its type",
+                field.name
+            )));
+        }
     }
+    Ok(())
 }
+
+/// JSON string escaping matches `serde_json`: quotes, backslashes, and ASCII controls.
+fn write_json_string(out: &mut Vec<u8>, value: &str) {
+    out.push(b'"');
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        let escape = JSON_ESCAPE[byte as usize];
+        if escape == 0 {
+            continue;
+        }
+        out.extend_from_slice(&bytes[start..index]);
+        if escape == b'u' {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            out.extend_from_slice(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[(byte >> 4) as usize],
+                HEX[(byte & 0x0F) as usize],
+            ]);
+        } else {
+            out.push(b'\\');
+            out.push(escape);
+        }
+        start = index + 1;
+    }
+    out.extend_from_slice(&bytes[start..]);
+    out.push(b'"');
+}
+
+const JSON_ESCAPE: [u8; 256] = [
+    b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'b', b't', b'n', b'u', b'f', b'r', b'u',
+    b'u', // 0
+    b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u', b'u',
+    b'u', // 1
+    0, 0, b'"', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 2
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 3
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 4
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b'\\', 0, 0, 0, // 5
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 6
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 7
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 8
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 9
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // A
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // B
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // C
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // D
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // E
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // F
+];
 
 #[cfg(test)]
 mod tests {
@@ -982,6 +1063,134 @@ mod tests {
         assert_eq!(parse_decimal(".5", 2).unwrap(), 50);
         assert!(parse_decimal("1.234", 2).is_err());
         assert!(parse_decimal("1e2", 2).is_err());
+        assert_eq!(format_decimal(0, 0), "0");
+        assert_eq!(format_decimal(0, 4), "0.0000");
+        assert_eq!(format_decimal(i128::MIN, 0), i128::MIN.to_string());
+        assert_eq!(format_decimal(i128::MAX, 2), {
+            let digits = i128::MAX.to_string();
+            let split = digits.len() - 2;
+            format!("{}.{}", &digits[..split], &digits[split..])
+        });
+    }
+
+    /// The previous writer: one `serde_json::Value` per scalar, then `to_writer`.
+    fn row_json_via_value(schema: &Schema, row: &Row, keep: Option<&[bool]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(b'{');
+        let mut written = 0usize;
+        for (index, (field, scalar)) in schema.fields.iter().zip(row.values.iter()).enumerate() {
+            if keep.is_some_and(|keep| !keep.get(index).copied().unwrap_or(false)) {
+                continue;
+            }
+            if written > 0 {
+                out.push(b',');
+            }
+            written += 1;
+            serde_json::to_writer(&mut out, &field.name).unwrap();
+            out.push(b':');
+            let value = match (field.ty, scalar) {
+                (_, Scalar::Null) => Value::Null,
+                (FieldType::Int, Scalar::Int(v)) => Value::Number((*v).into()),
+                (FieldType::Float, Scalar::Float(v)) => {
+                    Value::Number(serde_json::Number::from_f64(*v).unwrap())
+                }
+                (FieldType::Bool, Scalar::Bool(v)) => Value::Bool(*v),
+                (FieldType::String | FieldType::Text, Scalar::Str(v)) => Value::String(v.clone()),
+                (FieldType::Decimal { scale }, Scalar::Decimal(v)) => {
+                    Value::String(format_decimal(*v, scale))
+                }
+                (FieldType::Timestamp, Scalar::Timestamp(v)) => Value::Number((*v).into()),
+                (FieldType::Json, Scalar::Json(raw)) => {
+                    out.extend_from_slice(raw.as_bytes());
+                    continue;
+                }
+                other => panic!("unexpected {other:?}"),
+            };
+            serde_json::to_writer(&mut out, &value).unwrap();
+        }
+        out.push(b'}');
+        out
+    }
+
+    #[test]
+    fn scalar_lexemes_match_the_value_writer() {
+        let schema = sample_schema();
+        let samples = vec![
+            br#"{"ts":1}"#.to_vec(),
+            br#"{"ts":1,"user_id":null,"score":null,"ok":null,"action":null,"note":null,"amount":null}"#.to_vec(),
+            br#"{"ts":"2024-01-02T03:04:05.123Z","user_id":7,"score":1.5,"ok":true,"action":"buy","note":"hi","amount":"19.99"}"#.to_vec(),
+            br#"{"ts":-0,"score":-0,"ok":false,"action":"a\"b\\c","note":"line\n\t\u0000","amount":"-0.01"}"#.to_vec(),
+            br#"{"ts":1,"score":-0.0,"note":"caf\u00e9","amount":"0.00"}"#.to_vec(),
+            br#"{"ts":1,"score":0.1,"user_id":0,"ok":true}"#.to_vec(),
+            format!(r#"{{"ts":{},"user_id":{}}}"#, i64::MIN, i64::MAX).into_bytes(),
+        ];
+        for sample in &samples {
+            let row = parse_event(&schema, sample).unwrap();
+            assert_eq!(
+                row_to_json_bytes(&schema, &row).unwrap(),
+                row_json_via_value(&schema, &row, None),
+                "{}",
+                String::from_utf8_lossy(sample)
+            );
+            let keep = [true, false, true, false, true, false, true];
+            assert_eq!(
+                row_to_json_bytes_selected(&schema, &row, &keep).unwrap(),
+                row_json_via_value(&schema, &row, Some(&keep))
+            );
+        }
+
+        let quoted = Schema {
+            timestamp_field: "ts".into(),
+            timestamp_index: 0,
+            fields: vec![
+                Field {
+                    name: "ts".into(),
+                    ty: FieldType::Timestamp,
+                },
+                Field {
+                    name: "say \"hi\"".into(),
+                    ty: FieldType::String,
+                },
+            ],
+        };
+        let row = Row {
+            ts: 1,
+            values: vec![Scalar::Timestamp(1), Scalar::Str("x/y".into())],
+        };
+        assert_eq!(
+            row_to_json_bytes(&quoted, &row).unwrap(),
+            row_json_via_value(&quoted, &row, None)
+        );
+
+        let floats = Schema {
+            timestamp_field: "ts".into(),
+            timestamp_index: 0,
+            fields: vec![
+                Field {
+                    name: "ts".into(),
+                    ty: FieldType::Timestamp,
+                },
+                Field {
+                    name: "score".into(),
+                    ty: FieldType::Float,
+                },
+            ],
+        };
+        let positive_zero = Row {
+            ts: 1,
+            values: vec![Scalar::Timestamp(1), Scalar::Float(0.0)],
+        };
+        let bytes = row_to_json_bytes(&floats, &positive_zero).unwrap();
+        assert_eq!(bytes, row_json_via_value(&floats, &positive_zero, None));
+        assert_eq!(bytes, br#"{"ts":1,"score":0.0}"#);
+        let negative_zero = Row {
+            ts: 1,
+            values: vec![Scalar::Timestamp(1), Scalar::Float(-0.0)],
+        };
+        assert_eq!(
+            row_to_json_bytes(&floats, &negative_zero).unwrap(),
+            row_json_via_value(&floats, &negative_zero, None)
+        );
     }
 
     #[test]
