@@ -13,7 +13,10 @@
 //! null flag as an integer. A null does not keep a block whose finite values
 //! sit entirely on the wrong side of a bound. Equality still reads a block
 //! whose range contains the value, because a min/max pair does not prove the
-//! value is present. JSON stays unpruned. A non-finite float is not stored by
+//! value is present. The same bounds prove the other direction for a count:
+//! when every stored value sits inside the predicate and the null flag is
+//! clear, the block's row count is the answer and the column is not decoded.
+//! JSON stays unpruned. A non-finite float is not stored by
 //! the parser; a block that nevertheless contains one keeps the unknown tag
 //! and is not skipped. Tag `0` stays unknown, so a zone file written when
 //! floats were that tag still opens. The timestamp column is
@@ -221,6 +224,25 @@ pub(crate) fn may_match_ranges(
         }
     }
     true
+}
+
+/// True when every range is true of every value this block stored.
+///
+/// Count can then use the timestamp column alone. `gt` needs a minimum
+/// strictly above the bound, and `ge` needs a minimum greater than or equal
+/// to it. `lt` and `le` use the maximum the same way. A set null flag is not
+/// a proof, because a null matches no range. Tag `0`, a non-finite float
+/// bound, and any other zone that is not an ordered min/max are not proofs.
+/// An empty range list is not a proof. Equality is not a range.
+pub(crate) fn ranges_implied(zone: &BlockZone, ranges: &[RangeFilter]) -> bool {
+    !ranges.is_empty() && ranges.iter().all(|range| range_implied(zone, range))
+}
+
+fn range_implied(zone: &BlockZone, range: &RangeFilter) -> bool {
+    match zone.columns.get(range.index) {
+        Some(column) => column.implies_range(range),
+        None => false,
+    }
 }
 
 /// Load the sidecar, or build it from block payloads when it is missing or stale.
@@ -536,6 +558,47 @@ impl ColumnZone {
             ColumnZone::Bool { .. } | ColumnZone::Exact { .. } | ColumnZone::Bloom { .. } => true,
         }
     }
+
+    /// True when every non-null value in this zone satisfies `range`, and the
+    /// zone recorded no nulls.
+    fn implies_range(&self, range: &RangeFilter) -> bool {
+        match self {
+            ColumnZone::I64 {
+                has_null: false,
+                min,
+                max,
+            }
+            | ColumnZone::IndexTs { min, max } => {
+                ordered_range_contains(*min, *max, range, bound_i64, |left, right| {
+                    Some(left.cmp(&right))
+                })
+            }
+            ColumnZone::I128 {
+                has_null: false,
+                min,
+                max,
+            } => ordered_range_contains(*min, *max, range, bound_i128, |left, right| {
+                Some(left.cmp(&right))
+            }),
+            ColumnZone::F64 {
+                has_null: false,
+                min,
+                max,
+            } if min.is_finite() && max.is_finite() => {
+                ordered_range_contains(*min, *max, range, bound_f64, |left, right| {
+                    left.partial_cmp(&right)
+                })
+            }
+            ColumnZone::Unknown
+            | ColumnZone::AllNull
+            | ColumnZone::I64 { .. }
+            | ColumnZone::I128 { .. }
+            | ColumnZone::F64 { .. }
+            | ColumnZone::Bool { .. }
+            | ColumnZone::Exact { .. }
+            | ColumnZone::Bloom { .. } => false,
+        }
+    }
 }
 
 fn bound_i64(value: &Scalar) -> Option<i64> {
@@ -599,6 +662,51 @@ fn ordered_range_overlaps<T: Copy>(
         };
         let Some(order) = cmp(min, cutoff) else {
             return true;
+        };
+        if upper.inclusive {
+            if order == Ordering::Greater {
+                return false;
+            }
+        } else if order != Ordering::Less {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when `[min, max]` sits inside the predicate.
+///
+/// A lower bound is implied when `min` is past it (`>` for `gt`, `>=` for
+/// `ge`). An upper bound uses `max` the same way. A comparison that is not
+/// ordered, including a non-finite float, is not a proof.
+fn ordered_range_contains<T: Copy>(
+    min: T,
+    max: T,
+    range: &RangeFilter,
+    bound: impl Fn(&Scalar) -> Option<T>,
+    cmp: impl Fn(T, T) -> Option<Ordering>,
+) -> bool {
+    if let Some(lower) = &range.lower {
+        let Some(cutoff) = bound(&lower.value) else {
+            return false;
+        };
+        let Some(order) = cmp(min, cutoff) else {
+            return false;
+        };
+        if lower.inclusive {
+            if order == Ordering::Less {
+                return false;
+            }
+        } else if order != Ordering::Greater {
+            return false;
+        }
+    }
+    if let Some(upper) = &range.upper {
+        let Some(cutoff) = bound(&upper.value) else {
+            return false;
+        };
+        let Some(order) = cmp(max, cutoff) else {
+            return false;
         };
         if upper.inclusive {
             if order == Ordering::Greater {
@@ -2002,5 +2110,131 @@ mod tests {
             &[row(&with_json, r#"{"ts":10,"props":{"n":1}}"#)],
         );
         assert!(matches!(json_zone.columns[1], ColumnZone::Unknown));
+    }
+
+    #[test]
+    fn range_is_implied_only_when_every_stored_value_matches() {
+        let schema = schema();
+        let zone = from_rows(
+            &schema,
+            &[
+                row(
+                    &schema,
+                    r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":0.0}"#,
+                ),
+                row(
+                    &schema,
+                    r#"{"ts":40,"user_id":9,"ok":false,"action":"view","note":"b","amount":"9.50","score":9.9}"#,
+                ),
+            ],
+        );
+        let index = |name: &str| {
+            schema
+                .fields
+                .iter()
+                .position(|field| field.name == name)
+                .unwrap()
+        };
+        let ge = |name: &str, value: Scalar| RangeFilter {
+            index: index(name),
+            lower: Some(crate::codec::RangeEnd {
+                inclusive: true,
+                value,
+            }),
+            upper: None,
+        };
+        let gt = |name: &str, value: Scalar| RangeFilter {
+            index: index(name),
+            lower: Some(crate::codec::RangeEnd {
+                inclusive: false,
+                value,
+            }),
+            upper: None,
+        };
+        let le = |name: &str, value: Scalar| RangeFilter {
+            index: index(name),
+            lower: None,
+            upper: Some(crate::codec::RangeEnd {
+                inclusive: true,
+                value,
+            }),
+        };
+        let lt = |name: &str, value: Scalar| RangeFilter {
+            index: index(name),
+            lower: None,
+            upper: Some(crate::codec::RangeEnd {
+                inclusive: false,
+                value,
+            }),
+        };
+        assert!(ranges_implied(&zone, &[ge("score", Scalar::Float(0.0))]));
+        assert!(ranges_implied(&zone, &[gt("score", Scalar::Float(-0.1))]));
+        assert!(!ranges_implied(&zone, &[gt("score", Scalar::Float(0.0))]));
+        assert!(!ranges_implied(&zone, &[ge("score", Scalar::Float(5.0))]));
+        assert!(ranges_implied(&zone, &[le("score", Scalar::Float(9.9))]));
+        assert!(ranges_implied(&zone, &[lt("score", Scalar::Float(10.0))]));
+        assert!(!ranges_implied(&zone, &[lt("score", Scalar::Float(9.9))]));
+        assert!(ranges_implied(
+            &zone,
+            &[ge("user_id", Scalar::Int(1)), le("user_id", Scalar::Int(9))]
+        ));
+        assert!(ranges_implied(&zone, &[gt("user_id", Scalar::Int(0))]));
+        assert!(!ranges_implied(&zone, &[gt("user_id", Scalar::Int(1))]));
+        assert!(ranges_implied(
+            &zone,
+            &[
+                ge("amount", Scalar::Decimal(100)),
+                le("amount", Scalar::Decimal(950))
+            ]
+        ));
+        assert!(!ranges_implied(
+            &zone,
+            &[
+                ge("amount", Scalar::Decimal(100)),
+                ge("score", Scalar::Float(5.0))
+            ]
+        ));
+        assert!(ranges_implied(
+            &zone,
+            &[
+                ge("ts", Scalar::Timestamp(10)),
+                le("ts", Scalar::Timestamp(40))
+            ]
+        ));
+        assert!(!ranges_implied(&zone, &[gt("ts", Scalar::Timestamp(10))]));
+        assert!(!ranges_implied(&zone, &[]));
+
+        let with_null = from_rows(
+            &schema,
+            &[
+                row(
+                    &schema,
+                    r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":1.0}"#,
+                ),
+                row(
+                    &schema,
+                    r#"{"ts":20,"user_id":null,"ok":true,"action":"click","note":"a","amount":null,"score":null}"#,
+                ),
+            ],
+        );
+        assert!(!ranges_implied(
+            &with_null,
+            &[ge("score", Scalar::Float(0.0))]
+        ));
+        assert!(!ranges_implied(
+            &with_null,
+            &[ge("user_id", Scalar::Int(0))]
+        ));
+        assert!(!ranges_implied(
+            &with_null,
+            &[ge("amount", Scalar::Decimal(0))]
+        ));
+
+        let mut unknown = zone.clone();
+        unknown.columns[index("score")] = ColumnZone::Unknown;
+        assert!(!ranges_implied(
+            &unknown,
+            &[ge("score", Scalar::Float(0.0))]
+        ));
     }
 }
