@@ -31,7 +31,7 @@ The first store is the baseline for the last column. `488f597` keeps 3,639 data 
 | `96e1ceb` | Timestamp zone bounds taken from the sparse index | 3639 | 0% | 674 | 23.8% smaller | 4313 | 4.7% smaller | 99.1% smaller |
 | `488f597` | Sparse index and zone file compressed at zstd level 19 | 3639 | 0% | 570 | 15.4% smaller | 4209 | 2.4% smaller | 99.1% smaller |
 
-JSON columns did not change this workload: the bench schema has no `json` field. Equality filters, schema append, retention, batch ingest, `limit`/`offset`, `GET /events/count`, numeric range predicates (`208c7b0`), directory rewrite (`7829a39`), `GET /events/stats`, grouping those stats by one column, and `GET /events/quantile` sit between these commits and do not change the encoder. HTTP drop (`d194464`), time-bucket counts (`305a4d5`), range predicates, and directory rewrite match the format commit they sit on.
+JSON columns did not change this workload: the bench schema has no `json` field. Equality filters, schema append, retention, batch ingest, `limit`/`offset`, `GET /events/count`, numeric range predicates (`208c7b0`), directory rewrite (`7829a39`), `GET /events/stats`, grouping those stats by one column, `GET /events/quantile`, and `GET /events/latest` sit between these commits and do not change the encoder. HTTP drop (`d194464`), time-bucket counts (`305a4d5`), range predicates, and directory rewrite match the format commit they sit on.
 
 Zone maps make the index total larger because the zone file did not exist before. The sparse index underneath was still 1,968 bytes until the later index compression.
 

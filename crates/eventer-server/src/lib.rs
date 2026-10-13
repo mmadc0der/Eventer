@@ -20,6 +20,8 @@
 //! `GET /events/quantile?field=&p=` returns one exact rank of a numeric column
 //! over that same range and the same filters. The body is that value, or JSON
 //! `null` when no non-null value matches.
+//! `GET /events/latest?by=field` returns the newest matching row for each value
+//! of that column, in the same key order.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
 //! with the caller's `before_ms`. The request `Content-Type` must be
 //! `application/json`, with an optional `charset=utf-8`. A block is removed
@@ -51,6 +53,7 @@ pub fn router(store: Arc<eventer::Store>) -> Router {
         .route("/events/histogram", get(histogram_events))
         .route("/events/stats", get(stats_events))
         .route("/events/quantile", get(quantile_events))
+        .route("/events/latest", get(latest_events))
         .route("/events", get(get_events).post(post_event))
         .route("/events/drop", post(post_drop))
         .with_state(AppState { store })
@@ -116,7 +119,11 @@ async fn post_drop(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(response) = reject_select(raw.as_deref().unwrap_or(""), "/events/drop") {
+    let raw_query = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_named_params(raw_query, "/events/drop", &["by", "latest"]) {
+        return *response;
+    }
+    if let Err(response) = reject_select(raw_query, "/events/drop") {
         return *response;
     }
     if let Err(response) = reject_quantile_param(raw.as_deref().unwrap_or(""), "/events/drop") {
@@ -220,6 +227,9 @@ async fn get_events(
     if let Err(response) = reject_quantile_param(raw_query, "/events") {
         return *response;
     }
+    if let Err(response) = reject_named_params(raw_query, "/events", &["by", "latest"]) {
+        return *response;
+    }
     let (offset, limit) = match page_params(raw_query) {
         Ok(page) => page,
         Err(response) => return *response,
@@ -228,7 +238,7 @@ async fn get_events(
         Ok(predicates) => predicates,
         Err(response) => return *response,
     };
-    let columns = match projection(state.store.schema(), raw_query) {
+    let columns = match projection(state.store.schema(), raw_query, "/events", &[]) {
         Ok(columns) => columns,
         Err(response) => return *response,
     };
@@ -260,6 +270,9 @@ async fn count_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_named_params(raw, "/events/count", &["by", "latest"]) {
+        return *response;
+    }
     if let Err(response) = reject_page_params(raw, "/events/count") {
         return *response;
     }
@@ -295,6 +308,9 @@ async fn histogram_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_named_params(raw, "/events/histogram", &["by", "latest"]) {
+        return *response;
+    }
     if let Err(response) = reject_page_params(raw, "/events/histogram") {
         return *response;
     }
@@ -350,6 +366,9 @@ async fn stats_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_named_params(raw, "/events/stats", &["latest"]) {
+        return *response;
+    }
     if let Err(response) = reject_stats_params(raw) {
         return *response;
     }
@@ -460,6 +479,61 @@ async fn quantile_events(
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "quantile task failed"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn latest_events(
+    State(state): State<AppState>,
+    Query(params): Query<RangeParams>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let raw = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_latest_params(raw) {
+        return *response;
+    }
+    let from = match parse_bound(params.from, "from") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let to = match parse_bound(params.to, "to") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let by = match group_field(raw) {
+        Ok(Some(by)) => by,
+        Ok(None) => return *bad_request("missing `by` query parameter"),
+        Err(response) => return *response,
+    };
+    if let Err(response) = reject_group_field(state.store.schema(), &by) {
+        return *response;
+    }
+    let predicates = match parse_filters(state.store.schema(), raw) {
+        Ok(predicates) => predicates,
+        Err(response) => return *response,
+    };
+    let columns = match projection(state.store.schema(), raw, "/events/latest", &["by"]) {
+        Ok(columns) => columns,
+        Err(response) => return *response,
+    };
+    let store = Arc::clone(&state.store);
+    let joined = tokio::task::spawn_blocking(move || match columns {
+        None => store.latest_json(from, to, &predicates, &by, None),
+        Some(columns) => store.latest_json(from, to, &predicates, &by, Some(&columns)),
+    })
+    .await;
+    match joined {
+        Ok(Ok(bytes)) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/json")],
+            Body::from(bytes),
+        )
+            .into_response(),
+        Ok(Err(err)) => error_response(&err),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "latest task failed"})),
         )
             .into_response(),
     }
@@ -922,6 +996,51 @@ fn bucket_ms_param(query: &str) -> std::result::Result<i64, Box<Response>> {
     found.ok_or_else(|| bad_request("missing `bucket_ms` query parameter"))
 }
 
+fn reject_latest_params(query: &str) -> std::result::Result<(), Box<Response>> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = percent_decode(key, "query")?;
+        if !matches!(
+            key.as_str(),
+            "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" | "select" | "by"
+        ) {
+            return Err(bad_request(&format!(
+                "`{key}` is not a parameter of /events/latest"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_named_params(
+    query: &str,
+    route: &str,
+    names: &[&str],
+) -> std::result::Result<(), Box<Response>> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = percent_decode(key, "query")?;
+        if names.contains(&key.as_str()) {
+            return Err(bad_request(&format!(
+                "`{key}` is not a parameter of {route}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn reject_page_params(query: &str, route: &str) -> std::result::Result<(), Box<Response>> {
     if query.is_empty() {
         return Ok(());
@@ -986,6 +1105,8 @@ fn reject_select(query: &str, route: &str) -> std::result::Result<(), Box<Respon
 fn projection(
     schema: &eventer::Schema,
     query: &str,
+    route: &str,
+    also_allowed: &[&str],
 ) -> std::result::Result<Option<Vec<usize>>, Box<Response>> {
     if query.is_empty() {
         return Ok(None);
@@ -1031,9 +1152,10 @@ fn projection(
         if !matches!(
             key.as_str(),
             "from" | "to" | "limit" | "offset" | "eq" | "gt" | "ge" | "lt" | "le" | "select"
-        ) {
+        ) && !also_allowed.contains(&key.as_str())
+        {
             return Err(bad_request(&format!(
-                "`{key}` is not a parameter of /events"
+                "`{key}` is not a parameter of {route}"
             )));
         }
     }
@@ -3019,6 +3141,227 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[tokio::test]
+    async fn latest_returns_one_row_per_key_in_group_order() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-latest-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "text"},
+                    {"name": "amount", "type": "decimal", "scale": 2},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(2, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        let rows = [
+            r#"{"ts":1000,"user_id":1,"score":1.0,"ok":true,"action":"click","note":"b","amount":"1.00"}"#,
+            r#"{"ts":5000,"user_id":9,"score":1.0,"ok":true,"action":"click","note":"b","amount":"9.00"}"#,
+            r#"{"ts":4000,"user_id":3,"score":1.0,"ok":false,"action":"click","note":"b","amount":"8.00"}"#,
+            r#"{"ts":5000,"user_id":2,"score":2.5,"ok":true,"action":"click","note":"Z","amount":"3.00"}"#,
+            r#"{"ts":2000,"score":1.0,"ok":false,"amount":"4.00"}"#,
+            r#"{"ts":1500,"user_id":4,"score":1.0,"ok":true,"action":"view","note":"a","amount":"2.00"}"#,
+            r#"{"ts":1100,"user_id":4,"score":1.0,"ok":false,"action":"view","note":"A","amount":"7.00"}"#,
+        ];
+        for row in rows {
+            let (status, body) = post(&app, row).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let (status, body) = get_json(&app, "/events/latest?from=1000&to=5000&by=action").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed = body.as_array().unwrap();
+        assert_eq!(listed.len(), 3);
+        assert!(listed[0]["action"].is_null());
+        assert_eq!(listed[0]["ts"], 2000);
+        assert!(listed[0]["user_id"].is_null());
+        assert_eq!(listed[1]["action"], "click");
+        assert_eq!(listed[1]["ts"], 5000);
+        assert_eq!(listed[1]["user_id"], 2);
+        assert_eq!(listed[2]["action"], "view");
+        assert_eq!(listed[2]["ts"], 1500);
+        assert_eq!(listed[2]["user_id"], 4);
+
+        let (status, groups) = get_json(
+            &app,
+            "/events/stats?from=1000&to=5000&by=action&sum=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{groups}");
+        let group_keys: Vec<_> = groups["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["key"].clone())
+            .collect();
+        let latest_keys: Vec<_> = listed.iter().map(|row| row["action"].clone()).collect();
+        assert_eq!(latest_keys, group_keys);
+
+        let (status, at_tie) = get_json(&app, "/events?from=5000&to=5000").await;
+        assert_eq!(status, StatusCode::OK, "{at_tie}");
+        let tied = at_tie
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["user_id"] == 2)
+            .unwrap();
+        assert_eq!(&listed[1], tied);
+
+        let (status, projected) = get_json(
+            &app,
+            "/events/latest?from=1000&to=5000&by=user_id&eq=note=b&select=action&select=ts",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{projected}");
+        assert_eq!(
+            projected,
+            json!([
+                {"ts": 1000, "action": "click"},
+                {"ts": 4000, "action": "click"},
+                {"ts": 5000, "action": "click"}
+            ])
+        );
+        let raw = get_raw(
+            &app,
+            "/events/latest?from=1000&to=5000&by=user_id&eq=note=b&select=action&select=ts",
+        )
+        .await;
+        assert_eq!(
+            raw,
+            br#"[{"ts":1000,"action":"click"},{"ts":4000,"action":"click"},{"ts":5000,"action":"click"}]"#
+        );
+
+        let (status, empty) = get_json(
+            &app,
+            "/events/latest?from=1000&to=5000&by=action&eq=action=missing",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert_eq!(empty, json!([]));
+
+        for uri in [
+            "/events/latest?from=1000&to=5000",
+            "/events/latest?from=1000&to=5000&by=",
+            "/events/latest?from=1000&to=5000&by",
+            "/events/latest?from=1000&to=5000&by=missing",
+            "/events/latest?from=1000&to=5000&by=score",
+            "/events/latest?from=1000&to=5000&by=props",
+            "/events/latest?from=1000&to=5000&by=action&by=ok",
+            "/events/latest?from=1000&to=5000&by=action&limit=1",
+            "/events/latest?from=1000&to=5000&by=action&offset=0",
+            "/events/latest?from=1000&to=5000&by=action&bucket_ms=1",
+            "/events?from=1000&to=5000&by=action",
+            "/events?from=1000&to=5000&latest=1",
+            "/events/count?from=1000&to=5000&by=action",
+            "/events/count?from=1000&to=5000&latest=1",
+            "/events/histogram?from=1000&to=5000&bucket_ms=1000&by=action",
+            "/events/histogram?from=1000&to=5000&bucket_ms=1000&latest=1",
+            "/events/stats?from=1000&to=5000&sum=ts&latest=1",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+            assert!(body.get("error").is_some(), "{uri}");
+            assert!(!body.is_array(), "{uri} {body}");
+        }
+        let (status, dropped) =
+            post_json(&app, "/events/drop?by=action", r#"{"before_ms":1}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+        let (status, dropped) =
+            post_json(&app, "/events/drop?latest=1", r#"{"before_ms":1}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+        let (status, still) = get_json(&app, "/events/count?from=1000&to=5000").await;
+        assert_eq!(status, StatusCode::OK, "{still}");
+        assert_eq!(still["count"], 7);
+
+        let data = root.join("data");
+        let dat = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("dat"))
+            .unwrap();
+        let mut bytes = fs::read(&dat).unwrap();
+        bytes[16] ^= 0xff;
+        fs::write(&dat, &bytes).unwrap();
+        for uri in [
+            "/events/latest?from=1000&to=5000&by=score",
+            "/events/latest?from=1000&to=5000&by=action&limit=1",
+            "/events/latest?from=1000&to=5000&by=action&by=ok",
+            "/events?from=1000&to=5000&by=action",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+            let message = body["error"].as_str().unwrap_or("");
+            assert!(!message.contains("corrupt"), "{uri} read the store: {body}");
+        }
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-latest-cap-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(8192, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        for id in 0..4097i64 {
+            store
+                .append_json(format!(r#"{{"ts":{id},"user_id":{id},"amount":"1.00"}}"#).as_bytes())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let app = router(Arc::clone(&store));
+        let (status, capped) = get_json(&app, "/events/latest?from=0&to=4095&by=user_id").await;
+        assert_eq!(status, StatusCode::OK, "{capped}");
+        assert_eq!(capped.as_array().unwrap().len(), 4096);
+        assert_eq!(capped[0]["user_id"], 0);
+        assert_eq!(capped[4095]["user_id"], 4095);
+        let (status, overflow) = get_json(&app, "/events/latest?from=0&to=4096&by=user_id").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{overflow}");
+        assert!(!overflow.is_array(), "{overflow}");
+        assert!(overflow["error"].as_str().unwrap_or("").contains("4096"));
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+
+
     async fn post(app: &Router, body: &str) -> (StatusCode, Value) {
         post_json(app, "/events", body).await
     }
@@ -3060,6 +3403,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn get_raw(app: &Router, uri: &str) -> Vec<u8> {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
     }
 
     async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
