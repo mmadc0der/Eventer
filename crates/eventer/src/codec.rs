@@ -1955,6 +1955,169 @@ pub(crate) fn read_timestamp_column(schema: &Schema, bytes: &[u8]) -> Result<Vec
     Err(Error::corrupt("timestamp column is missing"))
 }
 
+/// Minimum, maximum, and whether every timestamp sits in `from_ms..=to_ms`.
+///
+/// `None` is an empty block. A constant, a non-wrapping stride, or non-wrapping
+/// stride pieces answer from the encoded endpoints. Every other encoding
+/// expands the column. A null timestamp is the same corrupt error as a row decode.
+pub(crate) struct TimestampSpan {
+    pub min: i64,
+    pub max: i64,
+    pub inside: bool,
+}
+
+pub(crate) fn timestamp_column_span(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Option<TimestampSpan>> {
+    let nrows = block_row_count(bytes)?;
+    if nrows == 0 {
+        return Ok(None);
+    }
+    let mut cursor = 4usize;
+    for (index, field) in schema.fields.iter().enumerate() {
+        if index == schema.timestamp_index {
+            if field.ty != FieldType::Timestamp {
+                return Err(Error::corrupt("timestamp column has the wrong type"));
+            }
+            let flags = *bytes
+                .get(cursor)
+                .ok_or_else(|| Error::corrupt("truncated null flag"))?;
+            if flags != 0 {
+                let timestamps = read_timestamp_column(schema, bytes)?;
+                return Ok(Some(span_from_timestamps(&timestamps, from_ms, to_ms)?));
+            }
+            cursor += 1;
+            let span = i64_encoded_span(bytes, &mut cursor, nrows)?;
+            return Ok(Some(TimestampSpan {
+                inside: span.min >= from_ms && span.max <= to_ms,
+                min: span.min,
+                max: span.max,
+            }));
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Err(Error::corrupt("timestamp column is missing"))
+}
+
+struct I64Span {
+    min: i64,
+    max: i64,
+}
+
+fn span_from_timestamps(timestamps: &[i64], from_ms: i64, to_ms: i64) -> Result<TimestampSpan> {
+    let (min, max) = i64_minmax(timestamps)
+        .ok_or_else(|| Error::corrupt("timestamp column is missing a row"))?;
+    Ok(TimestampSpan {
+        inside: min >= from_ms && max <= to_ms,
+        min,
+        max,
+    })
+}
+
+fn i64_minmax(values: &[i64]) -> Option<(i64, i64)> {
+    let mut iter = values.iter().copied();
+    let first = iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for value in iter {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    Some((min, max))
+}
+
+/// Extremes of an i64 column body. A wrapping stride expands, so the result
+/// matches [`decode_i64s`].
+fn i64_encoded_span(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<I64Span> {
+    if count == 0 {
+        expect_kind(bytes, cursor, KIND_EMPTY)?;
+        return Err(Error::corrupt("timestamp column is missing a row"));
+    }
+    let kind = read_u8(bytes, cursor)?;
+    if kind == KIND_CONSTANT {
+        let base = read_i64(bytes, cursor)?;
+        return Ok(I64Span {
+            min: base,
+            max: base,
+        });
+    }
+    if kind == KIND_STRIDE {
+        let base = read_i64(bytes, cursor)?;
+        let stride = read_i64(bytes, cursor)?;
+        if let Some(span) = stride_span(base, stride, count) {
+            return Ok(span);
+        }
+        let values = materialize_wrapping_stride(base, stride, count);
+        return span_from_values(&values);
+    }
+    if kind == KIND_PIECES {
+        let pieces = read_stride_pieces(bytes, cursor, count, 8)?;
+        if let Some(span) = piece_span(&pieces, count) {
+            return Ok(span);
+        }
+        return span_from_values(&materialize_i64_pieces(&pieces, count));
+    }
+    *cursor -= 1;
+    let values = decode_i64s(bytes, cursor, count)?;
+    span_from_values(&values)
+}
+
+fn span_from_values(values: &[i64]) -> Result<I64Span> {
+    let (min, max) =
+        i64_minmax(values).ok_or_else(|| Error::corrupt("timestamp column is missing a row"))?;
+    Ok(I64Span { min, max })
+}
+
+fn stride_span(base: i64, stride: i64, count: usize) -> Option<I64Span> {
+    if count == 0 {
+        return None;
+    }
+    if count == 1 {
+        return Some(I64Span {
+            min: base,
+            max: base,
+        });
+    }
+    let offset = (count as i64 - 1).checked_mul(stride)?;
+    let end = base.checked_add(offset)?;
+    Some(I64Span {
+        min: base.min(end),
+        max: base.max(end),
+    })
+}
+
+fn piece_span(pieces: &[StridePiece], count: usize) -> Option<I64Span> {
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for (index, piece) in pieces.iter().enumerate() {
+        let end = pieces
+            .get(index + 1)
+            .map(|next| next.start as usize)
+            .unwrap_or(count);
+        let len = end - piece.start as usize;
+        let base = i64::try_from(piece.base).ok()?;
+        let stride = i64::try_from(piece.stride).ok()?;
+        let span = stride_span(base, stride, len)?;
+        min = min.min(span.min);
+        max = max.max(span.max);
+    }
+    if min > max {
+        return None;
+    }
+    Some(I64Span { min, max })
+}
+
+fn materialize_wrapping_stride(base: i64, stride: i64, count: usize) -> Vec<i64> {
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        out.push(base.wrapping_add((index as i64).wrapping_mul(stride)));
+    }
+    out
+}
+
 /// [`read_timestamp_column`] for a sliced payload that left holes.
 ///
 /// A false `included` column has no bytes. The timestamp itself has to be set.

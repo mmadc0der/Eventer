@@ -10,8 +10,11 @@
 //! so a filtered query can skip the payload as well. Equality predicates and
 //! numeric ranges that still need the block are applied while it is decoded.
 //! An integer, decimal, or float zone whose min/max cannot overlap the range is
-//! not read. A float equality still reads a block whose range contains the
-//! value. JSON and a float column stored as the old unknown tag stay unpruned.
+//! not read. When those bounds sit inside every range and the null flag is
+//! clear, [`Store::count_with_filter`](store::Store::count_with_filter) counts
+//! the block from its timestamps and does not decode the proved column. A
+//! float equality still reads a block whose range contains the value. JSON and
+//! a float column stored as the old unknown tag stay unpruned.
 //! [`Store::count_with_filter`](store::Store::count_with_filter) counts those
 //! rows without building the JSON array. A block with no predicates reads
 //! timestamps only. Each column is its own zstd frame when that container is
@@ -26,8 +29,13 @@
 //! and finds the minimum and maximum of numeric columns over that same filtered
 //! window, without building the rows. One float sum with no minimum, maximum,
 //! or row predicate adds a fully contained block from the encoded column.
+//! `min` and `max` with no `sum` and no row predicate take int, decimal, and
+//! float extremes from the zone when every payload timestamp in the block is
+//! inside the range.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
+//! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
+//! row for each value of one column, in that same key order.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares
