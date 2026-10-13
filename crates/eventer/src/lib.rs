@@ -21,7 +21,9 @@
 //! the same rows with only the requested fields. A column that is neither
 //! selected nor needed by a filter stays compressed.
 //! [`Store::histogram_with_filter`](store::Store::histogram_with_filter) counts
-//! the same rows into fixed epoch-aligned time buckets.
+//! the same rows into fixed epoch-aligned time buckets. A constant or positive
+//! non-wrapping timestamp stride with no nulls, and with both endpoints inside
+//! the range, fills those buckets from the column header.
 //! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums
 //! and finds the minimum and maximum of numeric columns over that same filtered
 //! window, without building the rows.
