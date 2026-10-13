@@ -27,6 +27,9 @@
 //! window, without building the rows.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
+//! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns
+//! one exact rank of a numeric column over that same window. Nulls are left
+//! out of the sample. The encoder and the on-disk files are unchanged.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares
@@ -49,8 +52,9 @@ mod zone;
 pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
 pub use store::{
-    CmpOp, ColumnStats, HistogramBucket, Predicate, RewriteReport, StatGroup, StatRequest, StatSum,
-    Stats, Store, StoreOptions, StoredBytes, MAX_HISTOGRAM_BUCKETS,
+    parse_quantile_p, CmpOp, ColumnStats, HistogramBucket, Predicate, QuantileP, RewriteReport,
+    StatGroup, StatRequest, StatSum, Stats, Store, StoreOptions, StoredBytes,
+    MAX_HISTOGRAM_BUCKETS,
 };
 pub use value::format_decimal;
 pub use value::{scalar_from_literal, Scalar};

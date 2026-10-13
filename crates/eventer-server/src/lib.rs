@@ -17,6 +17,9 @@
 //! `GET /events/stats` returns `sum`, `min`, and `max` for numeric columns over
 //! that same range and the same filters, without the matching rows. `by=field`
 //! splits that result into one group per value of a single column.
+//! `GET /events/quantile?field=&p=` returns one exact rank of a numeric column
+//! over that same range and the same filters. The body is that value, or JSON
+//! `null` when no non-null value matches.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
 //! with the caller's `before_ms`. The request `Content-Type` must be
 //! `application/json`, with an optional `charset=utf-8`. A block is removed
@@ -47,6 +50,7 @@ pub fn router(store: Arc<eventer::Store>) -> Router {
         .route("/events/count", get(count_events))
         .route("/events/histogram", get(histogram_events))
         .route("/events/stats", get(stats_events))
+        .route("/events/quantile", get(quantile_events))
         .route("/events", get(get_events).post(post_event))
         .route("/events/drop", post(post_drop))
         .with_state(AppState { store })
@@ -113,6 +117,9 @@ async fn post_drop(
     body: Bytes,
 ) -> Response {
     if let Err(response) = reject_select(raw.as_deref().unwrap_or(""), "/events/drop") {
+        return *response;
+    }
+    if let Err(response) = reject_quantile_param(raw.as_deref().unwrap_or(""), "/events/drop") {
         return *response;
     }
     if let Err(response) = require_json_content_type(headers.get(CONTENT_TYPE)) {
@@ -210,6 +217,9 @@ async fn get_events(
         Err(response) => return *response,
     };
     let raw_query = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_quantile_param(raw_query, "/events") {
+        return *response;
+    }
     let (offset, limit) = match page_params(raw_query) {
         Ok(page) => page,
         Err(response) => return *response,
@@ -410,9 +420,174 @@ async fn stats_events(
     }
 }
 
+async fn quantile_events(
+    State(state): State<AppState>,
+    Query(params): Query<RangeParams>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let raw = raw.as_deref().unwrap_or("");
+    let (field, level) = match quantile_params(raw) {
+        Ok(parsed) => parsed,
+        Err(response) => return *response,
+    };
+    if let Err(response) = reject_quantile_field(state.store.schema(), &field) {
+        return *response;
+    }
+    let from = match parse_bound(params.from, "from") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let to = match parse_bound(params.to, "to") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let predicates = match parse_filters(state.store.schema(), raw) {
+        Ok(predicates) => predicates,
+        Err(response) => return *response,
+    };
+    let store = Arc::clone(&state.store);
+    let field_name = field.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        store.quantile_with_filter(from, to, &predicates, &field_name, level)
+    })
+    .await;
+    match joined {
+        Ok(Ok(value)) => {
+            let body = quantile_body(state.store.schema(), &field, value.as_ref());
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Ok(Err(err)) => error_response(&err),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "quantile task failed"})),
+        )
+            .into_response(),
+    }
+}
+
 enum StatsOutcome {
     Columns(Vec<eventer::ColumnStats>),
     Groups(Vec<eventer::StatGroup>),
+}
+
+fn quantile_params(
+    query: &str,
+) -> std::result::Result<(String, eventer::QuantileP), Box<Response>> {
+    let mut field = None;
+    let mut level = None;
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, value) = match pair.split_once('=') {
+                Some(pair) => pair,
+                None => {
+                    let key = percent_decode(pair, "query")?;
+                    if key == "field" {
+                        return Err(bad_request("`field` is missing a field name"));
+                    }
+                    if key == "p" {
+                        return Err(bad_request("`p` must be a decimal in 0..=1"));
+                    }
+                    if !quantile_query_key(&key) {
+                        return Err(bad_request(&format!(
+                            "`{key}` is not a parameter of /events/quantile"
+                        )));
+                    }
+                    continue;
+                }
+            };
+            let key = percent_decode(key, "query")?;
+            match key.as_str() {
+                "field" => {
+                    if field.is_some() {
+                        return Err(bad_request("`field` was given more than once"));
+                    }
+                    let name = percent_decode(value, "field")?;
+                    if name.is_empty() {
+                        return Err(bad_request("`field` is missing a field name"));
+                    }
+                    field = Some(name);
+                }
+                "p" => {
+                    if level.is_some() {
+                        return Err(bad_request("`p` was given more than once"));
+                    }
+                    let text = percent_decode(value, "p")?;
+                    level = Some(
+                        eventer::parse_quantile_p(&text)
+                            .map_err(|_| bad_request("`p` must be a decimal in 0..=1"))?,
+                    );
+                }
+                "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" => {}
+                _ => {
+                    return Err(bad_request(&format!(
+                        "`{key}` is not a parameter of /events/quantile"
+                    )));
+                }
+            }
+        }
+    }
+    let field = field.ok_or_else(|| bad_request("missing `field` query parameter"))?;
+    let level = level.ok_or_else(|| bad_request("missing `p` query parameter"))?;
+    Ok((field, level))
+}
+
+fn quantile_query_key(key: &str) -> bool {
+    matches!(
+        key,
+        "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" | "field" | "p"
+    )
+}
+
+fn reject_quantile_field(
+    schema: &eventer::Schema,
+    name: &str,
+) -> std::result::Result<(), Box<Response>> {
+    if name.is_empty() {
+        return Err(bad_request("`field` is missing a field name"));
+    }
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(bad_request(&format!("unknown field `{name}`")));
+    };
+    if matches!(
+        field.ty,
+        eventer::FieldType::Bool
+            | eventer::FieldType::String
+            | eventer::FieldType::Text
+            | eventer::FieldType::Json
+    ) {
+        return Err(bad_request(&format!(
+            "quantile does not apply to {} column `{name}`",
+            field.ty.name()
+        )));
+    }
+    Ok(())
+}
+
+fn quantile_body(schema: &eventer::Schema, field: &str, value: Option<&eventer::Scalar>) -> Value {
+    let Some(value) = value else {
+        return Value::Null;
+    };
+    let Some(column) = schema
+        .fields
+        .iter()
+        .find(|candidate| candidate.name == field)
+    else {
+        return Value::Null;
+    };
+    match (column.ty, value) {
+        (eventer::FieldType::Int, eventer::Scalar::Int(number)) => json!(number),
+        (eventer::FieldType::Timestamp, eventer::Scalar::Timestamp(number)) => json!(number),
+        (eventer::FieldType::Float, eventer::Scalar::Float(number)) => {
+            Value::Number(Number::from_f64(*number).expect("quantile float is finite"))
+        }
+        (eventer::FieldType::Decimal { scale }, eventer::Scalar::Decimal(number)) => {
+            Value::String(eventer::format_decimal(*number, scale))
+        }
+        _ => Value::Null,
+    }
 }
 
 fn reject_stats_params(query: &str) -> std::result::Result<(), Box<Response>> {
@@ -425,7 +600,12 @@ fn reject_stats_params(query: &str) -> std::result::Result<(), Box<Response>> {
         }
         let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
         let key = percent_decode(key, "query")?;
-        if key == "limit" || key == "offset" || key == "bucket_ms" || key == "select" {
+        if key == "limit"
+            || key == "offset"
+            || key == "bucket_ms"
+            || key == "select"
+            || key == "quantile"
+        {
             return Err(bad_request(&format!(
                 "`{key}` is not a parameter of /events/stats"
             )));
@@ -752,9 +932,28 @@ fn reject_page_params(query: &str, route: &str) -> std::result::Result<(), Box<R
         }
         let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
         let key = percent_decode(key, "query")?;
-        if key == "limit" || key == "offset" || key == "select" {
+        if key == "limit" || key == "offset" || key == "select" || key == "quantile" {
             return Err(bad_request(&format!(
                 "`{key}` is not a parameter of {route}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_quantile_param(query: &str, route: &str) -> std::result::Result<(), Box<Response>> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = percent_decode(key, "query")?;
+        if key == "quantile" {
+            return Err(bad_request(&format!(
+                "`quantile` is not a parameter of {route}"
             )));
         }
     }
@@ -2660,6 +2859,160 @@ mod tests {
         assert!(
             !count["error"].as_str().unwrap_or("").contains("corrupt"),
             "select on count read the store: {count}"
+        );
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn quantile_returns_one_exact_rank() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-quantile-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "text"},
+                    {"name": "amount", "type": "decimal", "scale": 2},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(8, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        for row in [
+            r#"{"ts":1000,"user_id":1,"score":5.0,"ok":true,"action":"buy","amount":"1.50","props":{"a":1}}"#,
+            r#"{"ts":2000,"user_id":5,"score":0.0,"ok":true,"action":"buy","amount":"9.00"}"#,
+            r#"{"ts":2500,"user_id":4,"ok":false,"action":"other","note":"x","amount":"4.00","props":{}}"#,
+            r#"{"ts":3000,"user_id":9,"score":6.0,"ok":true,"action":"view","amount":"2.25","props":{"a":2}}"#,
+        ] {
+            let (status, body) = post(&app, row).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let (status, listed) = get_json(&app, "/events?from=1000&to=1000").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let (status, rank) =
+            get_json(&app, "/events/quantile?from=1000&to=1000&field=score&p=1").await;
+        assert_eq!(status, StatusCode::OK, "{rank}");
+        assert_eq!(rank, listed[0]["score"]);
+        let (status, amount) =
+            get_json(&app, "/events/quantile?from=1000&to=1000&field=amount&p=0").await;
+        assert_eq!(status, StatusCode::OK, "{amount}");
+        assert_eq!(amount, listed[0]["amount"]);
+        let (status, ts) = get_json(&app, "/events/quantile?from=1000&to=2000&field=ts&p=1").await;
+        assert_eq!(status, StatusCode::OK, "{ts}");
+        assert_eq!(ts, json!(2000));
+        let (status, user) =
+            get_json(&app, "/events/quantile?from=1000&to=3000&field=user_id&p=0").await;
+        assert_eq!(status, StatusCode::OK, "{user}");
+        assert_eq!(user, json!(1));
+
+        let (status, low) =
+            get_json(&app, "/events/quantile?from=1000&to=3000&field=score&p=0").await;
+        assert_eq!(status, StatusCode::OK, "{low}");
+        assert_eq!(low, json!(0.0));
+        let (status, mid) =
+            get_json(&app, "/events/quantile?from=1000&to=3000&field=score&p=0.5").await;
+        assert_eq!(status, StatusCode::OK, "{mid}");
+        assert_eq!(mid, json!(5.0));
+        let (status, high) =
+            get_json(&app, "/events/quantile?from=1000&to=3000&field=score&p=1").await;
+        assert_eq!(status, StatusCode::OK, "{high}");
+        assert_eq!(high, json!(6.0));
+        let (status, only_null) =
+            get_json(&app, "/events/quantile?from=2500&to=2500&field=score&p=1").await;
+        assert_eq!(status, StatusCode::OK, "{only_null}");
+        assert_eq!(only_null, Value::Null);
+        let (status, empty) =
+            get_json(&app, "/events/quantile?from=9000&to=9000&field=score&p=0.5").await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert_eq!(empty, Value::Null);
+        let (status, cut) = get_json(
+            &app,
+            "/events/quantile?from=1000&to=3000&field=amount&p=1&lt=amount=3.00",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cut}");
+        assert_eq!(cut, json!("2.25"));
+
+        for uri in [
+            "/events/quantile?from=1000&to=3000&p=0.5",
+            "/events/quantile?from=1000&to=3000&field=score",
+            "/events/quantile?from=1000&to=3000&field=&p=0.5",
+            "/events/quantile?from=1000&to=3000&field=score&p=1.1",
+            "/events/quantile?from=1000&to=3000&field=score&p=-0.1",
+            "/events/quantile?from=1000&to=3000&field=score&p=nope",
+            "/events/quantile?from=1000&to=3000&field=missing&p=0.5",
+            "/events/quantile?from=1000&to=3000&field=ok&p=0.5",
+            "/events/quantile?from=1000&to=3000&field=action&p=0.5",
+            "/events/quantile?from=1000&to=3000&field=note&p=0.5",
+            "/events/quantile?from=1000&to=3000&field=props&p=0.5",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&by=action",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&select=score",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&limit=1",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&offset=0",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&bucket_ms=1",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&sum=score",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&min=score",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&max=score",
+            "/events?from=1000&to=3000&quantile=score",
+            "/events/count?from=1000&to=3000&quantile=1",
+            "/events/histogram?from=1000&to=3000&bucket_ms=1000&quantile=1",
+            "/events/stats?from=1000&to=3000&sum=user_id&quantile=1",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+            assert!(body.get("error").is_some(), "{uri} -> {body}");
+        }
+        let (status, dropped) =
+            post_json(&app, "/events/drop?quantile=1", r#"{"before_ms":1}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+
+        let data = root.join("data");
+        let dat = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("dat"))
+            .unwrap();
+        let mut bytes = fs::read(&dat).unwrap();
+        bytes[16] ^= 0xff;
+        fs::write(&dat, &bytes).unwrap();
+        let (status, unread) =
+            get_json(&app, "/events/quantile?from=1000&to=3000&field=ok&p=0.5").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unread}");
+        assert!(
+            !unread["error"].as_str().unwrap_or("").contains("corrupt"),
+            "bad quantile read the store: {unread}"
+        );
+        let (status, missing_p) =
+            get_json(&app, "/events/quantile?from=1000&to=3000&field=score").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{missing_p}");
+        assert!(
+            !missing_p["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("corrupt"),
+            "missing p read the store: {missing_p}"
         );
 
         store.close().unwrap();
