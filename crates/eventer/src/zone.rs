@@ -9,7 +9,14 @@
 //! filter otherwise. A bloom hit can be wrong; a miss is not. Numbers use an
 //! inclusive min/max, which also rejects a range whose lower bound is above the
 //! max or whose upper bound is below the min, including exclusive bounds.
-//! Floats and JSON stay unpruned. The timestamp column is
+//! A float column stores one finite minimum, one finite maximum, and the same
+//! null flag as an integer. A null does not keep a block whose finite values
+//! sit entirely on the wrong side of a bound. Equality still reads a block
+//! whose range contains the value, because a min/max pair does not prove the
+//! value is present. JSON stays unpruned. A non-finite float is not stored by
+//! the parser; a block that nevertheless contains one keeps the unknown tag
+//! and is not skipped. Tag `0` stays unknown, so a zone file written when
+//! floats were that tag still opens. The timestamp column is
 //! not stored again: a new file keeps a one-byte tag, and the reader uses that
 //! block's sparse-index minimum and maximum, with no nulls. Segments written
 //! before zone maps existed are summarized once on open and the summary is kept.
@@ -25,6 +32,7 @@
 //! still loads. A corrupt or truncated frame, or a trailer that does not match,
 //! is rebuilt from payloads, the same path a corrupt raw file already takes.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -76,16 +84,18 @@ const TAG_EXACT: u8 = 5;
 const TAG_BLOOM: u8 = 6;
 /// Timestamp bounds live in the sparse index. The column is this byte and nothing else.
 const TAG_INDEX_TS: u8 = 7;
+/// Finite float minimum and maximum, plus a null flag. Tag `0` remains unknown.
+const TAG_F64: u8 = 8;
 
 /// Statistics for one sealed block, aligned with schema field order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BlockZone {
     pub columns: Vec<ColumnZone>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ColumnZone {
-    /// The block must be read. Used for floats, JSON, and unreadable stats.
+    /// The block must be read. Used for JSON, a non-finite float, and unreadable stats.
     Unknown,
     AllNull,
     I64 {
@@ -97,6 +107,12 @@ pub(crate) enum ColumnZone {
         has_null: bool,
         min: i128,
         max: i128,
+    },
+    /// Finite float bounds. A value inside the range may still be absent.
+    F64 {
+        has_null: bool,
+        min: f64,
+        max: f64,
     },
     Bool {
         has_null: bool,
@@ -179,10 +195,13 @@ pub(crate) fn may_match(zone: &BlockZone, predicates: &[ColumnPredicate]) -> boo
 /// Equality predicates and numeric ranges. A false result means the payload
 /// cannot contain a matching row.
 ///
-/// An `i64` or `i128` zone whose max is below a lower bound, or whose min is
-/// above an upper bound, does not match. Exclusive bounds use `<=` and `>=`.
-/// [`ColumnZone::Unknown`] (float and JSON) is not a skip. [`ColumnZone::AllNull`]
-/// fails every range, because nulls do not match one. A missing column is null.
+/// An `i64`, `i128`, or finite float zone whose max is below a lower bound, or
+/// whose min is above an upper bound, does not match. Exclusive bounds use
+/// `<=` and `>=`. A null in the block does not keep it when every finite value
+/// is on the wrong side of the bound. [`ColumnZone::Unknown`] (JSON, a
+/// non-finite float, and a float column stored as tag `0`) is not a skip.
+/// [`ColumnZone::AllNull`] fails every range, because nulls do not match one.
+/// A missing column is null.
 pub(crate) fn may_match_ranges(
     zone: &BlockZone,
     predicates: &[ColumnPredicate],
@@ -302,7 +321,35 @@ fn column_from_rows(ty: FieldType, rows: &[Row], index: usize) -> ColumnZone {
         FieldType::Decimal { .. } => i128_zone(rows, index),
         FieldType::Bool => bool_zone(rows, index),
         FieldType::String | FieldType::Text => string_zone(rows, index),
-        FieldType::Float | FieldType::Json => ColumnZone::Unknown,
+        FieldType::Float => f64_zone(rows, index),
+        FieldType::Json => ColumnZone::Unknown,
+    }
+}
+
+fn f64_zone(rows: &[Row], index: usize) -> ColumnZone {
+    let mut has_null = false;
+    let mut min = 0.0f64;
+    let mut max = 0.0f64;
+    let mut any = false;
+    for row in rows {
+        match row.values.get(index) {
+            Some(Scalar::Null) => has_null = true,
+            Some(Scalar::Float(value)) if value.is_finite() => {
+                if !any || *value < min {
+                    min = *value;
+                }
+                if !any || *value > max {
+                    max = *value;
+                }
+                any = true;
+            }
+            _ => return ColumnZone::Unknown,
+        }
+    }
+    if !any {
+        ColumnZone::AllNull
+    } else {
+        ColumnZone::F64 { has_null, min, max }
     }
 }
 
@@ -434,6 +481,11 @@ impl ColumnZone {
                 Scalar::Decimal(value) => *value >= *min && *value <= *max,
                 _ => true,
             },
+            ColumnZone::F64 { has_null, min, max } => match value {
+                Scalar::Null => *has_null,
+                Scalar::Float(value) => float_in_closed_range(*value, *min, *max),
+                _ => true,
+            },
             ColumnZone::Bool {
                 has_null,
                 has_false,
@@ -467,10 +519,19 @@ impl ColumnZone {
             ColumnZone::Unknown => true,
             ColumnZone::AllNull => false,
             ColumnZone::I64 { min, max, .. } | ColumnZone::IndexTs { min, max } => {
-                ordered_range_overlaps(*min, *max, range, bound_i64)
+                ordered_range_overlaps(*min, *max, range, bound_i64, |left, right| {
+                    Some(left.cmp(&right))
+                })
             }
             ColumnZone::I128 { min, max, .. } => {
-                ordered_range_overlaps(*min, *max, range, bound_i128)
+                ordered_range_overlaps(*min, *max, range, bound_i128, |left, right| {
+                    Some(left.cmp(&right))
+                })
+            }
+            ColumnZone::F64 { min, max, .. } => {
+                ordered_range_overlaps(*min, *max, range, bound_f64, |left, right| {
+                    left.partial_cmp(&right)
+                })
             }
             ColumnZone::Bool { .. } | ColumnZone::Exact { .. } | ColumnZone::Bloom { .. } => true,
         }
@@ -491,21 +552,44 @@ fn bound_i128(value: &Scalar) -> Option<i128> {
     }
 }
 
-fn ordered_range_overlaps<T: Ord + Copy>(
+fn bound_f64(value: &Scalar) -> Option<f64> {
+    match value {
+        Scalar::Float(value) if value.is_finite() => Some(*value),
+        _ => None,
+    }
+}
+
+/// True when `value` is finite and inside `[min, max]`.
+///
+/// A non-finite value, or non-finite bounds, is not a skip. A value strictly
+/// inside the range still matches: the bounds do not prove it is present.
+fn float_in_closed_range(value: f64, min: f64, max: f64) -> bool {
+    match value.partial_cmp(&min) {
+        Some(Ordering::Less) => false,
+        Some(_) => !matches!(value.partial_cmp(&max), Some(Ordering::Greater)),
+        None => true,
+    }
+}
+
+fn ordered_range_overlaps<T: Copy>(
     min: T,
     max: T,
     range: &RangeFilter,
     bound: impl Fn(&Scalar) -> Option<T>,
+    cmp: impl Fn(T, T) -> Option<Ordering>,
 ) -> bool {
     if let Some(lower) = &range.lower {
         let Some(cutoff) = bound(&lower.value) else {
             return true;
         };
+        let Some(order) = cmp(max, cutoff) else {
+            return true;
+        };
         if lower.inclusive {
-            if max < cutoff {
+            if order == Ordering::Less {
                 return false;
             }
-        } else if max <= cutoff {
+        } else if order != Ordering::Greater {
             return false;
         }
     }
@@ -513,11 +597,14 @@ fn ordered_range_overlaps<T: Ord + Copy>(
         let Some(cutoff) = bound(&upper.value) else {
             return true;
         };
+        let Some(order) = cmp(min, cutoff) else {
+            return true;
+        };
         if upper.inclusive {
-            if min > cutoff {
+            if order == Ordering::Greater {
                 return false;
             }
-        } else if min >= cutoff {
+        } else if order != Ordering::Less {
             return false;
         }
     }
@@ -912,6 +999,12 @@ fn encode_column(out: &mut Vec<u8>, column: &ColumnZone) {
             out.extend_from_slice(&min.to_le_bytes());
             out.extend_from_slice(&max.to_le_bytes());
         }
+        ColumnZone::F64 { has_null, min, max } => {
+            out.push(TAG_F64);
+            out.push(u8::from(*has_null));
+            out.extend_from_slice(&min.to_le_bytes());
+            out.extend_from_slice(&max.to_le_bytes());
+        }
         ColumnZone::Bool {
             has_null,
             has_false,
@@ -982,6 +1075,13 @@ fn decode_column(bytes: &mut &[u8], min_ts: i64, max_ts: i64) -> Result<ColumnZo
             let (max, rest) = take_i128(rest)?;
             *bytes = rest;
             Ok(ColumnZone::I128 { has_null, min, max })
+        }
+        TAG_F64 => {
+            let (has_null, rest) = take_bool(bytes)?;
+            let (min, rest) = take_f64(rest)?;
+            let (max, rest) = take_f64(rest)?;
+            *bytes = rest;
+            Ok(ColumnZone::F64 { has_null, min, max })
         }
         TAG_BOOL => {
             let bits = *bytes
@@ -1073,6 +1173,38 @@ fn take_i128(bytes: &[u8]) -> Result<(i128, &[u8])> {
     }
     let value = i128::from_le_bytes(bytes[0..16].try_into().unwrap());
     Ok((value, &bytes[16..]))
+}
+
+fn take_f64(bytes: &[u8]) -> Result<(f64, &[u8])> {
+    if bytes.len() < 8 {
+        return Err(Error::corrupt("truncated f64 zone"));
+    }
+    let value = f64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    Ok((value, &bytes[8..]))
+}
+
+/// Rewrite every float zone as tag `0` and store the file again.
+///
+/// A zone written before float bounds existed used that tag. Callers reopen
+/// the segment to prove the old column is not a skip.
+#[cfg(test)]
+pub(crate) fn rewrite_float_zones_unknown(
+    path: &Path,
+    schema_crc: u32,
+    field_count: u16,
+    bounds: &[(i64, i64)],
+) -> Result<()> {
+    let Some(mut zones) = read_zone_file(path, schema_crc, field_count, bounds)? else {
+        return Err(Error::corrupt("zone file is missing"));
+    };
+    for zone in &mut zones {
+        for column in &mut zone.columns {
+            if matches!(column, ColumnZone::F64 { .. }) {
+                *column = ColumnZone::Unknown;
+            }
+        }
+    }
+    write_zone_file(path, schema_crc, field_count, &zones)
 }
 
 fn indexes(bytes: &[u8], k: u8) -> impl Iterator<Item = u64> {
@@ -1238,8 +1370,12 @@ mod tests {
         ));
         assert!(may_match(
             &zone,
-            &[pred(&schema, "score", Scalar::Float(99.0))]
+            &[pred(&schema, "score", Scalar::Float(1.5))]
         ));
+        assert!(
+            !may_match(&zone, &[pred(&schema, "score", Scalar::Float(99.0))]),
+            "a float outside the stored range cannot be present"
+        );
         let user = schema
             .fields
             .iter()
@@ -1274,10 +1410,18 @@ mod tests {
             &[],
             &[above(amount, Scalar::Decimal(900))]
         ));
-        assert!(may_match_ranges(
+        assert!(!may_match_ranges(
             &zone,
             &[],
             &[above(score, Scalar::Float(100.0))]
+        ));
+        assert!(matches!(
+            zone.columns[score],
+            ColumnZone::F64 {
+                has_null: false,
+                min,
+                max,
+            } if min.to_bits() == 1.5f64.to_bits() && max.to_bits() == 1.5f64.to_bits()
         ));
         assert!(matches!(
             zone.columns[0],
@@ -1498,7 +1642,13 @@ mod tests {
         );
         let loaded = parse_zone_file(&raw, crc, fields, &bounds_of(&[zone.clone()])).unwrap();
         assert_eq!(loaded, vec![zone.clone()]);
-        assert!(matches!(loaded[0].columns[6], ColumnZone::Unknown));
+        assert!(matches!(
+            loaded[0].columns[6],
+            ColumnZone::F64 {
+                has_null: false,
+                ..
+            }
+        ));
 
         let mut flipped = raw.clone();
         let last = flipped.len() - 1;
@@ -1715,5 +1865,142 @@ mod tests {
         let encoded = encode_zone(&both);
         assert_eq!(encoded[0], TAG_INDEX_TS);
         assert_eq!(encoded[1], TAG_I64);
+    }
+
+    #[test]
+    fn float_range_skips_only_when_finite_bounds_cannot_overlap() {
+        let schema = schema();
+        let rows = vec![
+            row(
+                &schema,
+                r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":0.0}"#,
+            ),
+            row(
+                &schema,
+                r#"{"ts":20,"user_id":2,"ok":false,"action":"view","note":null,"amount":"2.50","score":9.9}"#,
+            ),
+            row(
+                &schema,
+                r#"{"ts":30,"user_id":3,"ok":true,"action":"buy","note":"c","amount":"3.00","score":null}"#,
+            ),
+        ];
+        let zone = from_rows(&schema, &rows);
+        let score = schema
+            .fields
+            .iter()
+            .position(|field| field.name == "score")
+            .unwrap();
+        assert!(matches!(
+            zone.columns[score],
+            ColumnZone::F64 {
+                has_null: true,
+                min,
+                max,
+            } if min.to_bits() == 0.0f64.to_bits() && max.to_bits() == 9.9f64.to_bits()
+        ));
+        let range =
+            |lower: Option<(bool, f64)>, upper: Option<(bool, f64)>| crate::codec::RangeFilter {
+                index: score,
+                lower: lower.map(|(inclusive, value)| crate::codec::RangeEnd {
+                    inclusive,
+                    value: Scalar::Float(value),
+                }),
+                upper: upper.map(|(inclusive, value)| crate::codec::RangeEnd {
+                    inclusive,
+                    value: Scalar::Float(value),
+                }),
+            };
+        assert!(!may_match_ranges(
+            &zone,
+            &[],
+            &[range(Some((false, 100.0)), None)]
+        ));
+        assert!(!may_match_ranges(
+            &zone,
+            &[],
+            &[range(Some((false, 9.9)), None)]
+        ));
+        assert!(may_match_ranges(
+            &zone,
+            &[],
+            &[range(Some((true, 9.9)), None)]
+        ));
+        assert!(may_match_ranges(
+            &zone,
+            &[],
+            &[range(Some((true, 0.0)), None)]
+        ));
+        assert!(!may_match_ranges(
+            &zone,
+            &[],
+            &[range(None, Some((false, 0.0)))]
+        ));
+        assert!(may_match_ranges(
+            &zone,
+            &[],
+            &[range(None, Some((true, 0.0)))]
+        ));
+        assert!(
+            may_match(&zone, &[pred(&schema, "score", Scalar::Float(5.0))]),
+            "a value inside the range is not proven absent"
+        );
+        assert!(!may_match(
+            &zone,
+            &[pred(&schema, "score", Scalar::Float(100.0))]
+        ));
+        assert!(may_match(&zone, &[pred(&schema, "score", Scalar::Null)]));
+
+        let mut legacy = zone.clone();
+        legacy.columns[score] = ColumnZone::Unknown;
+        let encoded = encode_zone(&legacy);
+        assert_eq!(*encoded.last().unwrap(), TAG_UNKNOWN);
+        let (min_ts, max_ts) = index_bounds(&legacy);
+        let decoded = decode_zone(&encoded, schema.fields.len() as u16, min_ts, max_ts).unwrap();
+        assert!(matches!(decoded.columns[score], ColumnZone::Unknown));
+        assert!(may_match_ranges(
+            &decoded,
+            &[],
+            &[range(Some((false, 100.0)), None)]
+        ));
+
+        let mut non_finite = rows[0].clone();
+        non_finite.values[score] = Scalar::Float(f64::NAN);
+        let unknown = from_rows(&schema, &[non_finite]);
+        assert!(matches!(unknown.columns[score], ColumnZone::Unknown));
+        assert!(may_match_ranges(
+            &unknown,
+            &[],
+            &[range(Some((false, 100.0)), None)]
+        ));
+
+        let nulls = from_rows(
+            &schema,
+            &[row(
+                &schema,
+                r#"{"ts":10,"user_id":1,"ok":true,"action":"click","note":"a","amount":"1.00","score":null}"#,
+            )],
+        );
+        assert!(matches!(nulls.columns[score], ColumnZone::AllNull));
+        assert!(!may_match_ranges(
+            &nulls,
+            &[],
+            &[range(Some((true, 0.0)), None)]
+        ));
+
+        let with_json = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let json_zone = from_rows(
+            &with_json,
+            &[row(&with_json, r#"{"ts":10,"props":{"n":1}}"#)],
+        );
+        assert!(matches!(json_zone.columns[1], ColumnZone::Unknown));
     }
 }

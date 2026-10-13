@@ -9,8 +9,9 @@
 //! equality stats (exact sets or a bloom filter for strings, min/max for numbers)
 //! so a filtered query can skip the payload as well. Equality predicates and
 //! numeric ranges that still need the block are applied while it is decoded.
-//! An integer or decimal zone whose min/max cannot overlap the range is not read.
-//! Float zones stay unknown and are filtered from the decoded values.
+//! An integer, decimal, or float zone whose min/max cannot overlap the range is
+//! not read. A float equality still reads a block whose range contains the
+//! value. JSON and a float column stored as the old unknown tag stay unpruned.
 //! [`Store::count_with_filter`](store::Store::count_with_filter) counts those
 //! rows without building the JSON array. A block with no predicates reads
 //! timestamps only. Each column is its own zstd frame when that container is
