@@ -832,6 +832,11 @@ pub(crate) fn try_add_dense_float(
     let mut cursor = 4usize;
     for (index, field) in schema.fields.iter().enumerate() {
         if index == column {
+            // A column appended after this block was written is all nulls.
+            // Summing it would set `contributed`; the row visitor must apply them.
+            if column_was_not_stored(bytes, cursor) {
+                return Ok(None);
+            }
             let added = add_dense_f64_values(bytes, &mut cursor, nrows, total)?;
             return Ok(added.then_some(nrows));
         }
@@ -5538,6 +5543,38 @@ mod tests {
             None
         );
         assert_eq!(null_sum.to_bits(), 4.0f64.to_bits());
+
+        let narrow = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let wide = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "amount", "type": "decimal", "scale": 2},
+                    {"name": "score", "type": "float"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let old = parse_event(&narrow, br#"{"ts":1,"user_id":1,"amount":"1.00"}"#).unwrap();
+        let old_block = encode_block(&narrow, &[old]).unwrap();
+        let mut missing = 7.0;
+        assert_eq!(
+            try_add_dense_float(&wide, &old_block.bytes, 3, 0, 10, &mut missing).unwrap(),
+            None
+        );
+        assert_eq!(missing.to_bits(), 7.0f64.to_bits());
     }
 
     fn float_row(schema: &Schema, ts: i64, score: f64, action: &str) -> Row {
