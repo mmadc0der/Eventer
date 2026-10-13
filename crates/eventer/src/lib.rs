@@ -24,7 +24,8 @@
 //! the same rows into fixed epoch-aligned time buckets.
 //! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums
 //! and finds the minimum and maximum of numeric columns over that same filtered
-//! window, without building the rows.
+//! window, without building the rows. One float sum with no minimum, maximum,
+//! or row predicate adds a fully contained block from the encoded column.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that

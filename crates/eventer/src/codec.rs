@@ -803,6 +803,106 @@ pub(crate) fn visit_matching_timestamps(
     Ok(())
 }
 
+/// Add one float column into `total` when every payload timestamp is inside
+/// `from_ms..=to_ms` and the column stores no nulls.
+///
+/// The sum is sequential IEEE-754 addition of a constant, a raw f64 frame, or a
+/// repeated decimal stride, in row order, continuing from the value already in
+/// `total`. `Ok(Some(rows))` means those rows were added and the other columns
+/// were not visited. `Ok(None)` leaves `total` unchanged: a timestamp falls
+/// outside the range, the column has a null or was not stored, a value is not
+/// finite, or the encoding is not one of those three. The caller keeps the row
+/// visitor for that block. The sparse index is not the containment check.
+pub(crate) fn try_add_dense_float(
+    schema: &Schema,
+    bytes: &[u8],
+    column: usize,
+    from_ms: i64,
+    to_ms: i64,
+    total: &mut f64,
+) -> Result<Option<usize>> {
+    if schema.fields.get(column).map(|field| field.ty) != Some(FieldType::Float) {
+        return Ok(None);
+    }
+    let timestamps = read_timestamp_column(schema, bytes)?;
+    if timestamps.iter().any(|ts| *ts < from_ms || *ts > to_ms) {
+        return Ok(None);
+    }
+    let nrows = timestamps.len();
+    let mut cursor = 4usize;
+    for (index, field) in schema.fields.iter().enumerate() {
+        if index == column {
+            let added = add_dense_f64_values(bytes, &mut cursor, nrows, total)?;
+            return Ok(added.then_some(nrows));
+        }
+        if column_was_not_stored(bytes, cursor) {
+            return Ok(None);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Ok(None)
+}
+
+/// `true` when `count` finite values were added. `false` when this column is
+/// not a dense constant, raw frame, or repeated stride.
+fn add_dense_f64_values(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    total: &mut f64,
+) -> Result<bool> {
+    let flags = *bytes
+        .get(*cursor)
+        .ok_or_else(|| Error::corrupt("truncated null flag"))?;
+    if flags != 0 {
+        return Ok(false);
+    }
+    *cursor += 1;
+    if count == 0 {
+        expect_kind(bytes, cursor, KIND_FLOAT_EMPTY)?;
+        return Ok(true);
+    }
+    let kind = read_u8(bytes, cursor)?;
+    let mut local = *total;
+    match kind {
+        KIND_FLOAT_CONSTANT => {
+            let value = read_f64(bytes, cursor)?;
+            if !value.is_finite() {
+                return Ok(false);
+            }
+            for _ in 0..count {
+                local += value;
+            }
+        }
+        KIND_FLOAT_RAW => {
+            for _ in 0..count {
+                let value = read_f64(bytes, cursor)?;
+                if !value.is_finite() {
+                    return Ok(false);
+                }
+                local += value;
+            }
+        }
+        KIND_FLOAT_REPEATED => {
+            let repeated = read_float_repeated(bytes, cursor, count)?;
+            let scale = pow10(repeated.exp);
+            for index in 0..count {
+                let scaled = repeated
+                    .base
+                    .wrapping_add(((index % repeated.period) as i64).wrapping_mul(repeated.stride));
+                let value = (scaled as f64) / scale;
+                if !value.is_finite() {
+                    return Ok(false);
+                }
+                local += value;
+            }
+        }
+        _ => return Ok(false),
+    }
+    *total = local;
+    Ok(true)
+}
+
 fn encode_column(out: &mut Vec<u8>, ty: FieldType, rows: &[Row], index: usize) -> Result<()> {
     let mut nulls = Vec::with_capacity(rows.len());
     for row in rows {
@@ -5193,6 +5293,99 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not finite"), "{err}");
+        let mut total = 0.0;
+        assert_eq!(
+            try_add_dense_float(&schema, &encoded.bytes, 2, 0, 5000, &mut total).unwrap(),
+            None
+        );
+        assert_eq!(total.to_bits(), 0.0f64.to_bits());
+        let err = visit_matching_timestamps(
+            &schema,
+            &encoded.bytes,
+            0,
+            5000,
+            &[],
+            &[],
+            &mut captured,
+            |_ts, _row, _captured| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not finite"), "{err}");
+    }
+
+    #[test]
+    fn dense_float_sum_adds_in_row_order_and_leaves_a_cut_block() {
+        let schema = schema();
+        let mut rows = Vec::new();
+        for i in 0..300 {
+            let score = (i % 100) as f64 / 10.0;
+            rows.push(float_row(&schema, i as i64, score, "click"));
+        }
+        let encoded = encode_block(&schema, &rows).unwrap();
+        let mut total = 0.0;
+        let added = try_add_dense_float(&schema, &encoded.bytes, 2, 0, 299, &mut total).unwrap();
+        assert_eq!(added, Some(300));
+        let mut expected = 0.0;
+        for i in 0..300 {
+            expected += (i % 100) as f64 / 10.0;
+        }
+        assert_eq!(total.to_bits(), expected.to_bits());
+
+        let mut untouched = 3.5;
+        assert_eq!(
+            try_add_dense_float(&schema, &encoded.bytes, 2, 1, 299, &mut untouched).unwrap(),
+            None
+        );
+        assert_eq!(untouched.to_bits(), 3.5f64.to_bits());
+
+        let mut constant_rows = Vec::new();
+        for i in 0..32 {
+            constant_rows.push(float_row(&schema, i, 1.5, "click"));
+        }
+        let constant = encode_block(&schema, &constant_rows).unwrap();
+        let mut constant_sum = 0.0;
+        assert_eq!(
+            try_add_dense_float(&schema, &constant.bytes, 2, 0, 31, &mut constant_sum).unwrap(),
+            Some(32)
+        );
+        let mut constant_expected = 0.0f64;
+        for _ in 0..32 {
+            constant_expected += 1.5;
+        }
+        assert_eq!(constant_sum.to_bits(), constant_expected.to_bits());
+
+        let mut raw_rows = Vec::new();
+        for (index, score) in [0.1, 0.2, 0.4, 0.8].into_iter().enumerate() {
+            raw_rows.push(float_row(&schema, index as i64, score, "click"));
+        }
+        let raw = encode_block(&schema, &raw_rows).unwrap();
+        let mut raw_sum = 0.0;
+        assert_eq!(
+            try_add_dense_float(&schema, &raw.bytes, 2, 0, 3, &mut raw_sum).unwrap(),
+            Some(4)
+        );
+        assert_eq!(raw_sum.to_bits(), (0.1 + 0.2 + 0.4 + 0.8f64).to_bits());
+
+        let mut with_null = rows[0].clone();
+        with_null.values[2] = Scalar::Null;
+        let nullable = encode_block(&schema, &[with_null, rows[1].clone()]).unwrap();
+        let mut null_sum = 4.0;
+        assert_eq!(
+            try_add_dense_float(&schema, &nullable.bytes, 2, 0, 10, &mut null_sum).unwrap(),
+            None
+        );
+        assert_eq!(null_sum.to_bits(), 4.0f64.to_bits());
+    }
+
+    fn float_row(schema: &Schema, ts: i64, score: f64, action: &str) -> Row {
+        parse_event(
+            schema,
+            format!(
+                r#"{{"ts":{ts},"user_id":1,"score":{score},"ok":true,"action":"{action}","note":"n","amount":"1.00"}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap()
     }
 
     #[test]
