@@ -575,6 +575,125 @@ impl Store {
         Ok(out)
     }
 
+    /// One JSON object per distinct value of `by`: the matching row with the
+    /// greatest timestamp. A tie keeps the later row in ingest order.
+    ///
+    /// `columns` is `None` for every field, or schema indexes. Each object
+    /// contains those fields in schema order. A selected null is JSON `null`.
+    /// A field that is not selected is absent. Filters may name a column that
+    /// is not selected. A sliced block does not decompress a column that is
+    /// neither selected, nor the group key, nor needed by a filter. A
+    /// single-frame block is decoded in full and the omitted values are dropped
+    /// after that.
+    ///
+    /// `by` is one bool, string, text, int, timestamp, or decimal column. An
+    /// empty name, an unknown field, a float, or a json column is an error and
+    /// does not read the store. The array is ordered by that key: null first,
+    /// then numeric order for int, timestamp, and decimal, `false` then `true`
+    /// for bool, and byte order for string and text. A null key is one object.
+    /// No matching row is `[]`.
+    ///
+    /// More than [`MAX_HISTOGRAM_BUCKETS`] distinct keys, or a response that
+    /// would exceed [`MAX_QUERY_BYTES`], returns [`Error::Event`](Error::Event)
+    /// and no array. A block the sparse index places outside the range is not
+    /// read. A block the zone map can reject is not read.
+    pub fn latest_json(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        by: &str,
+        columns: Option<&[usize]>,
+    ) -> Result<Vec<u8>> {
+        let group = resolve_group_field(&self.schema, by)?;
+        let keep = match columns {
+            None => None,
+            Some(indexes) => Some(select_keep(&self.schema, indexes)?),
+        };
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
+            return Ok(b"[]".to_vec());
+        };
+        let load_mask = keep.as_ref().map(|keep| {
+            let mut load = columns_to_load(&self.schema, &resolved, keep);
+            if let Some(slot) = load.get_mut(group.index) {
+                *slot = true;
+            }
+            load
+        });
+        let _retention = self.pipeline.lock_for_read();
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+        let mut winners: BTreeMap<GroupKey, LatestHit> = BTreeMap::new();
+        let mut key_bytes = 0usize;
+        let mut json_bytes = 0usize;
+        let mut dictionaries = HashMap::new();
+        for block in blocks {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+                return Err(Error::event("query response size limit exceeded"));
+            }
+            let loaded = if let Some(mask) = &load_mask {
+                self.read_loaded_block(
+                    &block,
+                    &mut dictionaries,
+                    segment::BlockLoad {
+                        through_column: None,
+                        columns: Some(mask),
+                    },
+                )?
+            } else {
+                segment::LoadedBlock {
+                    bytes: self.load_scan_block(&block, &mut dictionaries, &resolved, true)?,
+                    included: None,
+                }
+            };
+            let payload = &loaded.bytes;
+            let nrows = block_row_count(payload)?;
+            require_header_row_count(block.row_count, nrows)?;
+            let rows = decode_rows_included(
+                &self.schema,
+                payload,
+                from_ms,
+                to_ms,
+                MAX_QUERY_BYTES,
+                &resolved.predicates,
+                &resolved.ranges,
+                loaded.included.as_deref(),
+            )?;
+            for row in rows {
+                if row.ts < from_ms || row.ts > to_ms {
+                    continue;
+                }
+                let json = if let Some(keep) = &keep {
+                    row_to_json_bytes_selected(&self.schema, &row, keep)?
+                } else {
+                    row_to_json_bytes(&self.schema, &row)?
+                };
+                let scalar = row.values.get(group.index).cloned().ok_or_else(|| {
+                    Error::corrupt(format!("field `{}` is missing a row", group.name))
+                })?;
+                let key = group_key_from_scalar(&group, scalar)?;
+                note_latest(
+                    &mut winners,
+                    &mut key_bytes,
+                    &mut json_bytes,
+                    key,
+                    row.ts,
+                    json,
+                )?;
+            }
+        }
+        let mut out = Vec::from(b"[");
+        let mut wrote = false;
+        for hit in winners.values() {
+            if wrote {
+                out.push(b',');
+            }
+            wrote = true;
+            out.extend_from_slice(&hit.json);
+        }
+        out.push(b']');
+        Ok(out)
+    }
+
     /// Inclusive range count. [`Store::count_with_filter`] with no predicates.
     pub fn count(&self, from_ms: i64, to_ms: i64) -> Result<u64> {
         self.count_with_filter(from_ms, to_ms, &[])
@@ -1312,6 +1431,11 @@ impl GroupKey {
     }
 }
 
+struct LatestHit {
+    ts: i64,
+    json: Vec<u8>,
+}
+
 struct RunningStat {
     spec: ResolvedStat,
     exact: i128,
@@ -1600,6 +1724,89 @@ fn group_text_from_row<'a>(
     }
 }
 
+fn group_key_from_scalar(group: &ResolvedGroup, scalar: Scalar) -> Result<GroupKey> {
+    match (group.ty, scalar) {
+        (_, Scalar::Null) => Ok(GroupKey::Null),
+        (FieldType::Bool, Scalar::Bool(value)) => Ok(GroupKey::Bool(value)),
+        (FieldType::Int, Scalar::Int(value)) => Ok(GroupKey::Int(value)),
+        (FieldType::Timestamp, Scalar::Timestamp(value)) => Ok(GroupKey::Timestamp(value)),
+        (FieldType::Decimal { .. }, Scalar::Decimal(value)) => Ok(GroupKey::Decimal(value)),
+        (FieldType::String | FieldType::Text, Scalar::Str(value)) => Ok(GroupKey::Str(value)),
+        _ => Err(Error::corrupt(format!(
+            "field `{}` has a value that does not match its type",
+            group.name
+        ))),
+    }
+}
+
+fn note_latest(
+    winners: &mut BTreeMap<GroupKey, LatestHit>,
+    key_bytes: &mut usize,
+    json_bytes: &mut usize,
+    key: GroupKey,
+    ts: i64,
+    json: Vec<u8>,
+) -> Result<()> {
+    let extra = match &key {
+        GroupKey::Str(text) => text.len(),
+        _ => 0,
+    };
+    if winners.contains_key(&key) {
+        let current = winners
+            .get(&key)
+            .expect("latest key was present in the map");
+        if ts < current.ts {
+            return Ok(());
+        }
+        let next_json = json_bytes
+            .checked_sub(current.json.len())
+            .and_then(|n| n.checked_add(json.len()))
+            .ok_or_else(|| Error::event("query response size overflow"))?;
+        ensure_latest_response(next_json, winners.len())?;
+        *json_bytes = next_json;
+        winners.insert(key, LatestHit { ts, json });
+        return Ok(());
+    }
+    reserve_latest_key(winners.len(), key_bytes, extra)?;
+    let next_json = json_bytes
+        .checked_add(json.len())
+        .ok_or_else(|| Error::event("query response size overflow"))?;
+    ensure_latest_response(next_json, winners.len() + 1)?;
+    *json_bytes = next_json;
+    winners.insert(key, LatestHit { ts, json });
+    Ok(())
+}
+
+fn reserve_latest_key(distinct: usize, key_bytes: &mut usize, extra: usize) -> Result<()> {
+    if distinct >= MAX_HISTOGRAM_BUCKETS {
+        return Err(Error::event("latest would emit more than 4096 keys"));
+    }
+    if extra == 0 {
+        return Ok(());
+    }
+    let room = remaining_query_bytes(*key_bytes)?;
+    if extra > room {
+        return Err(Error::event("query response size limit exceeded"));
+    }
+    *key_bytes += extra;
+    Ok(())
+}
+
+fn ensure_latest_response(json_bytes: usize, groups: usize) -> Result<()> {
+    let len = if groups == 0 {
+        2
+    } else {
+        json_bytes
+            .checked_add(groups - 1)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| Error::event("query response size overflow"))?
+    };
+    if len > MAX_QUERY_BYTES {
+        return Err(Error::event("query response size limit exceeded"));
+    }
+    Ok(())
+}
+
 fn group_key_from_row(
     schema: &Schema,
     group: &ResolvedGroup,
@@ -1619,18 +1826,7 @@ fn group_key_from_row(
             .cloned()
             .ok_or_else(|| Error::corrupt(format!("field `{}` is missing a row", group.name)))?
     };
-    match (group.ty, scalar) {
-        (_, Scalar::Null) => Ok(GroupKey::Null),
-        (FieldType::Bool, Scalar::Bool(value)) => Ok(GroupKey::Bool(value)),
-        (FieldType::Int, Scalar::Int(value)) => Ok(GroupKey::Int(value)),
-        (FieldType::Timestamp, Scalar::Timestamp(value)) => Ok(GroupKey::Timestamp(value)),
-        (FieldType::Decimal { .. }, Scalar::Decimal(value)) => Ok(GroupKey::Decimal(value)),
-        (FieldType::String | FieldType::Text, Scalar::Str(value)) => Ok(GroupKey::Str(value)),
-        _ => Err(Error::corrupt(format!(
-            "field `{}` has a value that does not match its type",
-            group.name
-        ))),
-    }
+    group_key_from_scalar(group, scalar)
 }
 
 fn capture_columns(indexes: impl IntoIterator<Item = usize>) -> Vec<CapturedColumn> {
@@ -7185,6 +7381,267 @@ mod tests {
             matches!(overflow, Err(Error::Event(ref message)) if message.contains("query response size limit exceeded")),
             "{overflow:?}"
         );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn latest_keeps_the_newest_row_and_orders_keys_like_grouped_stats() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        let rows = [
+            (1000i64, Some(1i64), true, "click", Some("b"), "1.00"),
+            (5000, Some(9), true, "click", Some("b"), "9.00"),
+            (4000, Some(3), false, "click", Some("b"), "8.00"),
+            (5000, Some(2), true, "click", Some("Z"), "3.00"),
+            (2000, None, false, "", None, "4.00"),
+            (1500, Some(4), true, "view", Some("a"), "2.00"),
+            (1100, Some(4), false, "view", Some("A"), "7.00"),
+        ];
+        for (ts, user, ok, action, note, amount) in rows {
+            let mut obj = serde_json::json!({
+                "ts": ts,
+                "score": 1.5,
+                "ok": ok,
+                "amount": amount,
+            });
+            if let Some(user) = user {
+                obj["user_id"] = serde_json::json!(user);
+            }
+            if !action.is_empty() {
+                obj["action"] = serde_json::json!(action);
+            }
+            if let Some(note) = note {
+                obj["note"] = serde_json::json!(note);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        let body = store.latest_json(1000, 5000, &[], "action", None).unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let listed = listed.as_array().unwrap();
+        assert_eq!(listed.len(), 3);
+        assert!(listed[0]["action"].is_null());
+        assert_eq!(listed[0]["ts"], 2000);
+        assert!(listed[0]["user_id"].is_null());
+        assert_eq!(listed[0]["amount"], "4.00");
+        assert_eq!(listed[1]["action"], "click");
+        assert_eq!(listed[1]["ts"], 5000);
+        assert_eq!(
+            listed[1]["user_id"], 2,
+            "a timestamp tie keeps the later row"
+        );
+        assert_eq!(listed[1]["note"], "Z");
+        assert_eq!(listed[2]["action"], "view");
+        assert_eq!(
+            listed[2]["ts"], 1500,
+            "a later ingest with an earlier timestamp does not win"
+        );
+        assert_eq!(listed[2]["user_id"], 4);
+
+        let grouped = store
+            .aggregate_grouped(
+                1000,
+                5000,
+                &[],
+                &[stat_req("user_id", true, false, false)],
+                "action",
+            )
+            .unwrap();
+        let group_keys: Vec<_> = grouped.iter().map(|group| group.key.clone()).collect();
+        assert_eq!(
+            group_keys,
+            vec![
+                Scalar::Null,
+                Scalar::Str("click".into()),
+                Scalar::Str("view".into()),
+            ]
+        );
+
+        let one = store.query_json(5000, 5000).unwrap();
+        let one: serde_json::Value = serde_json::from_slice(&one).unwrap();
+        let tied = one
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["user_id"] == 2)
+            .unwrap();
+        assert_eq!(&listed[1], tied);
+
+        let projected = store
+            .latest_json(
+                1000,
+                5000,
+                &[Predicate::Eq("note".into(), Scalar::Str("b".into()))],
+                "user_id",
+                Some(&[4, 0]),
+            )
+            .unwrap();
+        assert_eq!(
+            projected,
+            br#"[{"ts":1000,"action":"click"},{"ts":4000,"action":"click"},{"ts":5000,"action":"click"}]"#
+        );
+
+        let ranged = store
+            .latest_json(
+                1000,
+                5000,
+                &[Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(3))],
+                "action",
+                None,
+            )
+            .unwrap();
+        let ranged: serde_json::Value = serde_json::from_slice(&ranged).unwrap();
+        assert_eq!(ranged.as_array().unwrap().len(), 2);
+        assert_eq!(ranged[0]["action"], "click");
+        assert_eq!(ranged[0]["user_id"], 9);
+        assert_eq!(ranged[1]["action"], "view");
+        assert_eq!(ranged[1]["user_id"], 4);
+
+        let empty = store
+            .latest_json(
+                1000,
+                5000,
+                &[Predicate::Eq(
+                    "action".into(),
+                    Scalar::Str("missing".into()),
+                )],
+                "action",
+                None,
+            )
+            .unwrap();
+        assert_eq!(empty, b"[]");
+
+        let by_user = store.latest_json(1000, 5000, &[], "user_id", None).unwrap();
+        let by_user: serde_json::Value = serde_json::from_slice(&by_user).unwrap();
+        let user_keys: Vec<_> = by_user
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                if row["user_id"].is_null() {
+                    None
+                } else {
+                    Some(row["user_id"].as_i64().unwrap())
+                }
+            })
+            .collect();
+        assert_eq!(
+            user_keys,
+            vec![None, Some(1), Some(2), Some(3), Some(4), Some(9)]
+        );
+        assert_eq!(by_user[1]["ts"], 1000, "user 1 keeps the only earlier row");
+
+        let by_ok = store.latest_json(1000, 5000, &[], "ok", None).unwrap();
+        let by_ok: serde_json::Value = serde_json::from_slice(&by_ok).unwrap();
+        assert_eq!(by_ok[0]["ok"], false);
+        assert_eq!(by_ok[0]["ts"], 4000);
+        assert_eq!(by_ok[1]["ok"], true);
+        assert_eq!(by_ok[1]["ts"], 5000);
+        assert_eq!(by_ok[1]["user_id"], 2);
+
+        let by_amount = store.latest_json(1000, 5000, &[], "amount", None).unwrap();
+        let by_amount: serde_json::Value = serde_json::from_slice(&by_amount).unwrap();
+        let amounts: Vec<_> = by_amount
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["amount"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            amounts,
+            vec!["1.00", "2.00", "3.00", "4.00", "7.00", "8.00", "9.00"]
+        );
+
+        let by_note = store.latest_json(1000, 2000, &[], "note", None).unwrap();
+        let by_note: serde_json::Value = serde_json::from_slice(&by_note).unwrap();
+        let notes: Vec<_> = by_note
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                if row["note"].is_null() {
+                    None
+                } else {
+                    Some(row["note"].as_str().unwrap().to_string())
+                }
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            vec![None, Some("A".into()), Some("a".into()), Some("b".into())]
+        );
+
+        let float = store.latest_json(0, 10, &[], "score", None);
+        assert!(matches!(float, Err(Error::Schema(_))), "{float:?}");
+        let empty_name = store.latest_json(0, 10, &[], "", None);
+        assert!(matches!(empty_name, Err(Error::Event(_))), "{empty_name:?}");
+        let unknown = store.latest_json(0, 10, &[], "missing", None);
+        assert!(matches!(unknown, Err(Error::Schema(_))), "{unknown:?}");
+        store.close().unwrap();
+
+        let wide = TempDir::new();
+        let schema = write_schema(wide.path());
+        let store =
+            Store::open_with(wide.path().join("data"), &schema, test_options(8192)).unwrap();
+        for id in 0..4097i64 {
+            store
+                .append_json(&event(id, Some(id), "k", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let capped = store.latest_json(0, 4095, &[], "user_id", None).unwrap();
+        let capped: serde_json::Value = serde_json::from_slice(&capped).unwrap();
+        assert_eq!(capped.as_array().unwrap().len(), 4096);
+        assert_eq!(capped[0]["user_id"], 0);
+        assert_eq!(capped[4095]["user_id"], 4095);
+        let overflow = store.latest_json(0, 4096, &[], "user_id", None);
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("4096")),
+            "{overflow:?}"
+        );
+        assert!(overflow.as_ref().ok().is_none());
+        store.close().unwrap();
+
+        let skipped = TempDir::new();
+        let schema = write_schema(skipped.path());
+        let data = skipped.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, user, action) in [
+            (10i64, 1i64, "low"),
+            (11, 2, "low"),
+            (20, 10, "high"),
+            (21, 11, "high"),
+        ] {
+            store
+                .append_json(&event(ts, Some(user), action, None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let gt = [Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(5))];
+        let resolved = resolve_predicates(store.schema(), &gt).unwrap();
+        assert_eq!(store.blocks_in_range(0, 100, &resolved).len(), 1);
+        let victim = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.max_ts <= 11)
+            .cloned()
+            .unwrap();
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[victim.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let kept = store.latest_json(0, 100, &gt, "action", None).unwrap();
+        let kept: serde_json::Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(kept.as_array().unwrap().len(), 1);
+        assert_eq!(kept[0]["action"], "high");
+        assert_eq!(kept[0]["user_id"], 11);
+        let unread = store.latest_json(victim.min_ts, victim.max_ts, &[], "score", None);
+        assert!(matches!(unread, Err(Error::Schema(_))), "{unread:?}");
         store.close().unwrap();
     }
 }
