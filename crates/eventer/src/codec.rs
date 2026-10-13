@@ -834,6 +834,7 @@ pub(crate) fn try_add_dense_float(
         if index == column {
             // A column appended after this block was written is all nulls.
             // Summing it would set `contributed`; the row visitor must apply them.
+            // Bytes that start the column and then stop stay corrupt.
             if column_was_not_stored(bytes, cursor) {
                 return Ok(None);
             }
@@ -5575,6 +5576,10 @@ mod tests {
             None
         );
         assert_eq!(missing.to_bits(), 7.0f64.to_bits());
+        let mut torn = old_block.bytes.clone();
+        torn.push(0);
+        let err = try_add_dense_float(&wide, &torn, 3, 0, 10, &mut missing).unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{err}");
     }
 
     fn float_row(schema: &Schema, ts: i64, score: f64, action: &str) -> Row {
