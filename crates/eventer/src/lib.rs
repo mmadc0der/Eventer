@@ -17,7 +17,11 @@
 //! a float column stored as the old unknown tag stay unpruned.
 //! [`Store::count_with_filter`](store::Store::count_with_filter) counts those
 //! rows without building the JSON array. A block with no predicates reads
-//! timestamps only. Each column is its own zstd frame when that container is
+//! timestamps only. One string or text equality, with no other predicate and
+//! no numeric range, counts a constant or one dictionary-code period from the
+//! column header when every payload timestamp is inside the range. A null, a
+//! full code vector, raw strings, or a timestamp outside the range still walks
+//! rows. Each column is its own zstd frame when that container is
 //! at most a quarter larger than one frame, so a filter does not decompress
 //! columns after the predicate.
 //! [`Store::query_json_columns`](store::Store::query_json_columns) returns

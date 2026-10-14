@@ -727,8 +727,19 @@ impl Store {
     /// unread. `gt` needs a minimum strictly above the bound. `ge` needs a
     /// minimum greater than or equal to it. `lt` and `le` use the maximum the
     /// same way. A null flag, tag `0`, or a bound the zone does not cover still
-    /// decodes. Equality is not a proof, so it still reads the column. The
-    /// histogram path does not use this shortcut.
+    /// decodes. An equality on a numeric or json column still reads that column.
+    /// The histogram path does not use this shortcut.
+    ///
+    /// One equality on a string or text column, with no other predicate and no
+    /// numeric range, is counted from the column header when every payload
+    /// timestamp sits in the inclusive range. A constant string contributes the
+    /// block row count or zero. One period of dictionary codes contributes the
+    /// matches in that period, repeated across the rows, without expanding the
+    /// codes. A null, a full per-row code vector, raw strings, a second
+    /// predicate, a range, or a timestamp outside the range still walks rows.
+    /// The sparse index is not that check. A constant or a positive
+    /// non-wrapping timestamp stride may prove it from its header. Any other
+    /// timestamp encoding still expands.
     pub fn count_with_filter(
         &self,
         from_ms: i64,
@@ -5687,6 +5698,88 @@ mod tests {
     }
 
     #[test]
+    fn count_reads_one_string_period_and_still_walks_a_cut() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        for i in 0..8i64 {
+            let mut obj = serde_json::json!({
+                "ts": i * 10,
+                "user_id": i,
+                "score": 1.0,
+                "ok": i != 0,
+                "action": actions[i as usize % actions.len()],
+                "amount": "1.00",
+            });
+            if i % 4 != 3 {
+                obj["note"] = serde_json::json!(["landing", "checkout", "search"][i as usize % 3]);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 1);
+
+        let click = [Predicate::Eq("action".into(), "click".into())];
+        let counted = store.count_with_filter(0, 70, &click).unwrap();
+        let walked = store.query_with_filter(0, 70, &click).unwrap().len() as u64;
+        assert_eq!(counted, 2);
+        assert_eq!(counted, walked);
+        assert_eq!(
+            store
+                .count_with_filter(0, 70, &[Predicate::Eq("action".into(), "missing".into())])
+                .unwrap(),
+            0
+        );
+        let cut = store.count_with_filter(15, 45, &click).unwrap();
+        assert_eq!(cut, 1);
+        assert_eq!(
+            cut,
+            store.query_with_filter(15, 45, &click).unwrap().len() as u64
+        );
+        let both = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+        ];
+        assert_eq!(store.count_with_filter(0, 70, &both).unwrap(), 1);
+        assert_eq!(
+            store.count_with_filter(0, 70, &both).unwrap(),
+            store.query_with_filter(0, 70, &both).unwrap().len() as u64
+        );
+        let ranged = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(4)),
+        ];
+        assert_eq!(store.count_with_filter(0, 70, &ranged).unwrap(), 1);
+        assert_eq!(
+            store
+                .histogram_with_filter(0, 70, 10, &click)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            2
+        );
+
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = 0;
+            block.max_ts = 10;
+        }
+        assert_eq!(
+            store.count_with_filter(0, 10, &click).unwrap(),
+            1,
+            "the sparse index does not prove that every payload timestamp is inside"
+        );
+        assert_eq!(store.count_with_filter(0, 70, &click).unwrap(), 2);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn count_does_not_decode_a_proved_float_slice() {
         let dir = TempDir::new();
         let schema_text = r#"{
@@ -9096,5 +9189,4 @@ mod tests {
         assert!(matches!(unread, Err(Error::Schema(_))), "{unread:?}");
         store.close().unwrap();
     }
-
 }
