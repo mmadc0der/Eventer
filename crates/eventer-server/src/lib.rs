@@ -3585,6 +3585,7 @@ mod tests {
             "/events/histogram?from=1000&to=3000&bucket_ms=1000&distinct=action",
             "/events/stats?from=1000&to=3000&sum=user_id&distinct=action",
             "/events/latest?from=1000&to=3000&by=action&distinct=1",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&distinct=action",
         ] {
             let (status, body) = get_json(&app, uri).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
@@ -3614,6 +3615,7 @@ mod tests {
             "/events/distinct?from=1000&to=3000&field=missing",
             "/events/distinct?from=1000&to=3000&field=action&limit=1",
             "/events?from=1000&to=3000&distinct=action",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&distinct=action",
         ] {
             let (status, body) = get_json(&app, uri).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");

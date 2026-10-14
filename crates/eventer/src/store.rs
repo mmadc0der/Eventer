@@ -795,8 +795,11 @@ impl Store {
     /// sum returns.
     ///
     /// More than [`MAX_DISTINCT_VALUES`] distinct values returns
-    /// [`Error::Event`](Error::Event) and no count. An empty name, an unknown
-    /// field, or a json column is an error and does not read the store.
+    /// [`Error::Event`](Error::Event) and no count. String and text values
+    /// also count their bytes. When a new value would push that total past
+    /// [`MAX_QUERY_BYTES`], the scan returns `query response size limit
+    /// exceeded` and no count. An empty name, an unknown field, or a json
+    /// column is an error and does not read the store.
     pub fn distinct_count(
         &self,
         from_ms: i64,
@@ -2293,7 +2296,7 @@ enum DistinctSet {
     Timestamp(HashSet<i64>),
     Decimal(HashSet<i128>),
     Float(HashSet<u64>),
-    Str(HashSet<String>),
+    Str(HashSet<String>, usize),
 }
 
 impl DistinctSet {
@@ -2304,8 +2307,8 @@ impl DistinctSet {
             FieldType::Timestamp => DistinctSet::Timestamp(HashSet::new()),
             FieldType::Decimal { .. } => DistinctSet::Decimal(HashSet::new()),
             FieldType::Float => DistinctSet::Float(HashSet::new()),
-            FieldType::String | FieldType::Text => DistinctSet::Str(HashSet::new()),
-            FieldType::Json => DistinctSet::Str(HashSet::new()),
+            FieldType::String | FieldType::Text => DistinctSet::Str(HashSet::new(), 0),
+            FieldType::Json => DistinctSet::Str(HashSet::new(), 0),
         }
     }
 
@@ -2316,7 +2319,7 @@ impl DistinctSet {
             DistinctSet::Timestamp(values) => values.len(),
             DistinctSet::Decimal(values) => values.len(),
             DistinctSet::Float(values) => values.len(),
-            DistinctSet::Str(values) => values.len(),
+            DistinctSet::Str(values, _) => values.len(),
         }
     }
 
@@ -2378,7 +2381,7 @@ impl DistinctSet {
     }
 
     fn insert_str(&mut self, value: &str) -> Result<()> {
-        let DistinctSet::Str(values) = self else {
+        let DistinctSet::Str(values, bytes) = self else {
             return Err(Error::corrupt("distinct set does not match the column"));
         };
         if values.contains(value) {
@@ -2387,7 +2390,12 @@ impl DistinctSet {
         if values.len() >= MAX_DISTINCT_VALUES {
             return Err(Error::event("distinct value limit exceeded"));
         }
+        let next = bytes.saturating_add(value.len());
+        if next > MAX_QUERY_BYTES {
+            return Err(Error::event("query response size limit exceeded"));
+        }
         values.insert(value.to_owned());
+        *bytes = next;
         Ok(())
     }
 }
@@ -9525,6 +9533,39 @@ mod tests {
         let overflow = store.distinct_count(0, 1_000_000, &[], "user_id");
         assert!(
             matches!(overflow, Err(Error::Event(ref message)) if message == "distinct value limit exceeded"),
+            "{overflow:?}"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn distinct_count_charges_text_bytes_before_keeping_a_value() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let mut options = test_options(4);
+        options.segment_bytes = 256 * 1024 * 1024;
+        let store = Store::open_with(dir.path().join("data"), &schema, options).unwrap();
+        let width = 512 * 1024;
+        let rows = (MAX_QUERY_BYTES / width) + 1;
+        let start = 1_000_000i64;
+        for id in 0..rows {
+            let mut note = vec![b'x'; width];
+            note[..8].copy_from_slice(format!("{id:08}").as_bytes());
+            let note = String::from_utf8(note).unwrap();
+            store
+                .append_json(&event(start + id as i64, Some(1), "click", Some(&note), "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let end = start + rows as i64 - 1;
+        let kept = store.distinct_count(start, end - 1, &[], "note");
+        assert_eq!(kept.unwrap(), (rows - 1) as u64);
+        let overflow = store.distinct_count(start, end, &[], "note");
+        assert!(
+            matches!(
+                overflow,
+                Err(Error::Event(ref message)) if message == "query response size limit exceeded"
+            ),
             "{overflow:?}"
         );
         store.close().unwrap();
