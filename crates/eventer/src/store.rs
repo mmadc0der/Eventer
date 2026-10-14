@@ -10,8 +10,8 @@ use crate::codec::{
     accumulate_histogram_filtered, block_row_count, cmp_numeric, count_rows_filtered,
     decode_rows_filtered, decode_rows_included, range_impossible, range_matches,
     read_timestamp_column, read_timestamp_column_included, tighter_lower, tighter_upper,
-    timestamp_column_span, visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd,
-    RangeFilter,
+    timestamp_column_span, try_add_dense_float, visit_matching_timestamps, CapturedColumn,
+    ColumnPredicate, RangeEnd, RangeFilter,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -796,7 +796,14 @@ impl Store {
     /// `bucket_ms` is a positive integer. More than [`MAX_HISTOGRAM_BUCKETS`]
     /// buckets is an error, and no block is read for that call. A block the
     /// sparse index places outside the range is not read. A block the zone map
-    /// can reject is not read. A block with no predicates reads timestamps only.
+    /// can reject is not read. A block with no predicates and no numeric range
+    /// reads the timestamp column only. When that column is a constant or a
+    /// positive stride that does not wrap, it has no nulls, and both encoded
+    /// endpoints sit inside the inclusive range, each run is added to the
+    /// buckets without expanding the column. A negative stride, wrapping
+    /// arithmetic, stride pieces, a bit-packed column, a null, a predicate, or
+    /// a range still walks the rows. A timestamp outside the range is not
+    /// counted. The sparse-index min/max are not that check.
     pub fn histogram_with_filter(
         &self,
         from_ms: i64,
@@ -866,12 +873,19 @@ impl Store {
     /// An int, decimal, or timestamp sum uses a 128-bit accumulator and returns
     /// [`Error::Event`](Error::Event) if that accumulator would overflow. A
     /// float sum is IEEE-754 addition in ingest order inside a block and in
-    /// block order across the store. A finished float sum that is not finite
-    /// returns [`Error::Event`](Error::Event) and no column stats. A non-finite
-    /// float already stored is [`Error::Corrupt`](Error::Corrupt). At least one
-    /// of `sum`, `min`, or `max` is required. A bool, string, text, or json
-    /// column is [`Error::Schema`](Error::Schema). Checks run before the store
-    /// is read.
+    /// block order across the store. When the request is that one float sum,
+    /// with no `min`, no `max`, and no row predicate, a block whose every
+    /// payload timestamp is inside the range and whose float column has no
+    /// nulls is added from the encoded constant, raw frame, or repeated decimal
+    /// stride. The other columns of that block are not visited. The sparse
+    /// index is not the inside check. A null, a non-finite value, a block the
+    /// range cuts, a `min` or `max`, or a predicate still visits matching rows,
+    /// including the error a non-finite float already returns. A finished float
+    /// sum that is not finite returns [`Error::Event`](Error::Event) and no
+    /// column stats. A non-finite float already stored is
+    /// [`Error::Corrupt`](Error::Corrupt). At least one of `sum`, `min`, or
+    /// `max` is required. A bool, string, text, or json column is
+    /// [`Error::Schema`](Error::Schema). Checks run before the store is read.
     pub fn aggregate_with_filter(
         &self,
         from_ms: i64,
@@ -885,6 +899,7 @@ impl Store {
         };
         let _retention = self.pipeline.lock_for_read();
         let mut running: Vec<RunningStat> = specs.into_iter().map(RunningStat::new).collect();
+        let dense_float = dense_float_sum(&running, &resolved);
         let minmax_only = running.iter().all(|stat| !stat.spec.sum);
         let mut dictionaries = HashMap::new();
         if minmax_only && resolved.unfiltered() {
@@ -919,6 +934,24 @@ impl Store {
                 )?;
                 let nrows = block_row_count(&payload)?;
                 require_header_row_count(block.row_count, nrows)?;
+                if let Some(index) = dense_float {
+                    match try_add_dense_float(
+                        &self.schema,
+                        &payload,
+                        index,
+                        from_ms,
+                        to_ms,
+                        &mut running[0].float_sum,
+                    )? {
+                        Some(rows) => {
+                            if rows > 0 {
+                                running[0].contributed = true;
+                            }
+                            continue;
+                        }
+                        None => {}
+                    }
+                }
                 let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
                 visit_matching_timestamps(
                     &self.schema,
@@ -2497,6 +2530,20 @@ fn group_key_from_row(
             .ok_or_else(|| Error::corrupt(format!("field `{}` is missing a row", group.name)))?
     };
     group_key_from_scalar(group, scalar)
+}
+
+/// One float `sum`, nothing else, and no row predicate. The column index is
+/// the encoded values to add when the block is fully inside the range.
+fn dense_float_sum(stats: &[RunningStat], resolved: &ResolvedScan) -> Option<usize> {
+    if !resolved.unfiltered() || stats.len() != 1 {
+        return None;
+    }
+    let stat = &stats[0];
+    if stat.spec.ty == FieldType::Float && stat.spec.sum && !stat.spec.min && !stat.spec.max {
+        Some(stat.spec.index)
+    } else {
+        None
+    }
 }
 
 fn capture_columns(indexes: impl IntoIterator<Item = usize>) -> Vec<CapturedColumn> {
@@ -7877,6 +7924,145 @@ mod tests {
             "{negative:?}"
         );
         store.close().unwrap();
+    }
+
+    #[test]
+    fn float_sum_skips_a_row_outside_a_cut_block_and_keeps_extremes() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(2)).unwrap();
+        for (ts, score) in [(1i64, 1e16f64), (2, 0.0), (3, -1e16), (4, 1.0)] {
+            store
+                .append_json(&score_event(ts, Some(score), "click"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let summed = store
+            .aggregate_with_filter(1, 4, &[], &[stat_req("score", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            summed[0].sum,
+            Some(StatSum::Float {
+                total: 1.0,
+                contributed: true,
+            })
+        );
+        store.close().unwrap();
+
+        let cut_dir = TempDir::new();
+        let schema = write_schema(cut_dir.path());
+        let store =
+            Store::open_with(cut_dir.path().join("data"), &schema, test_options(4)).unwrap();
+        for (ts, score) in [(1i64, 1e16f64), (2, 0.0), (3, -1e16), (4, 1.0)] {
+            store
+                .append_json(&score_event(ts, Some(score), "click"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let cut = store
+            .aggregate_with_filter(3, 4, &[], &[stat_req("score", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            cut[0].sum,
+            Some(StatSum::Float {
+                total: -1e16 + 1.0,
+                contributed: true,
+            })
+        );
+        store.close().unwrap();
+
+        let extremes = TempDir::new();
+        let schema = write_schema(extremes.path());
+        let store =
+            Store::open_with(extremes.path().join("data"), &schema, test_options(128)).unwrap();
+        for i in 0..100 {
+            let score = (i % 100) as f64 / 10.0;
+            store
+                .append_json(&score_event(i, Some(score), "view"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let both = store
+            .aggregate_with_filter(0, 99, &[], &[stat_req("score", true, true, true)])
+            .unwrap();
+        assert_eq!(both[0].min, Some(Some(Scalar::Float(0.0))));
+        assert_eq!(both[0].max, Some(Some(Scalar::Float(9.9))));
+        let mut expected = 0.0;
+        for i in 0..100 {
+            expected += (i % 100) as f64 / 10.0;
+        }
+        match both[0].sum.unwrap() {
+            StatSum::Float { total, contributed } => {
+                assert!(contributed);
+                assert_eq!(total.to_bits(), expected.to_bits());
+            }
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        let only = store
+            .aggregate_with_filter(0, 99, &[], &[stat_req("score", true, false, false)])
+            .unwrap();
+        match only[0].sum.unwrap() {
+            StatSum::Float { total, contributed } => {
+                assert!(contributed);
+                assert_eq!(total.to_bits(), expected.to_bits());
+            }
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        assert!(only[0].min.is_none());
+        assert!(only[0].max.is_none());
+
+        let with_null = TempDir::new();
+        let schema = write_schema(with_null.path());
+        let store =
+            Store::open_with(with_null.path().join("data"), &schema, test_options(4)).unwrap();
+        store
+            .append_json(&score_event(10, Some(1.0), "click"))
+            .unwrap();
+        store.append_json(&score_event(20, None, "click")).unwrap();
+        store
+            .append_json(&score_event(30, Some(2.5), "buy"))
+            .unwrap();
+        store.flush().unwrap();
+        let nullable = store
+            .aggregate_with_filter(10, 30, &[], &[stat_req("score", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            nullable[0].sum,
+            Some(StatSum::Float {
+                total: 3.5,
+                contributed: true,
+            })
+        );
+        let clicks = store
+            .aggregate_with_filter(
+                10,
+                30,
+                &[Predicate::Eq("action".into(), "click".into())],
+                &[stat_req("score", true, false, false)],
+            )
+            .unwrap();
+        assert_eq!(
+            clicks[0].sum,
+            Some(StatSum::Float {
+                total: 1.0,
+                contributed: true,
+            })
+        );
+        store.close().unwrap();
+    }
+
+    fn score_event(ts: i64, score: Option<f64>, action: &str) -> Vec<u8> {
+        let mut obj = serde_json::json!({
+            "ts": ts,
+            "user_id": 1,
+            "ok": true,
+            "action": action,
+            "amount": "1.00",
+        });
+        if let Some(score) = score {
+            obj["score"] = serde_json::json!(score);
+        }
+        serde_json::to_vec(&obj).unwrap()
     }
 
     #[test]
