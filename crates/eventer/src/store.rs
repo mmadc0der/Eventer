@@ -1688,31 +1688,7 @@ impl Store {
         )?;
         let nrows = block_row_count(&payload)?;
         require_header_row_count(block.row_count, nrows)?;
-        let mut captures = capture_columns(
-            running
-                .iter()
-                .map(|stat| stat.spec.index)
-                .filter(|index| selected(*index)),
-        );
-        visit_matching_timestamps(
-            &self.schema,
-            &payload,
-            from_ms,
-            to_ms,
-            &[],
-            &[],
-            &mut captures,
-            |ts, row, captured| {
-                for stat in running.iter_mut() {
-                    if !selected(stat.spec.index) {
-                        continue;
-                    }
-                    let value = stat_value(&self.schema, stat, ts, row, captured)?;
-                    stat.absorb(value)?;
-                }
-                Ok(())
-            },
-        )
+        fold_stat_payload(&self.schema, &payload, from_ms, to_ms, running, only)
     }
 
     /// One exact `sum` and no row predicate.
@@ -1747,7 +1723,7 @@ impl Store {
             return Ok(());
         };
         if !span.inside {
-            return self.absorb_decoded_stats(block, dictionaries, from_ms, to_ms, running, None);
+            return fold_stat_payload(&self.schema, &payload, from_ms, to_ms, running, None);
         }
         let name = running[0].spec.name.clone();
         match try_accumulate_exact_sum(&self.schema, &payload, index, &name, &mut running[0].exact)?
@@ -1758,7 +1734,7 @@ impl Store {
                 }
                 Ok(())
             }
-            None => self.absorb_decoded_stats(block, dictionaries, from_ms, to_ms, running, None),
+            None => fold_stat_payload(&self.schema, &payload, from_ms, to_ms, running, None),
         }
     }
 
@@ -1983,6 +1959,44 @@ enum ZoneMinMax {
         min: Scalar,
         max: Scalar,
     },
+}
+
+/// Fold rows already loaded. `only` limits the fold the way
+/// [`Store::absorb_decoded_stats`] does after it reads the block.
+fn fold_stat_payload(
+    schema: &Schema,
+    payload: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    running: &mut [RunningStat],
+    only: Option<&[usize]>,
+) -> Result<()> {
+    let selected = |index: usize| only.is_none_or(|indexes| indexes.contains(&index));
+    let mut captures = capture_columns(
+        running
+            .iter()
+            .map(|stat| stat.spec.index)
+            .filter(|index| selected(*index)),
+    );
+    visit_matching_timestamps(
+        schema,
+        payload,
+        from_ms,
+        to_ms,
+        &[],
+        &[],
+        &mut captures,
+        |ts, row, captured| {
+            for stat in running.iter_mut() {
+                if !selected(stat.spec.index) {
+                    continue;
+                }
+                let value = stat_value(schema, stat, ts, row, captured)?;
+                stat.absorb(value)?;
+            }
+            Ok(())
+        },
+    )
 }
 
 /// One int, timestamp, or decimal `sum`, with no `min` and no `max`.
@@ -8331,6 +8345,49 @@ mod tests {
             matches!(overflow, Err(Error::Event(ref message)) if message.contains("overflow")),
             "{overflow:?}"
         );
+        let overflow_bounds =
+            store.aggregate_with_filter(0, 10, &[], &[stat_req("amount", true, true, true)]);
+        assert!(
+            matches!(overflow_bounds, Err(Error::Event(ref message)) if message.contains("overflow")),
+            "{overflow_bounds:?}"
+        );
+        store.close().unwrap();
+
+        let carried = TempDir::new();
+        let schema_path = carried.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "amount", "type": "decimal", "scale": 0}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let store =
+            Store::open_with(carried.path().join("data"), &schema_path, test_options(8)).unwrap();
+        let low = (i128::MIN + 1).to_string();
+        let high = i128::MAX.to_string();
+        store
+            .append_json(format!(r#"{{"ts":1,"amount":"{low}"}}"#).as_bytes())
+            .unwrap();
+        store.flush().unwrap();
+        for ts in [2i64, 3] {
+            store
+                .append_json(format!(r#"{{"ts":{ts},"amount":"{high}"}}"#).as_bytes())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let with_bounds = store
+            .aggregate_with_filter(0, 10, &[], &[stat_req("amount", true, true, true)])
+            .unwrap();
+        assert_eq!(exact_sum(&with_bounds, "amount"), (i128::MAX, true));
+        let alone = store
+            .aggregate_with_filter(0, 10, &[], &[stat_req("amount", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&alone, "amount"), (i128::MAX, true));
         store.close().unwrap();
     }
 

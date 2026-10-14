@@ -2159,9 +2159,11 @@ pub(crate) fn timestamp_column_span(
 ///
 /// `Ok(None)` leaves `total` unchanged: the column is missing, has a null, or
 /// is bit-packed or a frame of reference. `Ok(Some(true))` means one or more
-/// values were added. A constant is `value * n`. A stride or a stride piece is
-/// the wrapped steps in row order, the same arithmetic [`decode_i64s`] uses.
-/// Overflow is the event error from adding those values one by one.
+/// values were added. A constant whose product fits is one add of `value * n`.
+/// When that product does not fit, the same value is added once per row. A
+/// stride or a stride piece is the wrapped steps in row order, the same
+/// arithmetic [`decode_i64s`] uses. Overflow is the event error from adding
+/// those values one by one.
 pub(crate) fn try_accumulate_exact_sum(
     schema: &Schema,
     bytes: &[u8],
@@ -2225,10 +2227,15 @@ fn accumulate_integer_body(
             read_i128(bytes, cursor)?
         };
         let n = i128::try_from(count).map_err(|_| Error::corrupt("column is too long to sum"))?;
-        let product = value.checked_mul(n).ok_or_else(|| sum_overflow(name))?;
-        *total = total
-            .checked_add(product)
-            .ok_or_else(|| sum_overflow(name))?;
+        if let Some(product) = value.checked_mul(n) {
+            *total = total
+                .checked_add(product)
+                .ok_or_else(|| sum_overflow(name))?;
+        } else {
+            for _ in 0..count {
+                *total = total.checked_add(value).ok_or_else(|| sum_overflow(name))?;
+            }
+        }
         return Ok(Some(true));
     }
     if kind == KIND_STRIDE {
