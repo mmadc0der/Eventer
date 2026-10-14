@@ -549,6 +549,11 @@ pub(crate) fn count_rows_filtered(
 ///
 /// `counts[i]` is the bucket starting at `first_start + i * bucket_ms`. A timestamp
 /// outside `from_ms..=to_ms` is not visited. `bucket_ms` is a positive integer.
+///
+/// With no predicates, a timestamp column that is a constant or a positive
+/// non-wrapping stride, with no nulls, and whose encoded endpoints both sit in
+/// the inclusive range, adds each whole run to those buckets. The column is not
+/// expanded. Anything else walks the timestamps.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn accumulate_histogram(
     schema: &Schema,
@@ -584,6 +589,11 @@ pub(crate) fn accumulate_histogram_filtered(
     first_start: i128,
     counts: &mut [u64],
 ) -> Result<()> {
+    if predicates.is_empty() && ranges.is_empty() {
+        if let Some(run) = plain_timestamp_run(schema, bytes, from_ms, to_ms)? {
+            return add_timestamp_run(&run, bucket_ms, first_start, counts);
+        }
+    }
     visit_matching_timestamps(
         schema,
         bytes,
@@ -606,6 +616,143 @@ pub(crate) fn accumulate_histogram_filtered(
             Ok(())
         },
     )
+}
+
+/// A constant (`stride == 0`) or a positive stride over every row.
+struct TimestampRun {
+    base: i64,
+    stride: i64,
+    count: usize,
+}
+
+/// Header of a null-free constant or positive non-wrapping stride whose first
+/// and last values both sit in `from_ms..=to_ms`.
+///
+/// The sparse index is not read. A negative stride, wrapping arithmetic,
+/// stride pieces, bit packing, a null, or an endpoint outside the range is
+/// `None`, and the caller walks rows. A truncated header is corrupt.
+fn plain_timestamp_run(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Option<TimestampRun>> {
+    if from_ms > to_ms {
+        return Ok(None);
+    }
+    let nrows = block_row_count(bytes)?;
+    let mut cursor = 4usize;
+    for (index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            return Err(Error::corrupt("timestamp column is missing"));
+        }
+        if index == schema.timestamp_index {
+            if field.ty != FieldType::Timestamp {
+                return Err(Error::corrupt("timestamp column has the wrong type"));
+            }
+            return plain_i64_run(bytes, &mut cursor, nrows, from_ms, to_ms);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Err(Error::corrupt("timestamp column is missing"))
+}
+
+fn plain_i64_run(
+    bytes: &[u8],
+    cursor: &mut usize,
+    nrows: usize,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Option<TimestampRun>> {
+    let flag = *bytes
+        .get(*cursor)
+        .ok_or_else(|| Error::corrupt("truncated null flag"))?;
+    if flag != 0 {
+        return Ok(None);
+    }
+    *cursor += 1;
+    let kind = read_u8(bytes, cursor)?;
+    if kind == KIND_CONSTANT {
+        let base = read_i64(bytes, cursor)?;
+        if base < from_ms || base > to_ms {
+            return Ok(None);
+        }
+        return Ok(Some(TimestampRun {
+            base,
+            stride: 0,
+            count: nrows,
+        }));
+    }
+    if kind == KIND_STRIDE {
+        let base = read_i64(bytes, cursor)?;
+        let stride = read_i64(bytes, cursor)?;
+        if stride <= 0 {
+            return Ok(None);
+        }
+        let Some(last) = stride_end(base, stride, nrows) else {
+            return Ok(None);
+        };
+        if base < from_ms || last > to_ms {
+            return Ok(None);
+        }
+        return Ok(Some(TimestampRun {
+            base,
+            stride,
+            count: nrows,
+        }));
+    }
+    Ok(None)
+}
+
+/// `base + (count - 1) * stride` when that product does not wrap in `i64`.
+fn stride_end(base: i64, stride: i64, count: usize) -> Option<i64> {
+    let steps = i64::try_from(count.checked_sub(1)?).ok()?;
+    base.checked_add(steps.checked_mul(stride)?)
+}
+
+fn add_timestamp_run(
+    run: &TimestampRun,
+    bucket_ms: i64,
+    first_start: i128,
+    counts: &mut [u64],
+) -> Result<()> {
+    let width = i128::from(bucket_ms);
+    if width <= 0 {
+        return Err(Error::event("bucket_ms must be a positive integer"));
+    }
+    let base = i128::from(run.base);
+    let stride = i128::from(run.stride);
+    let count = u64::try_from(run.count).map_err(|_| Error::corrupt("histogram bucket index"))?;
+    let mut index = 0u64;
+    while index < count {
+        let ts = base + i128::from(index) * stride;
+        let start = ts.div_euclid(width) * width;
+        let bucket_index = (start - first_start) / width;
+        let bucket_index =
+            usize::try_from(bucket_index).map_err(|_| Error::corrupt("histogram bucket index"))?;
+        let bucket = counts
+            .get_mut(bucket_index)
+            .ok_or_else(|| Error::corrupt("histogram bucket index"))?;
+        let remain = count - index;
+        let n = if stride == 0 {
+            remain
+        } else {
+            let room = start + width - ts;
+            if room <= 0 {
+                return Err(Error::corrupt("histogram bucket index"));
+            }
+            let steps = (room - 1) / stride;
+            u64::try_from(steps + 1).unwrap_or(u64::MAX).min(remain)
+        };
+        if n == 0 {
+            return Err(Error::corrupt("histogram bucket index"));
+        }
+        *bucket = bucket
+            .checked_add(n)
+            .ok_or_else(|| Error::event("event count overflow"))?;
+        index += n;
+    }
+    Ok(())
 }
 
 /// One decoded column kept for rows that survive the filters.
@@ -5401,6 +5548,321 @@ mod tests {
                 Scalar::Null,
                 Scalar::Str("click".into()),
             ]
+        );
+    }
+
+    fn timestamp_only() -> Schema {
+        parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [{"name": "ts", "type": "timestamp"}]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn rows_at(stamps: &[i64]) -> Vec<Row> {
+        let schema = timestamp_only();
+        stamps
+            .iter()
+            .map(|ts| parse_event(&schema, format!(r#"{{"ts":{ts}}}"#).as_bytes()).unwrap())
+            .collect()
+    }
+
+    fn timestamp_kind(schema: &Schema, bytes: &[u8]) -> u8 {
+        let nrows = block_row_count(bytes).unwrap();
+        let mut cursor = 4usize;
+        for (index, field) in schema.fields.iter().enumerate() {
+            if index == schema.timestamp_index {
+                assert_eq!(bytes[cursor], 0);
+                return bytes[cursor + 1];
+            }
+            skip_column(field.ty, bytes, &mut cursor, nrows, false).unwrap();
+        }
+        panic!("timestamp column is missing");
+    }
+
+    fn walked_buckets(
+        schema: &Schema,
+        bytes: &[u8],
+        from: i64,
+        to: i64,
+        bucket_ms: i64,
+    ) -> Vec<u64> {
+        let width = i128::from(bucket_ms);
+        let first = i128::from(from).div_euclid(width) * width;
+        let last = i128::from(to).div_euclid(width) * width;
+        let n = ((last - first) / width + 1) as usize;
+        let mut counts = vec![0u64; n];
+        for ts in read_timestamp_column(schema, bytes).unwrap() {
+            if ts < from || ts > to {
+                continue;
+            }
+            let start = i128::from(ts).div_euclid(width) * width;
+            counts[((start - first) / width) as usize] += 1;
+        }
+        counts
+    }
+
+    fn assert_histogram_matches_walk(
+        schema: &Schema,
+        bytes: &[u8],
+        from: i64,
+        to: i64,
+        bucket_ms: i64,
+    ) -> Vec<u64> {
+        let expected = walked_buckets(schema, bytes, from, to, bucket_ms);
+        let width = i128::from(bucket_ms);
+        let first = i128::from(from).div_euclid(width) * width;
+        let mut counts = vec![0u64; expected.len()];
+        accumulate_histogram(schema, bytes, from, to, &[], bucket_ms, first, &mut counts).unwrap();
+        assert_eq!(counts, expected);
+        counts
+    }
+
+    #[test]
+    fn histogram_fills_a_positive_stride_without_expanding_it() {
+        let schema = timestamp_only();
+        let base = 1_700_000_000_000i64;
+        let stamps: Vec<i64> = (0..2048).map(|i| base + i * 10).collect();
+        let block = encode_block(&schema, &rows_at(&stamps)).unwrap();
+        assert_eq!(timestamp_kind(&schema, &block.bytes), KIND_STRIDE);
+        let last = base + 2047 * 10;
+        assert!(plain_timestamp_run(&schema, &block.bytes, base, last)
+            .unwrap()
+            .is_some());
+        let counts = assert_histogram_matches_walk(&schema, &block.bytes, base, last, 1000);
+        assert_eq!(counts.len(), 21);
+        assert_eq!(&counts[..20], &[100u64; 20]);
+        assert_eq!(counts[20], 48);
+        assert_eq!(counts.iter().sum::<u64>(), 2048);
+
+        let uneven: Vec<i64> = (0..10).map(|i| 5 + i * 3).collect();
+        let block = encode_block(&schema, &rows_at(&uneven)).unwrap();
+        assert_eq!(timestamp_kind(&schema, &block.bytes), KIND_STRIDE);
+        assert!(plain_timestamp_run(&schema, &block.bytes, 5, 32)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            assert_histogram_matches_walk(&schema, &block.bytes, 5, 32, 10),
+            vec![2, 3, 4, 1]
+        );
+
+        let crossed: Vec<i64> = (0..32).map(|i| -25 + i * 10).collect();
+        let block = encode_block(&schema, &rows_at(&crossed)).unwrap();
+        assert_eq!(timestamp_kind(&schema, &block.bytes), KIND_STRIDE);
+        let crossed_last = -25 + 31 * 10;
+        assert!(
+            plain_timestamp_run(&schema, &block.bytes, -25, crossed_last)
+                .unwrap()
+                .is_some()
+        );
+        let counts = assert_histogram_matches_walk(&schema, &block.bytes, -25, crossed_last, 10);
+        assert_eq!(counts.len(), 32);
+        assert!(counts.iter().all(|count| *count == 1));
+
+        let constant = vec![base; 7];
+        let block = encode_block(&schema, &rows_at(&constant)).unwrap();
+        assert_eq!(timestamp_kind(&schema, &block.bytes), KIND_CONSTANT);
+        assert!(plain_timestamp_run(&schema, &block.bytes, base, base)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            assert_histogram_matches_walk(&schema, &block.bytes, base, base, 1000),
+            vec![7]
+        );
+
+        let early = vec![-1500i64; 4];
+        let block = encode_block(&schema, &rows_at(&early)).unwrap();
+        assert!(plain_timestamp_run(&schema, &block.bytes, -1500, -100)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            assert_histogram_matches_walk(&schema, &block.bytes, -1500, -100, 1000),
+            vec![4, 0]
+        );
+    }
+
+    #[test]
+    fn histogram_walks_when_the_stride_is_not_a_plain_run() {
+        let schema = timestamp_only();
+        let positive: Vec<i64> = (0..12).map(|i| 100 + i * 10).collect();
+        let block = encode_block(&schema, &rows_at(&positive)).unwrap();
+        assert!(plain_timestamp_run(&schema, &block.bytes, 150, 180)
+            .unwrap()
+            .is_none());
+        let cut = assert_histogram_matches_walk(&schema, &block.bytes, 150, 180, 10);
+        assert_eq!(cut.iter().sum::<u64>(), 4);
+
+        let decreasing: Vec<i64> = (0..30).map(|i| 5_000 - i * 15).collect();
+        let block = encode_block(&schema, &rows_at(&decreasing)).unwrap();
+        assert_eq!(timestamp_kind(&schema, &block.bytes), KIND_STRIDE);
+        assert!(
+            plain_timestamp_run(&schema, &block.bytes, decreasing[29], decreasing[0])
+                .unwrap()
+                .is_none()
+        );
+        let counts = assert_histogram_matches_walk(
+            &schema,
+            &block.bytes,
+            decreasing[29],
+            decreasing[0],
+            100,
+        );
+        assert_eq!(counts.iter().sum::<u64>(), 30);
+
+        let base = i64::MAX - 40;
+        let wrapped: Vec<i64> = (0..6).map(|i| base.wrapping_add(i * 30)).collect();
+        let block = encode_block(&schema, &rows_at(&wrapped)).unwrap();
+        assert_eq!(timestamp_kind(&schema, &block.bytes), KIND_STRIDE);
+        let from = *wrapped.iter().min().unwrap();
+        let to = *wrapped.iter().max().unwrap();
+        assert!(plain_timestamp_run(&schema, &block.bytes, from, to)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            assert_histogram_matches_walk(&schema, &block.bytes, from, to, 1 << 62),
+            vec![4, 0, 0, 2]
+        );
+
+        let pieces: Vec<i64> = (0..200).map(|i| (i % 50) as i64).collect();
+        let block = encode_block(&schema, &rows_at(&pieces)).unwrap();
+        assert_eq!(timestamp_kind(&schema, &block.bytes), KIND_PIECES);
+        assert!(plain_timestamp_run(&schema, &block.bytes, 0, 49)
+            .unwrap()
+            .is_none());
+        let counts = assert_histogram_matches_walk(&schema, &block.bytes, 0, 49, 10);
+        assert_eq!(counts.iter().sum::<u64>(), 200);
+
+        let packed = [0i64, 999, 1];
+        let block = encode_block(&schema, &rows_at(&packed)).unwrap();
+        assert_eq!(timestamp_kind(&schema, &block.bytes), KIND_BITPACK);
+        assert!(plain_timestamp_run(&schema, &block.bytes, 0, 999)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            assert_histogram_matches_walk(&schema, &block.bytes, 0, 999, 500),
+            vec![2, 1]
+        );
+
+        let mut null_row = rows_at(&[10])[0].clone();
+        null_row.values[0] = Scalar::Null;
+        let null_block = encode_block(&schema, &[null_row]).unwrap();
+        assert!(plain_timestamp_run(&schema, &null_block.bytes, 0, 100)
+            .unwrap()
+            .is_none());
+        let err = accumulate_histogram(&schema, &null_block.bytes, 0, 100, &[], 10, 0, &mut [0])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("timestamp column is null"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn histogram_predicates_and_an_earlier_column_still_agree_with_the_walk() {
+        let schema = schema();
+        let mut rows = Vec::new();
+        for index in 0..16 {
+            let action = if index % 2 == 0 { "click" } else { "view" };
+            rows.push(
+                parse_event(
+                    &schema,
+                    format!(
+                        r#"{{"ts":{},"user_id":{index},"score":1.0,"ok":true,"action":"{action}","note":"n","amount":"1.00"}}"#,
+                        1_000 + index * 25
+                    )
+                    .as_bytes(),
+                )
+                .unwrap(),
+            );
+        }
+        let block = encode_block(&schema, &rows).unwrap();
+        assert_eq!(timestamp_kind(&schema, &block.bytes), KIND_STRIDE);
+        let from = 1_000i64;
+        let to = 1_000 + 15 * 25;
+        assert!(plain_timestamp_run(&schema, &block.bytes, from, to)
+            .unwrap()
+            .is_some());
+        let predicate = [ColumnPredicate {
+            index: 4,
+            allowed: vec![Scalar::Str("click".into())],
+        }];
+        let range = [RangeFilter {
+            index: 1,
+            lower: Some(RangeEnd {
+                inclusive: true,
+                value: Scalar::Int(8),
+            }),
+            upper: None,
+        }];
+        for (predicates, ranges) in [(&predicate[..], &[][..]), (&[][..], &range[..])] {
+            let rows = decode_rows_filtered(
+                &schema,
+                &block.bytes,
+                from,
+                to,
+                usize::MAX,
+                predicates,
+                ranges,
+            )
+            .unwrap();
+            let width = 50i128;
+            let first = i128::from(from).div_euclid(width) * width;
+            let last = i128::from(to).div_euclid(width) * width;
+            let n = ((last - first) / width + 1) as usize;
+            let mut expected = vec![0u64; n];
+            for row in &rows {
+                let start = i128::from(row.ts).div_euclid(width) * width;
+                expected[((start - first) / width) as usize] += 1;
+            }
+            let mut counts = vec![0u64; n];
+            accumulate_histogram_filtered(
+                &schema,
+                &block.bytes,
+                from,
+                to,
+                predicates,
+                ranges,
+                50,
+                first,
+                &mut counts,
+            )
+            .unwrap();
+            assert_eq!(counts, expected);
+            assert!(counts.iter().sum::<u64>() < 16);
+        }
+
+        let later = parse_schema(
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "user_id", "type": "int"},
+                    {"name": "ts", "type": "timestamp"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for index in 0..12 {
+            rows.push(
+                parse_event(
+                    &later,
+                    format!(r#"{{"user_id":{index},"ts":{}}}"#, 40 + index * 7).as_bytes(),
+                )
+                .unwrap(),
+            );
+        }
+        let block = encode_block(&later, &rows).unwrap();
+        assert_eq!(timestamp_kind(&later, &block.bytes), KIND_STRIDE);
+        assert!(plain_timestamp_run(&later, &block.bytes, 40, 40 + 11 * 7)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            assert_histogram_matches_walk(&later, &block.bytes, 40, 40 + 11 * 7, 20)
+                .iter()
+                .sum::<u64>(),
+            12
         );
     }
 }
