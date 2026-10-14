@@ -21,7 +21,10 @@
 //! no numeric range, counts a constant or one dictionary-code period from the
 //! column header when every payload timestamp is inside the range. A null, a
 //! full code vector, raw strings, or a timestamp outside the range still walks
-//! rows. Each column is its own zstd frame when that container is
+//! rows. One bool equality, with no other predicate and no numeric range,
+//! counts a constant or one bitmap period the same way, and does not expand a
+//! bool per row. A null or a full per-row bitmap still walks. Each column is
+//! its own zstd frame when that container is
 //! at most a quarter larger than one frame, so a filter does not decompress
 //! columns after the predicate.
 //! [`Store::query_json_columns`](store::Store::query_json_columns) returns
