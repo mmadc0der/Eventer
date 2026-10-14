@@ -10,8 +10,8 @@ use crate::codec::{
     accumulate_histogram_filtered, block_row_count, cmp_numeric, count_rows_filtered,
     decode_rows_filtered, decode_rows_included, range_impossible, range_matches,
     read_timestamp_column, read_timestamp_column_included, tighter_lower, tighter_upper,
-    timestamp_column_span, visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd,
-    RangeFilter,
+    timestamp_column_span, try_add_dense_float, visit_matching_timestamps, CapturedColumn,
+    ColumnPredicate, RangeEnd, RangeFilter,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -87,6 +87,16 @@ pub struct ColumnStats {
 pub struct StatGroup {
     pub key: Scalar,
     pub columns: Vec<ColumnStats>,
+}
+
+/// A probability in `0..=1` for [`Store::quantile_with_filter`].
+///
+/// `1` (including `1.0`) selects the last sorted value. Every smaller `p`
+/// selects index `floor(p * n)`. Build one with [`parse_quantile_p`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuantileP {
+    numer: u128,
+    scale: u8,
 }
 
 /// Counters for the bytes sitting in segment files after the last flush.
@@ -872,7 +882,14 @@ impl Store {
     /// `bucket_ms` is a positive integer. More than [`MAX_HISTOGRAM_BUCKETS`]
     /// buckets is an error, and no block is read for that call. A block the
     /// sparse index places outside the range is not read. A block the zone map
-    /// can reject is not read. A block with no predicates reads timestamps only.
+    /// can reject is not read. A block with no predicates and no numeric range
+    /// reads the timestamp column only. When that column is a constant or a
+    /// positive stride that does not wrap, it has no nulls, and both encoded
+    /// endpoints sit inside the inclusive range, each run is added to the
+    /// buckets without expanding the column. A negative stride, wrapping
+    /// arithmetic, stride pieces, a bit-packed column, a null, a predicate, or
+    /// a range still walks the rows. A timestamp outside the range is not
+    /// counted. The sparse-index min/max are not that check.
     pub fn histogram_with_filter(
         &self,
         from_ms: i64,
@@ -942,12 +959,19 @@ impl Store {
     /// An int, decimal, or timestamp sum uses a 128-bit accumulator and returns
     /// [`Error::Event`](Error::Event) if that accumulator would overflow. A
     /// float sum is IEEE-754 addition in ingest order inside a block and in
-    /// block order across the store. A finished float sum that is not finite
-    /// returns [`Error::Event`](Error::Event) and no column stats. A non-finite
-    /// float already stored is [`Error::Corrupt`](Error::Corrupt). At least one
-    /// of `sum`, `min`, or `max` is required. A bool, string, text, or json
-    /// column is [`Error::Schema`](Error::Schema). Checks run before the store
-    /// is read.
+    /// block order across the store. When the request is that one float sum,
+    /// with no `min`, no `max`, and no row predicate, a block whose every
+    /// payload timestamp is inside the range and whose float column has no
+    /// nulls is added from the encoded constant, raw frame, or repeated decimal
+    /// stride. The other columns of that block are not visited. The sparse
+    /// index is not the inside check. A null, a non-finite value, a block the
+    /// range cuts, a `min` or `max`, or a predicate still visits matching rows,
+    /// including the error a non-finite float already returns. A finished float
+    /// sum that is not finite returns [`Error::Event`](Error::Event) and no
+    /// column stats. A non-finite float already stored is
+    /// [`Error::Corrupt`](Error::Corrupt). At least one of `sum`, `min`, or
+    /// `max` is required. A bool, string, text, or json column is
+    /// [`Error::Schema`](Error::Schema). Checks run before the store is read.
     pub fn aggregate_with_filter(
         &self,
         from_ms: i64,
@@ -961,6 +985,7 @@ impl Store {
         };
         let _retention = self.pipeline.lock_for_read();
         let mut running: Vec<RunningStat> = specs.into_iter().map(RunningStat::new).collect();
+        let dense_float = dense_float_sum(&running, &resolved);
         let minmax_only = running.iter().all(|stat| !stat.spec.sum);
         let mut dictionaries = HashMap::new();
         if minmax_only && resolved.unfiltered() {
@@ -995,6 +1020,24 @@ impl Store {
                 )?;
                 let nrows = block_row_count(&payload)?;
                 require_header_row_count(block.row_count, nrows)?;
+                if let Some(index) = dense_float {
+                    match try_add_dense_float(
+                        &self.schema,
+                        &payload,
+                        index,
+                        from_ms,
+                        to_ms,
+                        &mut running[0].float_sum,
+                    )? {
+                        Some(rows) => {
+                            if rows > 0 {
+                                running[0].contributed = true;
+                            }
+                            continue;
+                        }
+                        None => {}
+                    }
+                }
                 let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
                 visit_matching_timestamps(
                     &self.schema,
@@ -1165,6 +1208,77 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    /// Exact rank of one numeric column over an inclusive range.
+    ///
+    /// Filters are the same ones [`Store::count_with_filter`] applies. A block
+    /// the sparse index places outside the range is not read. A block the zone
+    /// map can reject is not read. Rows that share a block with a match are
+    /// filtered while the block is decoded, so a timestamp outside the range
+    /// does not enter the sample.
+    ///
+    /// Nulls are not part of `n`. No non-null match returns `Ok(None)`. The
+    /// other values are sorted in numeric order and the result is index
+    /// `floor(p * n)` when `p < 1`, or index `n - 1` when `p` is 1. An int,
+    /// timestamp, decimal, or float uses that column's scalar. A bool, string,
+    /// text, or json column, an empty name, or an unknown field is an error
+    /// and does not read the store. A non-finite float is corrupt.
+    ///
+    /// Retained samples are one `i64` or `f64` (8 bytes) or one `i128` (16
+    /// bytes) per non-null match. A sample count already at [`MAX_QUERY_ROWS`]
+    /// returns [`Error::Event`](Error::Event) (`query row limit exceeded`)
+    /// before that sample is stored. The next sample that would push retained
+    /// bytes past [`MAX_QUERY_BYTES`] returns the same error kind (`query
+    /// response size limit exceeded`). Either refusal returns no rank. A prefix
+    /// of the rows is not a result.
+    pub fn quantile_with_filter(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        field: &str,
+        p: QuantileP,
+    ) -> Result<Option<Scalar>> {
+        let spec = resolve_quantile_field(&self.schema, field)?;
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
+            return Ok(None);
+        };
+        let _retention = self.pipeline.lock_for_read();
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+        let mut samples = QuantileSamples::new(spec.ty);
+        let mut dictionaries = HashMap::new();
+        for block in blocks {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+                return Err(Error::event("query response size limit exceeded"));
+            }
+            let through = needed_column(&self.schema, &resolved, Some(spec.index));
+            let payload = self.read_block_bytes(
+                &block,
+                &mut dictionaries,
+                segment::BlockLoad {
+                    through_column: Some(through),
+                    columns: None,
+                },
+            )?;
+            let nrows = block_row_count(&payload)?;
+            require_header_row_count(block.row_count, nrows)?;
+            let mut captures = capture_columns(std::iter::once(spec.index));
+            visit_matching_timestamps(
+                &self.schema,
+                &payload,
+                from_ms,
+                to_ms,
+                &resolved.predicates,
+                &resolved.ranges,
+                &mut captures,
+                |ts, row, captured| {
+                    let value = quantile_value(&self.schema, &spec, ts, row, captured)?;
+                    samples.push(value)
+                },
+            )?;
+        }
+        samples.finish(p)
     }
 
     /// Delete every block whose maximum timestamp is strictly less than `cutoff_ms`.
@@ -2026,6 +2140,153 @@ struct DistinctColumn {
     ty: FieldType,
 }
 
+/// Parse `p` as a decimal in `0..=1`.
+///
+/// The text is digits with one optional `.`. An exponent, a sign, or a value
+/// outside that range is an error. `1` and `1.0` are the same probability.
+/// Trailing zeros in the fraction do not change the rank.
+pub fn parse_quantile_p(text: &str) -> Result<QuantileP> {
+    parse_quantile_level(text).ok_or_else(|| Error::event("`p` must be a decimal in 0..=1"))
+}
+
+fn parse_quantile_level(text: &str) -> Option<QuantileP> {
+    if text.is_empty() || text == "." {
+        return None;
+    }
+    if !text
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    let mut parts = text.split('.');
+    let whole = parts.next().unwrap_or("");
+    let frac = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let whole_value = integer_digit(whole)?;
+    let frac = frac.unwrap_or("");
+    if !frac.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if whole_value == 1 {
+        if frac.bytes().all(|byte| byte == b'0') {
+            return Some(QuantileP { numer: 1, scale: 0 });
+        }
+        return None;
+    }
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() {
+        return Some(QuantileP { numer: 0, scale: 0 });
+    }
+    if frac.len() > 38 {
+        return None;
+    }
+    let numer = frac.parse::<u128>().ok()?;
+    Some(QuantileP {
+        numer,
+        scale: frac.len() as u8,
+    })
+}
+
+fn integer_digit(whole: &str) -> Option<u8> {
+    if whole.is_empty() {
+        return Some(0);
+    }
+    if !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let trimmed = whole.trim_start_matches('0');
+    if trimmed.is_empty() {
+        Some(0)
+    } else if trimmed == "1" {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Index `floor(p * n)` for `p < 1`, and `n - 1` when `p` is 1.
+/// `n == 0` has no rank.
+fn quantile_rank(p: QuantileP, n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    if p.numer == 1 && p.scale == 0 {
+        return Some(n - 1);
+    }
+    if p.numer == 0 {
+        return Some(0);
+    }
+    let den = ten_pow(p.scale);
+    Some(floor_rank(p.numer, n as u128, den))
+}
+
+const fn ten_pow(scale: u8) -> u128 {
+    let mut value = 1u128;
+    let mut left = scale;
+    while left > 0 {
+        value *= 10;
+        left -= 1;
+    }
+    value
+}
+
+/// Largest `k < n` such that `k * den <= numer * n`, with `numer < den`.
+fn floor_rank(numer: u128, n: u128, den: u128) -> usize {
+    let mut lo = 0u128;
+    let mut hi = n;
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if mul_le(mid, den, numer, n) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo as usize
+}
+
+fn mul_le(left_a: u128, left_b: u128, right_a: u128, right_b: u128) -> bool {
+    cmp_limbs(mul_limbs(left_a, left_b), mul_limbs(right_a, right_b)) != Ordering::Greater
+}
+
+fn cmp_limbs(left: [u64; 4], right: [u64; 4]) -> Ordering {
+    for index in (0..4).rev() {
+        match left[index].cmp(&right[index]) {
+            Ordering::Equal => {}
+            other => return other,
+        }
+    }
+    Ordering::Equal
+}
+
+/// Little-endian 64-bit limbs of `a * b`.
+fn mul_limbs(a: u128, b: u128) -> [u64; 4] {
+    let a0 = a as u64 as u128;
+    let a1 = a >> 64;
+    let b0 = b as u64 as u128;
+    let b1 = b >> 64;
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let l0 = p00 as u64;
+    let sum1 = (p00 >> 64) + (p01 as u64) as u128 + (p10 as u64) as u128;
+    let l1 = sum1 as u64;
+    let sum2 = (sum1 >> 64) + (p01 >> 64) + (p10 >> 64) + (p11 as u64) as u128;
+    let l2 = sum2 as u64;
+    let l3 = ((sum2 >> 64) + (p11 >> 64)) as u64;
+    [l0, l1, l2, l3]
+}
+
+struct ResolvedQuantile {
+    index: usize,
+    name: String,
+    ty: FieldType,
+}
+
 enum DistinctSet {
     Bool(HashSet<bool>),
     Int(HashSet<i64>),
@@ -2162,6 +2423,145 @@ fn resolve_distinct_field(schema: &Schema, field: &str) -> Result<DistinctColumn
         name: field.to_string(),
         ty,
     })
+}
+
+
+fn resolve_quantile_field(schema: &Schema, field: &str) -> Result<ResolvedQuantile> {
+    if field.is_empty() {
+        return Err(Error::event("quantile field name is empty"));
+    }
+    let index = schema
+        .fields
+        .iter()
+        .position(|candidate| candidate.name == field)
+        .ok_or_else(|| Error::schema(format!("unknown quantile field `{field}`")))?;
+    let ty = schema.fields[index].ty;
+    if !matches!(
+        ty,
+        FieldType::Int | FieldType::Timestamp | FieldType::Float | FieldType::Decimal { .. }
+    ) {
+        return Err(Error::schema(format!(
+            "quantile does not apply to {} column `{field}`",
+            ty.name()
+        )));
+    }
+    Ok(ResolvedQuantile {
+        index,
+        name: field.to_string(),
+        ty,
+    })
+}
+
+fn quantile_value(
+    schema: &Schema,
+    spec: &ResolvedQuantile,
+    ts: i64,
+    row: usize,
+    captures: &[CapturedColumn],
+) -> Result<Scalar> {
+    if let Some(slot) = captures.iter().find(|column| column.index == spec.index) {
+        if !slot.values.is_empty() {
+            return slot
+                .values
+                .get(row)
+                .cloned()
+                .ok_or_else(|| Error::corrupt(format!("field `{}` is missing a row", spec.name)));
+        }
+    }
+    if spec.index == schema.timestamp_index {
+        return Ok(Scalar::Timestamp(ts));
+    }
+    Err(Error::corrupt(format!(
+        "field `{}` was not decoded",
+        spec.name
+    )))
+}
+
+enum QuantileSamples {
+    Int(Vec<i64>),
+    Timestamp(Vec<i64>),
+    Decimal(Vec<i128>),
+    Float(Vec<f64>),
+}
+
+impl QuantileSamples {
+    fn new(ty: FieldType) -> Self {
+        match ty {
+            FieldType::Int => Self::Int(Vec::new()),
+            FieldType::Timestamp => Self::Timestamp(Vec::new()),
+            FieldType::Decimal { .. } => Self::Decimal(Vec::new()),
+            FieldType::Float => Self::Float(Vec::new()),
+            _ => Self::Int(Vec::new()),
+        }
+    }
+
+    fn push(&mut self, value: Scalar) -> Result<()> {
+        match (self, value) {
+            (_, Scalar::Null) => Ok(()),
+            (Self::Int(samples), Scalar::Int(value)) => push_sample(samples, value),
+            (Self::Timestamp(samples), Scalar::Timestamp(value)) => push_sample(samples, value),
+            (Self::Decimal(samples), Scalar::Decimal(value)) => push_sample(samples, value),
+            (Self::Float(samples), Scalar::Float(value)) => {
+                if !value.is_finite() {
+                    return Err(Error::corrupt("quantile float is not finite"));
+                }
+                push_sample(samples, value)
+            }
+            _ => Err(Error::corrupt(
+                "quantile value does not match its column type",
+            )),
+        }
+    }
+
+    fn finish(self, p: QuantileP) -> Result<Option<Scalar>> {
+        let n = match &self {
+            Self::Int(samples) => samples.len(),
+            Self::Timestamp(samples) => samples.len(),
+            Self::Decimal(samples) => samples.len(),
+            Self::Float(samples) => samples.len(),
+        };
+        let Some(index) = quantile_rank(p, n) else {
+            return Ok(None);
+        };
+        let value = match self {
+            Self::Int(mut samples) => {
+                samples.sort_unstable();
+                Scalar::Int(samples[index])
+            }
+            Self::Timestamp(mut samples) => {
+                samples.sort_unstable();
+                Scalar::Timestamp(samples[index])
+            }
+            Self::Decimal(mut samples) => {
+                samples.sort_unstable();
+                Scalar::Decimal(samples[index])
+            }
+            Self::Float(mut samples) => {
+                samples.sort_unstable_by(|left, right| left.total_cmp(right));
+                Scalar::Float(samples[index])
+            }
+        };
+        Ok(Some(value))
+    }
+}
+
+fn push_sample<T>(samples: &mut Vec<T>, value: T) -> Result<()> {
+    if samples.len() >= MAX_QUERY_ROWS {
+        return Err(Error::event("query row limit exceeded"));
+    }
+    retain_sample_bytes(samples.len(), std::mem::size_of::<T>())?;
+    samples.push(value);
+    Ok(())
+}
+
+fn retain_sample_bytes(len: usize, width: usize) -> Result<()> {
+    let retained = len
+        .checked_mul(width)
+        .ok_or_else(|| Error::event("query response size limit exceeded"))?;
+    if width > MAX_QUERY_BYTES.saturating_sub(retained) {
+        return Err(Error::event("query response size limit exceeded"));
+    }
+    Ok(())
 }
 
 fn resolve_group_field(schema: &Schema, by: &str) -> Result<ResolvedGroup> {
@@ -2361,6 +2761,20 @@ fn group_key_from_row(
             .ok_or_else(|| Error::corrupt(format!("field `{}` is missing a row", group.name)))?
     };
     group_key_from_scalar(group, scalar)
+}
+
+/// One float `sum`, nothing else, and no row predicate. The column index is
+/// the encoded values to add when the block is fully inside the range.
+fn dense_float_sum(stats: &[RunningStat], resolved: &ResolvedScan) -> Option<usize> {
+    if !resolved.unfiltered() || stats.len() != 1 {
+        return None;
+    }
+    let stat = &stats[0];
+    if stat.spec.ty == FieldType::Float && stat.spec.sum && !stat.spec.min && !stat.spec.max {
+        Some(stat.spec.index)
+    } else {
+        None
+    }
 }
 
 fn capture_columns(indexes: impl IntoIterator<Item = usize>) -> Vec<CapturedColumn> {
@@ -7744,6 +8158,145 @@ mod tests {
     }
 
     #[test]
+    fn float_sum_skips_a_row_outside_a_cut_block_and_keeps_extremes() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(2)).unwrap();
+        for (ts, score) in [(1i64, 1e16f64), (2, 0.0), (3, -1e16), (4, 1.0)] {
+            store
+                .append_json(&score_event(ts, Some(score), "click"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let summed = store
+            .aggregate_with_filter(1, 4, &[], &[stat_req("score", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            summed[0].sum,
+            Some(StatSum::Float {
+                total: 1.0,
+                contributed: true,
+            })
+        );
+        store.close().unwrap();
+
+        let cut_dir = TempDir::new();
+        let schema = write_schema(cut_dir.path());
+        let store =
+            Store::open_with(cut_dir.path().join("data"), &schema, test_options(4)).unwrap();
+        for (ts, score) in [(1i64, 1e16f64), (2, 0.0), (3, -1e16), (4, 1.0)] {
+            store
+                .append_json(&score_event(ts, Some(score), "click"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let cut = store
+            .aggregate_with_filter(3, 4, &[], &[stat_req("score", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            cut[0].sum,
+            Some(StatSum::Float {
+                total: -1e16 + 1.0,
+                contributed: true,
+            })
+        );
+        store.close().unwrap();
+
+        let extremes = TempDir::new();
+        let schema = write_schema(extremes.path());
+        let store =
+            Store::open_with(extremes.path().join("data"), &schema, test_options(128)).unwrap();
+        for i in 0..100 {
+            let score = (i % 100) as f64 / 10.0;
+            store
+                .append_json(&score_event(i, Some(score), "view"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let both = store
+            .aggregate_with_filter(0, 99, &[], &[stat_req("score", true, true, true)])
+            .unwrap();
+        assert_eq!(both[0].min, Some(Some(Scalar::Float(0.0))));
+        assert_eq!(both[0].max, Some(Some(Scalar::Float(9.9))));
+        let mut expected = 0.0;
+        for i in 0..100 {
+            expected += (i % 100) as f64 / 10.0;
+        }
+        match both[0].sum.unwrap() {
+            StatSum::Float { total, contributed } => {
+                assert!(contributed);
+                assert_eq!(total.to_bits(), expected.to_bits());
+            }
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        let only = store
+            .aggregate_with_filter(0, 99, &[], &[stat_req("score", true, false, false)])
+            .unwrap();
+        match only[0].sum.unwrap() {
+            StatSum::Float { total, contributed } => {
+                assert!(contributed);
+                assert_eq!(total.to_bits(), expected.to_bits());
+            }
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        assert!(only[0].min.is_none());
+        assert!(only[0].max.is_none());
+
+        let with_null = TempDir::new();
+        let schema = write_schema(with_null.path());
+        let store =
+            Store::open_with(with_null.path().join("data"), &schema, test_options(4)).unwrap();
+        store
+            .append_json(&score_event(10, Some(1.0), "click"))
+            .unwrap();
+        store.append_json(&score_event(20, None, "click")).unwrap();
+        store
+            .append_json(&score_event(30, Some(2.5), "buy"))
+            .unwrap();
+        store.flush().unwrap();
+        let nullable = store
+            .aggregate_with_filter(10, 30, &[], &[stat_req("score", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            nullable[0].sum,
+            Some(StatSum::Float {
+                total: 3.5,
+                contributed: true,
+            })
+        );
+        let clicks = store
+            .aggregate_with_filter(
+                10,
+                30,
+                &[Predicate::Eq("action".into(), "click".into())],
+                &[stat_req("score", true, false, false)],
+            )
+            .unwrap();
+        assert_eq!(
+            clicks[0].sum,
+            Some(StatSum::Float {
+                total: 1.0,
+                contributed: true,
+            })
+        );
+        store.close().unwrap();
+    }
+
+    fn score_event(ts: i64, score: Option<f64>, action: &str) -> Vec<u8> {
+        let mut obj = serde_json::json!({
+            "ts": ts,
+            "user_id": 1,
+            "ok": true,
+            "action": action,
+            "amount": "1.00",
+        });
+        if let Some(score) = score {
+            obj["score"] = serde_json::json!(score);
+        }
+        serde_json::to_vec(&obj).unwrap()
+    }
+
+    #[test]
     fn minmax_uses_zone_extremes_only_when_every_timestamp_is_inside() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -8258,6 +8811,263 @@ mod tests {
     }
 
     #[test]
+    fn quantile_rank_matches_the_exact_index() {
+        let rank = |text: &str, n: usize| quantile_rank(parse_quantile_p(text).unwrap(), n);
+        assert_eq!(rank("0", 100_000), Some(0));
+        assert_eq!(rank("0.0", 100_000), Some(0));
+        assert_eq!(rank("0.5", 100_000), Some(50_000));
+        assert_eq!(rank("0.50", 100_000), Some(50_000));
+        assert_eq!(rank("0.95", 100_000), Some(95_000));
+        assert_eq!(rank("1", 100_000), Some(99_999));
+        assert_eq!(rank("1.0", 100_000), Some(99_999));
+        assert_eq!(rank("1.000", 4), Some(3));
+        assert_eq!(rank("0.1", 10), Some(1));
+        assert_eq!(rank("0.1", 3), Some(0));
+        assert_eq!(rank(".5", 2), Some(1));
+        assert_eq!(rank("0", 0), None);
+        assert!(parse_quantile_p("1.1").is_err());
+        assert!(parse_quantile_p("-0.1").is_err());
+        assert!(parse_quantile_p("2").is_err());
+        assert!(parse_quantile_p("0.95e0").is_err());
+        assert!(parse_quantile_p("").is_err());
+        let almost = parse_quantile_p(&format!("0.{}", "9".repeat(38))).unwrap();
+        assert_eq!(quantile_rank(almost, usize::MAX), Some(usize::MAX - 1));
+    }
+
+    #[test]
+    fn quantile_refuses_samples_past_the_query_byte_ceiling() {
+        let width = std::mem::size_of::<i64>();
+        let fit = MAX_QUERY_BYTES / width;
+        retain_sample_bytes(fit, width).unwrap_err();
+        retain_sample_bytes(fit - 1, width).unwrap();
+
+        let width = std::mem::size_of::<i128>();
+        let fit = MAX_QUERY_BYTES / width;
+        let overflow = retain_sample_bytes(fit, width);
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("query response size limit exceeded")),
+            "{overflow:?}"
+        );
+        retain_sample_bytes(fit - 1, width).unwrap();
+    }
+
+    #[test]
+    fn quantile_refuses_samples_past_the_query_row_ceiling() {
+        let mut ints = QuantileSamples::new(FieldType::Int);
+        for value in 0..MAX_QUERY_ROWS as i64 {
+            ints.push(Scalar::Int(value)).unwrap();
+        }
+        let overflow = ints.push(Scalar::Int(0));
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("query row limit exceeded")),
+            "{overflow:?}"
+        );
+    }
+
+    #[test]
+    fn quantile_skips_nulls_outside_rows_and_rejected_blocks() {
+        let level = |text: &str| parse_quantile_p(text).unwrap();
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(8)).unwrap();
+        for (ts, user, score, amount) in [
+            (1000i64, Some(1i64), 5.0, "1.50"),
+            (2000, Some(5), 0.0, "9.00"),
+            (3000, Some(9), 6.0, "2.25"),
+        ] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "score": score,
+                "ok": true,
+                "action": "buy",
+                "amount": amount,
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        let null_score = serde_json::json!({
+            "ts": 2500,
+            "user_id": 4,
+            "ok": false,
+            "action": "other",
+            "amount": "4.00",
+        });
+        store
+            .append_json(&serde_json::to_vec(&null_score).unwrap())
+            .unwrap();
+        store.flush().unwrap();
+
+        let score = |from, to, p: &str| {
+            store
+                .quantile_with_filter(from, to, &[], "score", level(p))
+                .unwrap()
+        };
+        assert_eq!(score(1000, 3000, "0"), Some(Scalar::Float(0.0)));
+        assert_eq!(score(1000, 3000, "0.5"), Some(Scalar::Float(5.0)));
+        assert_eq!(score(1000, 3000, "1"), Some(Scalar::Float(6.0)));
+        assert_eq!(score(1000, 1000, "1"), Some(Scalar::Float(5.0)));
+        assert_eq!(score(9000, 9000, "0.5"), None);
+        assert_eq!(
+            store
+                .quantile_with_filter(2500, 2500, &[], "score", level("1"))
+                .unwrap(),
+            None,
+            "a null score is not a sample"
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(1000, 3000, &[], "user_id", level("0"))
+                .unwrap(),
+            Some(Scalar::Int(1))
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(1000, 3000, &[], "user_id", level("1"))
+                .unwrap(),
+            Some(Scalar::Int(9))
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(1000, 2000, &[], "ts", level("1"))
+                .unwrap(),
+            Some(Scalar::Timestamp(2000))
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(1000, 3000, &[], "amount", level("0"))
+                .unwrap(),
+            Some(Scalar::Decimal(150))
+        );
+        let below =
+            crate::value::scalar_from_literal(FieldType::Decimal { scale: 2 }, "3.00").unwrap();
+        assert_eq!(
+            store
+                .quantile_with_filter(
+                    1000,
+                    3000,
+                    &[Predicate::Cmp("amount".into(), CmpOp::Lt, below)],
+                    "amount",
+                    level("1"),
+                )
+                .unwrap(),
+            Some(Scalar::Decimal(225))
+        );
+        assert!(matches!(
+            store.quantile_with_filter(0, 10, &[], "action", level("0.5")),
+            Err(Error::Schema(_))
+        ));
+        assert!(matches!(
+            store.quantile_with_filter(0, 10, &[], "missing", level("0.5")),
+            Err(Error::Schema(_))
+        ));
+        assert!(matches!(
+            store.quantile_with_filter(0, 10, &[], "", level("0.5")),
+            Err(Error::Event(_))
+        ));
+
+        let copies = 10usize;
+        for index in 0..(copies * 100) {
+            let score = (index % 100) as f64 / 10.0;
+            let obj = serde_json::json!({
+                "ts": 10_000 + index as i64,
+                "user_id": 1,
+                "score": score,
+                "ok": true,
+                "action": "view",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let tenths = |p: &str| {
+            store
+                .quantile_with_filter(
+                    10_000,
+                    10_000 + (copies * 100) as i64,
+                    &[],
+                    "score",
+                    level(p),
+                )
+                .unwrap()
+        };
+        assert_eq!(tenths("0"), Some(Scalar::Float(0.0)));
+        assert_eq!(tenths("0.5"), Some(Scalar::Float(5.0)));
+        assert_eq!(tenths("0.95"), Some(Scalar::Float(9.5)));
+        assert_eq!(tenths("1"), Some(Scalar::Float(9.9)));
+        store.close().unwrap();
+
+        let low_dir = TempDir::new();
+        let schema = write_schema(low_dir.path());
+        let data = low_dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, user, score) in [
+            (10i64, 1i64, 1.0),
+            (11, 2, 2.0),
+            (20, 10, 8.0),
+            (21, 11, 9.0),
+        ] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let gt = [Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(5))];
+        let resolved = resolve_predicates(store.schema(), &gt).unwrap();
+        assert_eq!(store.blocks_in_range(0, 100, &resolved).len(), 1);
+        let victim = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.max_ts <= 11)
+            .cloned()
+            .unwrap();
+        let outside = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.min_ts >= 20)
+            .cloned()
+            .unwrap();
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[victim.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 100, &gt, "score", level("0"))
+                .unwrap(),
+            Some(Scalar::Float(8.0))
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 100, &gt, "score", level("1"))
+                .unwrap(),
+            Some(Scalar::Float(9.0))
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(outside.min_ts, outside.max_ts, &[], "user_id", level("0"))
+                .unwrap(),
+            Some(Scalar::Int(10))
+        );
+        assert!(store
+            .quantile_with_filter(victim.min_ts, victim.max_ts, &[], "user_id", level("0"))
+            .is_err());
+        store.close().unwrap();
+    }
+
+    #[test]
     fn latest_keeps_the_newest_row_and_orders_keys_like_grouped_stats() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -8517,6 +9327,7 @@ mod tests {
         assert!(matches!(unread, Err(Error::Schema(_))), "{unread:?}");
         store.close().unwrap();
     }
+
 
     #[test]
     fn distinct_count_ignores_nulls_and_rows_outside_the_range() {

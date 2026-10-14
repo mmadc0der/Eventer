@@ -24,14 +24,21 @@
 //! the same rows with only the requested fields. A column that is neither
 //! selected nor needed by a filter stays compressed.
 //! [`Store::histogram_with_filter`](store::Store::histogram_with_filter) counts
-//! the same rows into fixed epoch-aligned time buckets.
+//! the same rows into fixed epoch-aligned time buckets. A constant or positive
+//! non-wrapping timestamp stride with no nulls, and with both endpoints inside
+//! the range, fills those buckets from the column header.
 //! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums
 //! and finds the minimum and maximum of numeric columns over that same filtered
-//! window, without building the rows. `min` and `max` with no `sum` and no row
-//! predicate take int, decimal, and float extremes from the zone when every
-//! payload timestamp in the block is inside the range.
+//! window, without building the rows. One float sum with no minimum, maximum,
+//! or row predicate adds a fully contained block from the encoded column.
+//! `min` and `max` with no `sum` and no row predicate take int, decimal, and
+//! float extremes from the zone when every payload timestamp in the block is
+//! inside the range.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
+//! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns
+//! one exact rank of a numeric column over that same window. Nulls are left
+//! out of the sample. The encoder and the on-disk files are unchanged.
 //! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
 //! row for each value of one column, in that same key order.
 //! [`Store::distinct_count`](store::Store::distinct_count) counts distinct
@@ -58,8 +65,9 @@ mod zone;
 pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
 pub use store::{
-    CmpOp, ColumnStats, HistogramBucket, Predicate, RewriteReport, StatGroup, StatRequest, StatSum,
-    Stats, Store, StoreOptions, StoredBytes, MAX_DISTINCT_VALUES, MAX_HISTOGRAM_BUCKETS,
+    parse_quantile_p, CmpOp, ColumnStats, HistogramBucket, Predicate, QuantileP, RewriteReport,
+    StatGroup, StatRequest, StatSum, Stats, Store, StoreOptions, StoredBytes, MAX_DISTINCT_VALUES,
+    MAX_HISTOGRAM_BUCKETS,
 };
 pub use value::format_decimal;
 pub use value::{scalar_from_literal, Scalar};
