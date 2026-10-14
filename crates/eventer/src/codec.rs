@@ -2155,6 +2155,173 @@ pub(crate) fn timestamp_column_span(
     Err(Error::corrupt("timestamp column is missing"))
 }
 
+/// Add one null-free int, timestamp, or decimal column into `total`.
+///
+/// `Ok(None)` leaves `total` unchanged: the column is missing, has a null, or
+/// is bit-packed or a frame of reference. `Ok(Some(true))` means one or more
+/// values were added. A constant whose product fits is one add of `value * n`.
+/// When that product does not fit, the same value is added once per row. A
+/// stride or a stride piece is the wrapped steps in row order, the same
+/// arithmetic [`decode_i64s`] uses. Overflow is the event error from adding
+/// those values one by one.
+pub(crate) fn try_accumulate_exact_sum(
+    schema: &Schema,
+    bytes: &[u8],
+    column: usize,
+    name: &str,
+    total: &mut i128,
+) -> Result<Option<bool>> {
+    let nrows = block_row_count(bytes)?;
+    if nrows == 0 {
+        return Ok(Some(false));
+    }
+    let Some(field) = schema.fields.get(column) else {
+        return Err(Error::corrupt("stat column is missing"));
+    };
+    let width = match field.ty {
+        FieldType::Int | FieldType::Timestamp => 8,
+        FieldType::Decimal { .. } => 16,
+        _ => return Ok(None),
+    };
+    let mut cursor = 4usize;
+    for (index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            return Ok(None);
+        }
+        if index == column {
+            let flags = *bytes
+                .get(cursor)
+                .ok_or_else(|| Error::corrupt("truncated null flag"))?;
+            if flags != 0 {
+                return Ok(None);
+            }
+            cursor += 1;
+            return accumulate_integer_body(bytes, &mut cursor, nrows, width, name, total);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Ok(None)
+}
+
+fn sum_overflow(name: &str) -> Error {
+    Error::event(format!("sum of `{name}` overflowed"))
+}
+
+fn accumulate_integer_body(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    width: usize,
+    name: &str,
+    total: &mut i128,
+) -> Result<Option<bool>> {
+    if count == 0 {
+        expect_kind(bytes, cursor, KIND_EMPTY)?;
+        return Ok(Some(false));
+    }
+    let kind = read_u8(bytes, cursor)?;
+    if kind == KIND_CONSTANT {
+        let value = if width == 8 {
+            i128::from(read_i64(bytes, cursor)?)
+        } else {
+            read_i128(bytes, cursor)?
+        };
+        let n = i128::try_from(count).map_err(|_| Error::corrupt("column is too long to sum"))?;
+        if let Some(product) = value.checked_mul(n) {
+            *total = total
+                .checked_add(product)
+                .ok_or_else(|| sum_overflow(name))?;
+        } else {
+            for _ in 0..count {
+                *total = total.checked_add(value).ok_or_else(|| sum_overflow(name))?;
+            }
+        }
+        return Ok(Some(true));
+    }
+    if kind == KIND_STRIDE {
+        if width == 8 {
+            let base = read_i64(bytes, cursor)?;
+            let stride = read_i64(bytes, cursor)?;
+            add_i64_run(total, base, stride, count, name)?;
+        } else {
+            let base = read_i128(bytes, cursor)?;
+            let stride = read_i128(bytes, cursor)?;
+            add_i128_run(total, base, stride, count, name)?;
+        }
+        return Ok(Some(true));
+    }
+    if kind == KIND_PIECES {
+        let pieces = read_stride_pieces(bytes, cursor, count, width)?;
+        for (index, piece) in pieces.iter().enumerate() {
+            let end = pieces
+                .get(index + 1)
+                .map(|next| next.start as usize)
+                .unwrap_or(count);
+            let len = end - piece.start as usize;
+            if width == 8 {
+                add_i64_run(total, piece.base as i64, piece.stride as i64, len, name)?;
+            } else {
+                add_i128_run(total, piece.base, piece.stride, len, name)?;
+            }
+        }
+        return Ok(Some(count > 0));
+    }
+    Ok(None)
+}
+
+/// Sum of a non-wrapping i64 run. `None` when the steps wrap, so the caller
+/// adds the wrapped values instead.
+fn i64_series_sum(base: i64, stride: i64, count: usize) -> Option<i128> {
+    if count == 0 {
+        return Some(0);
+    }
+    stride_span(base, stride, count)?;
+    let n = i128::from(u32::try_from(count).ok()?);
+    let pairs = n * (n - 1) / 2;
+    Some(i128::from(base) * n + i128::from(stride) * pairs)
+}
+
+/// True when every partial sum of `count` i64 values stays in range if the
+/// final sum does. The slack is the widest those values can swing.
+fn i64_sum_headroom(total: i128, count: usize) -> bool {
+    let Ok(count) = u32::try_from(count) else {
+        return false;
+    };
+    let slack = i128::from(count) * i128::from(i64::MAX);
+    total.checked_add(slack).is_some() && total.checked_sub(slack).is_some()
+}
+
+fn add_i64_run(total: &mut i128, base: i64, stride: i64, count: usize, name: &str) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    if i64_sum_headroom(*total, count) {
+        if let Some(sum) = i64_series_sum(base, stride, count) {
+            *total = total.checked_add(sum).ok_or_else(|| sum_overflow(name))?;
+            return Ok(());
+        }
+    }
+    for index in 0..count {
+        let value = i128::from(base.wrapping_add((index as i64).wrapping_mul(stride)));
+        *total = total.checked_add(value).ok_or_else(|| sum_overflow(name))?;
+    }
+    Ok(())
+}
+
+fn add_i128_run(
+    total: &mut i128,
+    base: i128,
+    stride: i128,
+    count: usize,
+    name: &str,
+) -> Result<()> {
+    for index in 0..count {
+        let value = base.wrapping_add((index as i128).wrapping_mul(stride));
+        *total = total.checked_add(value).ok_or_else(|| sum_overflow(name))?;
+    }
+    Ok(())
+}
+
 struct I64Span {
     min: i64,
     max: i64,
