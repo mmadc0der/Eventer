@@ -36,6 +36,9 @@
 //! inside the range.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
+//! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns
+//! one exact rank of a numeric column over that same window. Nulls are left
+//! out of the sample. The encoder and the on-disk files are unchanged.
 //! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
 //! row for each value of one column, in that same key order.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
@@ -60,8 +63,9 @@ mod zone;
 pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
 pub use store::{
-    CmpOp, ColumnStats, HistogramBucket, Predicate, RewriteReport, StatGroup, StatRequest, StatSum,
-    Stats, Store, StoreOptions, StoredBytes, MAX_HISTOGRAM_BUCKETS,
+    parse_quantile_p, CmpOp, ColumnStats, HistogramBucket, Predicate, QuantileP, RewriteReport,
+    StatGroup, StatRequest, StatSum, Stats, Store, StoreOptions, StoredBytes,
+    MAX_HISTOGRAM_BUCKETS,
 };
 pub use value::format_decimal;
 pub use value::{scalar_from_literal, Scalar};
