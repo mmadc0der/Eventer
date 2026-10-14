@@ -786,7 +786,14 @@ impl Store {
     /// `bucket_ms` is a positive integer. More than [`MAX_HISTOGRAM_BUCKETS`]
     /// buckets is an error, and no block is read for that call. A block the
     /// sparse index places outside the range is not read. A block the zone map
-    /// can reject is not read. A block with no predicates reads timestamps only.
+    /// can reject is not read. A block with no predicates and no numeric range
+    /// reads the timestamp column only. When that column is a constant or a
+    /// positive stride that does not wrap, it has no nulls, and both encoded
+    /// endpoints sit inside the inclusive range, each run is added to the
+    /// buckets without expanding the column. A negative stride, wrapping
+    /// arithmetic, stride pieces, a bit-packed column, a null, a predicate, or
+    /// a range still walks the rows. A timestamp outside the range is not
+    /// counted. The sparse-index min/max are not that check.
     pub fn histogram_with_filter(
         &self,
         from_ms: i64,
