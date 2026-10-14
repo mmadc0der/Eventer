@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,12 @@ pub const MAX_QUERY_ROWS: usize = 1_000_000;
 
 /// Most buckets one histogram may return. A wider request is rejected before any block is read.
 pub const MAX_HISTOGRAM_BUCKETS: usize = 4096;
+
+/// Most distinct non-null values [`Store::distinct_count`] may count.
+///
+/// One more value is [`Error::Event`](Error::Event) and the caller does not
+/// receive a partial count.
+pub const MAX_DISTINCT_VALUES: usize = 1_000_000;
 
 /// One epoch-aligned bucket of a histogram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,6 +769,86 @@ impl Store {
                 .ok_or_else(|| Error::event("event count overflow"))?;
         }
         Ok(total)
+    }
+
+    /// How many distinct non-null values `field` takes inside the filtered window.
+    ///
+    /// Filters are the same ones [`Store::count_with_filter`] applies. A block
+    /// the sparse index places outside the range is not read. A block the zone
+    /// map can reject is not read. Nulls do not count. No non-null match is
+    /// `0`.
+    ///
+    /// An int, timestamp, decimal, bool, string, or text value uses the same
+    /// equality as a grouped aggregate key. A float uses IEEE-754 bits, so
+    /// `0.0` and `-0.0` are one value when those bits match and two values
+    /// when they do not. A non-finite float is the same corrupt error a float
+    /// sum returns.
+    ///
+    /// More than [`MAX_DISTINCT_VALUES`] distinct values returns
+    /// [`Error::Event`](Error::Event) and no count. An empty name, an unknown
+    /// field, or a json column is an error and does not read the store.
+    pub fn distinct_count(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        predicates: &[Predicate],
+        field: &str,
+    ) -> Result<u64> {
+        let column = resolve_distinct_field(&self.schema, field)?;
+        let Some(resolved) = self.prepare_scan(from_ms, to_ms, predicates)? else {
+            return Ok(0);
+        };
+        let _retention = self.pipeline.lock_for_read();
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+        let mut seen = DistinctSet::new(column.ty);
+        let timestamp_field = column.index == self.schema.timestamp_index;
+        let mut dictionaries = HashMap::new();
+        for block in blocks {
+            if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+                return Err(Error::event("query response size limit exceeded"));
+            }
+            let payload = self.read_block_bytes(
+                &block,
+                &mut dictionaries,
+                segment::BlockLoad {
+                    through_column: Some(needed_column(
+                        &self.schema,
+                        &resolved,
+                        Some(column.index),
+                    )),
+                    columns: None,
+                },
+            )?;
+            let nrows = block_row_count(&payload)?;
+            require_header_row_count(block.row_count, nrows)?;
+            let mut captures = if timestamp_field {
+                Vec::new()
+            } else {
+                capture_columns([column.index])
+            };
+            visit_matching_timestamps(
+                &self.schema,
+                &payload,
+                from_ms,
+                to_ms,
+                &resolved.predicates,
+                &resolved.ranges,
+                &mut captures,
+                |ts, row, captured| {
+                    if timestamp_field {
+                        return seen.note(&column.name, column.ty, &Scalar::Timestamp(ts));
+                    }
+                    let scalar = captured
+                        .first()
+                        .and_then(|slot| slot.values.get(row))
+                        .ok_or_else(|| {
+                            Error::corrupt(format!("field `{}` is missing a row", column.name))
+                        })?;
+                    seen.note(&column.name, column.ty, scalar)
+                },
+            )?;
+        }
+        Ok(seen.len() as u64)
     }
 
     /// Inclusive range histogram. [`Store::histogram_with_filter`] with no predicates.
@@ -1932,6 +2018,150 @@ fn resolve_stat_requests(schema: &Schema, stats: &[StatRequest]) -> Result<Vec<R
         return Err(Error::event("at least one of sum, min, or max is required"));
     }
     Ok(resolved)
+}
+
+struct DistinctColumn {
+    index: usize,
+    name: String,
+    ty: FieldType,
+}
+
+enum DistinctSet {
+    Bool(HashSet<bool>),
+    Int(HashSet<i64>),
+    Timestamp(HashSet<i64>),
+    Decimal(HashSet<i128>),
+    Float(HashSet<u64>),
+    Str(HashSet<String>),
+}
+
+impl DistinctSet {
+    fn new(ty: FieldType) -> Self {
+        match ty {
+            FieldType::Bool => DistinctSet::Bool(HashSet::new()),
+            FieldType::Int => DistinctSet::Int(HashSet::new()),
+            FieldType::Timestamp => DistinctSet::Timestamp(HashSet::new()),
+            FieldType::Decimal { .. } => DistinctSet::Decimal(HashSet::new()),
+            FieldType::Float => DistinctSet::Float(HashSet::new()),
+            FieldType::String | FieldType::Text => DistinctSet::Str(HashSet::new()),
+            FieldType::Json => DistinctSet::Str(HashSet::new()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            DistinctSet::Bool(values) => values.len(),
+            DistinctSet::Int(values) => values.len(),
+            DistinctSet::Timestamp(values) => values.len(),
+            DistinctSet::Decimal(values) => values.len(),
+            DistinctSet::Float(values) => values.len(),
+            DistinctSet::Str(values) => values.len(),
+        }
+    }
+
+    fn note(&mut self, name: &str, ty: FieldType, scalar: &Scalar) -> Result<()> {
+        match (ty, scalar) {
+            (_, Scalar::Null) => Ok(()),
+            (FieldType::Bool, Scalar::Bool(value)) => self.insert_bool(*value),
+            (FieldType::Int, Scalar::Int(value)) => self.insert_int(*value),
+            (FieldType::Timestamp, Scalar::Timestamp(value)) => self.insert_timestamp(*value),
+            (FieldType::Decimal { .. }, Scalar::Decimal(value)) => self.insert_decimal(*value),
+            (FieldType::Float, Scalar::Float(value)) => {
+                if !value.is_finite() {
+                    return Err(Error::corrupt(format!(
+                        "field `{name}` is not a finite float"
+                    )));
+                }
+                self.insert_float(value.to_bits())
+            }
+            (FieldType::String | FieldType::Text, Scalar::Str(value)) => self.insert_str(value),
+            _ => Err(Error::corrupt(format!(
+                "field `{name}` has a value that does not match its type"
+            ))),
+        }
+    }
+
+    fn insert_bool(&mut self, value: bool) -> Result<()> {
+        let DistinctSet::Bool(values) = self else {
+            return Err(Error::corrupt("distinct set does not match the column"));
+        };
+        insert_new(values, value)
+    }
+
+    fn insert_int(&mut self, value: i64) -> Result<()> {
+        let DistinctSet::Int(values) = self else {
+            return Err(Error::corrupt("distinct set does not match the column"));
+        };
+        insert_new(values, value)
+    }
+
+    fn insert_timestamp(&mut self, value: i64) -> Result<()> {
+        let DistinctSet::Timestamp(values) = self else {
+            return Err(Error::corrupt("distinct set does not match the column"));
+        };
+        insert_new(values, value)
+    }
+
+    fn insert_decimal(&mut self, value: i128) -> Result<()> {
+        let DistinctSet::Decimal(values) = self else {
+            return Err(Error::corrupt("distinct set does not match the column"));
+        };
+        insert_new(values, value)
+    }
+
+    fn insert_float(&mut self, bits: u64) -> Result<()> {
+        let DistinctSet::Float(values) = self else {
+            return Err(Error::corrupt("distinct set does not match the column"));
+        };
+        insert_new(values, bits)
+    }
+
+    fn insert_str(&mut self, value: &str) -> Result<()> {
+        let DistinctSet::Str(values) = self else {
+            return Err(Error::corrupt("distinct set does not match the column"));
+        };
+        if values.contains(value) {
+            return Ok(());
+        }
+        if values.len() >= MAX_DISTINCT_VALUES {
+            return Err(Error::event("distinct value limit exceeded"));
+        }
+        values.insert(value.to_owned());
+        Ok(())
+    }
+}
+
+fn insert_new<T: Eq + std::hash::Hash>(values: &mut HashSet<T>, value: T) -> Result<()> {
+    if values.contains(&value) {
+        return Ok(());
+    }
+    if values.len() >= MAX_DISTINCT_VALUES {
+        return Err(Error::event("distinct value limit exceeded"));
+    }
+    values.insert(value);
+    Ok(())
+}
+
+fn resolve_distinct_field(schema: &Schema, field: &str) -> Result<DistinctColumn> {
+    if field.is_empty() {
+        return Err(Error::event("distinct field name is empty"));
+    }
+    let index = schema
+        .fields
+        .iter()
+        .position(|field_def| field_def.name == field)
+        .ok_or_else(|| Error::schema(format!("unknown distinct field `{field}`")))?;
+    let ty = schema.fields[index].ty;
+    if matches!(ty, FieldType::Json) {
+        return Err(Error::schema(format!(
+            "distinct does not apply to json column `{field}`"
+        )));
+    }
+    Ok(DistinctColumn {
+        index,
+        name: field.to_string(),
+        ty,
+    })
 }
 
 fn resolve_group_field(schema: &Schema, by: &str) -> Result<ResolvedGroup> {
@@ -8285,6 +8515,207 @@ mod tests {
         assert_eq!(kept[0]["user_id"], 11);
         let unread = store.latest_json(victim.min_ts, victim.max_ts, &[], "score", None);
         assert!(matches!(unread, Err(Error::Schema(_))), "{unread:?}");
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn distinct_count_ignores_nulls_and_rows_outside_the_range() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(10, Some(1), "click", Some("A"), "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(11, None, "click", Some("a"), "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(20, Some(2), "view", Some("b"), "2.00"))
+            .unwrap();
+        store
+            .append_json(&event(21, Some(2), "buy", None, "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+
+        assert_eq!(store.distinct_count(10, 21, &[], "user_id").unwrap(), 2);
+        assert_eq!(store.distinct_count(10, 11, &[], "user_id").unwrap(), 1);
+        assert_eq!(store.distinct_count(10, 21, &[], "action").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 11, &[], "action").unwrap(), 1);
+        assert_eq!(store.distinct_count(10, 21, &[], "note").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 21, &[], "amount").unwrap(), 2);
+        assert_eq!(store.distinct_count(10, 21, &[], "ok").unwrap(), 2);
+        assert_eq!(store.distinct_count(10, 21, &[], "ts").unwrap(), 4);
+        assert_eq!(store.distinct_count(10, 10, &[], "ts").unwrap(), 1);
+        assert_eq!(store.distinct_count(12, 19, &[], "action").unwrap(), 0);
+        assert_eq!(store.distinct_count(30, 10, &[], "action").unwrap(), 0);
+
+        let clicked = [Predicate::Eq("action".into(), "click".into())];
+        assert_eq!(
+            store.distinct_count(10, 21, &clicked, "user_id").unwrap(),
+            1
+        );
+        let above = [Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(1))];
+        assert_eq!(store.distinct_count(10, 21, &above, "action").unwrap(), 2);
+        assert_eq!(
+            store
+                .distinct_count(
+                    10,
+                    21,
+                    &[Predicate::Eq("action".into(), "missing".into())],
+                    "user_id"
+                )
+                .unwrap(),
+            0
+        );
+
+        let zeros = TempDir::new();
+        let schema = write_schema(zeros.path());
+        let store = Store::open_with(zeros.path().join("data"), &schema, test_options(4)).unwrap();
+        for (ts, score) in [(1i64, "0.0"), (2, "-0.0"), (3, "0"), (4, "1.5")] {
+            store
+                .append_json(
+                    format!(
+                        r#"{{"ts":{ts},"user_id":1,"score":{score},"ok":true,"action":"click","amount":"1.00"}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(
+            store.distinct_count(1, 4, &[], "score").unwrap(),
+            3,
+            "+0.0 and -0.0 are different bits; the integer lexeme 0 is +0.0"
+        );
+        assert_eq!(store.distinct_count(1, 1, &[], "score").unwrap(), 1);
+
+        let mut row = value::parse_event(
+            store.schema(),
+            br#"{"ts":5,"user_id":1,"score":1.0,"ok":true,"action":"click","amount":"1.00"}"#,
+        )
+        .unwrap();
+        row.values[2] = Scalar::Float(f64::NAN);
+        store.pipeline.append_row(row).unwrap();
+        store.flush().unwrap();
+        let err = store.distinct_count(5, 5, &[], "score").unwrap_err();
+        assert!(
+            matches!(err, Error::Corrupt(_)) && err.to_string().contains("not finite"),
+            "{err}"
+        );
+        assert_eq!(store.distinct_count(1, 4, &[], "score").unwrap(), 3);
+        let overlap = store.distinct_count(1, 5, &[], "score").unwrap_err();
+        assert!(
+            matches!(overlap, Error::Corrupt(_)) && overlap.to_string().contains("not finite"),
+            "{overlap}"
+        );
+        store.close().unwrap();
+
+        let skipped = TempDir::new();
+        let schema = write_schema(skipped.path());
+        let data = skipped.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, user, action) in [
+            (10i64, 1i64, "low"),
+            (11, 2, "low"),
+            (20, 10, "high"),
+            (21, 11, "high"),
+        ] {
+            store
+                .append_json(&event(ts, Some(user), action, None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let gt = [Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(5))];
+        let resolved = resolve_predicates(store.schema(), &gt).unwrap();
+        assert_eq!(store.blocks_in_range(0, 100, &resolved).len(), 1);
+        let victim = store.catalog().segments[0]
+            .blocks
+            .iter()
+            .find(|block| block.max_ts <= 11)
+            .cloned()
+            .unwrap();
+        let path = segment::data_path(&data, victim.segment_id);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[victim.offset as usize + segment::BLOCK_HEADER_LEN + 4] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(store.distinct_count(0, 100, &gt, "action").unwrap(), 1);
+        assert_eq!(store.distinct_count(20, 21, &[], "user_id").unwrap(), 2);
+        let unread = store.distinct_count(0, 100, &[], "props");
+        assert!(matches!(unread, Err(Error::Schema(_))), "{unread:?}");
+        let empty_name = store.distinct_count(0, 100, &[], "");
+        assert!(matches!(empty_name, Err(Error::Event(_))), "{empty_name:?}");
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn stock_events_have_the_distinct_counts_of_the_bench() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(2048)).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        let notes = ["landing", "checkout", "search", ""];
+        let count = 100_000usize;
+        for i in 0..count {
+            let ts = 1_700_000_000_000i64 + i as i64 * 10;
+            let amount_cents = (i % 5_000) as i64;
+            let amount = format!("{}.{:02}", amount_cents / 100, amount_cents % 100);
+            let note = notes[i % notes.len()];
+            let mut value = serde_json::json!({
+                "ts": ts,
+                "user_id": (i % 1_000) as i64,
+                "score": (i % 100) as f64 / 10.0,
+                "ok": i % 2 == 0,
+                "action": actions[i % actions.len()],
+                "amount": amount,
+            });
+            if !note.is_empty() {
+                value["note"] = serde_json::json!(note);
+            }
+            store
+                .append_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let start = 1_700_000_000_000i64;
+        let end = start + (count as i64 - 1) * 10;
+        assert_eq!(
+            store.distinct_count(start, end, &[], "user_id").unwrap(),
+            1000
+        );
+        assert_eq!(store.distinct_count(start, end, &[], "action").unwrap(), 4);
+        assert_eq!(store.distinct_count(start, end, &[], "score").unwrap(), 100);
+        assert_eq!(
+            store.distinct_count(start, start, &[], "user_id").unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .distinct_count(start + 1, start + 1, &[], "action")
+                .unwrap(),
+            0
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn distinct_count_stops_past_one_million_values() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8192)).unwrap();
+        for id in 0..=1_000_000i64 {
+            store
+                .append_json(&event(id, Some(id), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let capped = store.distinct_count(0, 999_999, &[], "user_id").unwrap();
+        assert_eq!(capped, 1_000_000);
+        let overflow = store.distinct_count(0, 1_000_000, &[], "user_id");
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message == "distinct value limit exceeded"),
+            "{overflow:?}"
+        );
         store.close().unwrap();
     }
 }

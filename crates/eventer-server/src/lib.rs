@@ -19,6 +19,8 @@
 //! splits that result into one group per value of a single column.
 //! `GET /events/latest?by=field` returns the newest matching row for each value
 //! of that column, in the same key order.
+//! `GET /events/distinct?field=` returns how many distinct non-null values that
+//! column takes in the same filtered window.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
 //! with the caller's `before_ms`. The request `Content-Type` must be
 //! `application/json`, with an optional `charset=utf-8`. A block is removed
@@ -47,6 +49,7 @@ pub fn router(store: Arc<eventer::Store>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/events/count", get(count_events))
+        .route("/events/distinct", get(distinct_events))
         .route("/events/histogram", get(histogram_events))
         .route("/events/stats", get(stats_events))
         .route("/events/latest", get(latest_events))
@@ -116,7 +119,9 @@ async fn post_drop(
     body: Bytes,
 ) -> Response {
     let raw_query = raw.as_deref().unwrap_or("");
-    if let Err(response) = reject_named_params(raw_query, "/events/drop", &["by", "latest"]) {
+    if let Err(response) =
+        reject_named_params(raw_query, "/events/drop", &["by", "latest", "distinct"])
+    {
         return *response;
     }
     if let Err(response) = reject_select(raw_query, "/events/drop") {
@@ -217,7 +222,8 @@ async fn get_events(
         Err(response) => return *response,
     };
     let raw_query = raw.as_deref().unwrap_or("");
-    if let Err(response) = reject_named_params(raw_query, "/events", &["by", "latest"]) {
+    if let Err(response) = reject_named_params(raw_query, "/events", &["by", "latest", "distinct"])
+    {
         return *response;
     }
     let (offset, limit) = match page_params(raw_query) {
@@ -260,7 +266,8 @@ async fn count_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
-    if let Err(response) = reject_named_params(raw, "/events/count", &["by", "latest"]) {
+    if let Err(response) = reject_named_params(raw, "/events/count", &["by", "latest", "distinct"])
+    {
         return *response;
     }
     if let Err(response) = reject_page_params(raw, "/events/count") {
@@ -292,13 +299,58 @@ async fn count_events(
     }
 }
 
+async fn distinct_events(
+    State(state): State<AppState>,
+    Query(params): Query<RangeParams>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let raw = raw.as_deref().unwrap_or("");
+    if let Err(response) = reject_distinct_params(raw) {
+        return *response;
+    }
+    let from = match parse_bound(params.from, "from") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let to = match parse_bound(params.to, "to") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let field = match distinct_field(raw) {
+        Ok(field) => field,
+        Err(response) => return *response,
+    };
+    if let Err(response) = reject_distinct_field(state.store.schema(), &field) {
+        return *response;
+    }
+    let predicates = match parse_filters(state.store.schema(), raw) {
+        Ok(predicates) => predicates,
+        Err(response) => return *response,
+    };
+    let store = Arc::clone(&state.store);
+    let joined =
+        tokio::task::spawn_blocking(move || store.distinct_count(from, to, &predicates, &field))
+            .await;
+    match joined {
+        Ok(Ok(count)) => (StatusCode::OK, Json(json!({"count": count}))).into_response(),
+        Ok(Err(err)) => error_response(&err),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "distinct task failed"})),
+        )
+            .into_response(),
+    }
+}
+
 async fn histogram_events(
     State(state): State<AppState>,
     Query(params): Query<RangeParams>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
-    if let Err(response) = reject_named_params(raw, "/events/histogram", &["by", "latest"]) {
+    if let Err(response) =
+        reject_named_params(raw, "/events/histogram", &["by", "latest", "distinct"])
+    {
         return *response;
     }
     if let Err(response) = reject_page_params(raw, "/events/histogram") {
@@ -356,7 +408,7 @@ async fn stats_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
-    if let Err(response) = reject_named_params(raw, "/events/stats", &["latest"]) {
+    if let Err(response) = reject_named_params(raw, "/events/stats", &["latest", "distinct"]) {
         return *response;
     }
     if let Err(response) = reject_stats_params(raw) {
@@ -814,6 +866,77 @@ fn bucket_ms_param(query: &str) -> std::result::Result<i64, Box<Response>> {
         }
     }
     found.ok_or_else(|| bad_request("missing `bucket_ms` query parameter"))
+}
+
+fn reject_distinct_params(query: &str) -> std::result::Result<(), Box<Response>> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = percent_decode(key, "query")?;
+        if !matches!(
+            key.as_str(),
+            "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" | "field"
+        ) {
+            return Err(bad_request(&format!(
+                "`{key}` is not a parameter of /events/distinct"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn distinct_field(query: &str) -> std::result::Result<String, Box<Response>> {
+    let mut found = None;
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, value) = match pair.split_once('=') {
+                Some(pair) => pair,
+                None => {
+                    let key = percent_decode(pair, "query")?;
+                    if key == "field" {
+                        return Err(bad_request("`field` is missing a field name"));
+                    }
+                    continue;
+                }
+            };
+            let key = percent_decode(key, "query")?;
+            if key != "field" {
+                continue;
+            }
+            if found.is_some() {
+                return Err(bad_request("`field` was given more than once"));
+            }
+            let field = percent_decode(value, "field")?;
+            if field.is_empty() {
+                return Err(bad_request("`field` is missing a field name"));
+            }
+            found = Some(field);
+        }
+    }
+    found.ok_or_else(|| bad_request("missing `field` query parameter"))
+}
+
+fn reject_distinct_field(
+    schema: &eventer::Schema,
+    name: &str,
+) -> std::result::Result<(), Box<Response>> {
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(bad_request(&format!("unknown field `{name}`")));
+    };
+    if matches!(field.ty, eventer::FieldType::Json) {
+        return Err(bad_request(&format!(
+            "`field` does not apply to json column `{name}`"
+        )));
+    }
+    Ok(())
 }
 
 fn reject_latest_params(query: &str) -> std::result::Result<(), Box<Response>> {
@@ -3003,6 +3126,148 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{overflow}");
         assert!(!overflow.is_array(), "{overflow}");
         assert!(overflow["error"].as_str().unwrap_or("").contains("4096"));
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn distinct_counts_non_null_values() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-distinct-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "text"},
+                    {"name": "amount", "type": "decimal", "scale": 2},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(2, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        for body in [
+            r#"{"ts":1000,"user_id":1,"score":0.0,"ok":true,"action":"click","note":"A","amount":"1.00","props":{"n":1}}"#,
+            r#"{"ts":2000,"score":-0.0,"ok":true,"action":"click","note":"a","amount":"1.00","props":{"n":2}}"#,
+            r#"{"ts":3000,"user_id":2,"score":1.5,"ok":false,"action":"view","amount":"2.00","props":[1]}"#,
+        ] {
+            let (status, created) = post(&app, body).await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+        }
+
+        let (status, users) =
+            get_json(&app, "/events/distinct?from=1000&to=3000&field=user_id").await;
+        assert_eq!(status, StatusCode::OK, "{users}");
+        assert_eq!(users, json!({"count": 2}));
+        let (status, early) =
+            get_json(&app, "/events/distinct?from=1000&to=2000&field=user_id").await;
+        assert_eq!(status, StatusCode::OK, "{early}");
+        assert_eq!(early["count"], 1);
+        let (status, actions) =
+            get_json(&app, "/events/distinct?from=1000&to=3000&field=action").await;
+        assert_eq!(status, StatusCode::OK, "{actions}");
+        assert_eq!(actions["count"], 2);
+        let (status, scores) =
+            get_json(&app, "/events/distinct?from=1000&to=3000&field=score").await;
+        assert_eq!(status, StatusCode::OK, "{scores}");
+        assert_eq!(scores["count"], 3);
+        let (status, notes) = get_json(&app, "/events/distinct?from=1000&to=3000&field=note").await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes["count"], 2);
+        let (status, amounts) = get_json(
+            &app,
+            "/events/distinct?from=1000&to=3000&field=amount&eq=action=click",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{amounts}");
+        assert_eq!(amounts["count"], 1);
+        let (status, none) =
+            get_json(&app, "/events/distinct?from=9000&to=9000&field=action").await;
+        assert_eq!(status, StatusCode::OK, "{none}");
+        assert_eq!(none, json!({"count": 0}));
+        let (status, ranged) = get_json(
+            &app,
+            "/events/distinct?from=1000&to=3000&field=action&gt=user_id=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ranged}");
+        assert_eq!(ranged["count"], 1);
+
+        for uri in [
+            "/events/distinct?from=1000&to=3000",
+            "/events/distinct?from=1000&to=3000&field=",
+            "/events/distinct?from=1000&to=3000&field",
+            "/events/distinct?from=1000&to=3000&field=missing",
+            "/events/distinct?from=1000&to=3000&field=props",
+            "/events/distinct?from=1000&to=3000&field=action&field=ok",
+            "/events/distinct?from=1000&to=3000&field=action&by=ok",
+            "/events/distinct?from=1000&to=3000&field=action&select=action",
+            "/events/distinct?from=1000&to=3000&field=action&limit=1",
+            "/events/distinct?from=1000&to=3000&field=action&offset=0",
+            "/events/distinct?from=1000&to=3000&field=action&bucket_ms=1",
+            "/events/distinct?from=1000&to=3000&field=action&sum=user_id",
+            "/events/distinct?from=1000&to=3000&field=action&min=user_id",
+            "/events/distinct?from=1000&to=3000&field=action&max=user_id",
+            "/events/distinct?from=1000&to=3000&field=action&quantile=user_id",
+            "/events?from=1000&to=3000&distinct=action",
+            "/events/count?from=1000&to=3000&distinct=action",
+            "/events/histogram?from=1000&to=3000&bucket_ms=1000&distinct=action",
+            "/events/stats?from=1000&to=3000&sum=user_id&distinct=action",
+            "/events/latest?from=1000&to=3000&by=action&distinct=1",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+            assert!(body.get("count").is_none(), "{uri} {body}");
+            assert!(body.get("error").is_some(), "{uri}");
+        }
+        let (status, dropped) =
+            post_json(&app, "/events/drop?distinct=action", r#"{"before_ms":1}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+        assert!(dropped.get("ok").is_none(), "{dropped}");
+        let (status, still) = get_json(&app, "/events/count?from=1000&to=3000").await;
+        assert_eq!(status, StatusCode::OK, "{still}");
+        assert_eq!(still["count"], 3);
+
+        let data = root.join("data");
+        let dat = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("dat"))
+            .unwrap();
+        let mut bytes = fs::read(&dat).unwrap();
+        bytes[16] ^= 0xff;
+        fs::write(&dat, &bytes).unwrap();
+        for uri in [
+            "/events/distinct?from=1000&to=3000&field=props",
+            "/events/distinct?from=1000&to=3000&field=",
+            "/events/distinct?from=1000&to=3000&field=missing",
+            "/events/distinct?from=1000&to=3000&field=action&limit=1",
+            "/events?from=1000&to=3000&distinct=action",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+            let message = body["error"].as_str().unwrap_or("");
+            assert!(!message.contains("corrupt"), "{uri} read the store: {body}");
+            assert!(body.get("count").is_none(), "{uri} {body}");
+        }
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
