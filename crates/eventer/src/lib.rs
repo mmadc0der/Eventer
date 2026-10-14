@@ -17,7 +17,11 @@
 //! a float column stored as the old unknown tag stay unpruned.
 //! [`Store::count_with_filter`](store::Store::count_with_filter) counts those
 //! rows without building the JSON array. A block with no predicates reads
-//! timestamps only. Each column is its own zstd frame when that container is
+//! timestamps only. One string or text equality, with no other predicate and
+//! no numeric range, counts a constant or one dictionary-code period from the
+//! column header when every payload timestamp is inside the range. A null, a
+//! full code vector, raw strings, or a timestamp outside the range still walks
+//! rows. Each column is its own zstd frame when that container is
 //! at most a quarter larger than one frame, so a filter does not decompress
 //! columns after the predicate.
 //! [`Store::query_json_columns`](store::Store::query_json_columns) returns
@@ -31,9 +35,12 @@
 //! and finds the minimum and maximum of numeric columns over that same filtered
 //! window, without building the rows. One float sum with no minimum, maximum,
 //! or row predicate adds a fully contained block from the encoded column.
-//! `min` and `max` with no `sum` and no row predicate take int, decimal, and
-//! float extremes from the zone when every payload timestamp in the block is
-//! inside the range.
+//! One int, timestamp, or decimal `sum`, with no `min`, no `max`, and no row
+//! predicate, adds a null-free constant, stride, or stride pieces from the
+//! column body when every payload timestamp is inside the range. `min` and
+//! `max` with no `sum` and no row predicate take int, decimal, and float
+//! extremes from the zone when every payload timestamp in the block is inside
+//! the range.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
 //! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns

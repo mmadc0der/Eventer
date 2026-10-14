@@ -10,8 +10,8 @@ use crate::codec::{
     accumulate_histogram_filtered, block_row_count, cmp_numeric, count_rows_filtered,
     decode_rows_filtered, decode_rows_included, range_impossible, range_matches,
     read_timestamp_column, read_timestamp_column_included, tighter_lower, tighter_upper,
-    timestamp_column_span, try_add_dense_float, visit_matching_timestamps, CapturedColumn,
-    ColumnPredicate, RangeEnd, RangeFilter,
+    timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float,
+    visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd, RangeFilter,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -733,8 +733,19 @@ impl Store {
     /// unread. `gt` needs a minimum strictly above the bound. `ge` needs a
     /// minimum greater than or equal to it. `lt` and `le` use the maximum the
     /// same way. A null flag, tag `0`, or a bound the zone does not cover still
-    /// decodes. Equality is not a proof, so it still reads the column. The
-    /// histogram path does not use this shortcut.
+    /// decodes. An equality on a numeric or json column still reads that column.
+    /// The histogram path does not use this shortcut.
+    ///
+    /// One equality on a string or text column, with no other predicate and no
+    /// numeric range, is counted from the column header when every payload
+    /// timestamp sits in the inclusive range. A constant string contributes the
+    /// block row count or zero. One period of dictionary codes contributes the
+    /// matches in that period, repeated across the rows, without expanding the
+    /// codes. A null, a full per-row code vector, raw strings, a second
+    /// predicate, a range, or a timestamp outside the range still walks rows.
+    /// The sparse index is not that check. A constant or a positive
+    /// non-wrapping timestamp stride may prove it from its header. Any other
+    /// timestamp encoding still expands.
     pub fn count_with_filter(
         &self,
         from_ms: i64,
@@ -954,8 +965,18 @@ impl Store {
     /// tag `0` and a non-finite float, still decodes that column. The primary
     /// timestamp is taken from the timestamps just read. A payload timestamp
     /// outside the range decodes the stat columns and keeps the in-range rows.
-    /// The sparse index is not that check. A `sum`, a grouped aggregate, or a
-    /// predicate still decodes.
+    /// The sparse index is not that check. A grouped aggregate, or a predicate,
+    /// still decodes.
+    ///
+    /// A request for one int, timestamp, or decimal `sum`, with no `min`, no
+    /// `max`, and no row predicate, reads each surviving block's timestamp
+    /// column. When every payload timestamp is inside the inclusive range and
+    /// the target column has no nulls, a constant, a stride, or stride pieces
+    /// are added in row order into the 128-bit accumulator. Other columns in
+    /// that block are not decoded. A null, a bit-packed or frame-of-reference
+    /// column, a block the timestamp column does not place entirely inside the
+    /// range, or a `min` or `max` keeps the row visitor, including the overflow
+    /// error that visitor already returns. The sparse index is not that check.
     ///
     /// Nulls do not contribute. A column whose matching values are all null, or
     /// a filter that matches nothing, has null `min` and `max` and a zero sum.
@@ -990,6 +1011,7 @@ impl Store {
         let mut running: Vec<RunningStat> = specs.into_iter().map(RunningStat::new).collect();
         let dense_float = dense_float_sum(&running, &resolved);
         let minmax_only = running.iter().all(|stat| !stat.spec.sum);
+        let exact_sum_only = exact_sum_request(&running);
         let mut dictionaries = HashMap::new();
         if minmax_only && resolved.unfiltered() {
             let blocks = self.prepare_minmax_blocks(from_ms, to_ms, &running);
@@ -997,6 +1019,17 @@ impl Store {
                 self.absorb_minmax_block(
                     &block,
                     &columns,
+                    &mut dictionaries,
+                    from_ms,
+                    to_ms,
+                    &mut running,
+                )?;
+            }
+        } else if exact_sum_only && resolved.unfiltered() {
+            let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+            for block in blocks {
+                self.absorb_exact_sum_block(
+                    &block,
                     &mut dictionaries,
                     from_ms,
                     to_ms,
@@ -1755,31 +1788,54 @@ impl Store {
         )?;
         let nrows = block_row_count(&payload)?;
         require_header_row_count(block.row_count, nrows)?;
-        let mut captures = capture_columns(
-            running
-                .iter()
-                .map(|stat| stat.spec.index)
-                .filter(|index| selected(*index)),
-        );
-        visit_matching_timestamps(
-            &self.schema,
-            &payload,
-            from_ms,
-            to_ms,
-            &[],
-            &[],
-            &mut captures,
-            |ts, row, captured| {
-                for stat in running.iter_mut() {
-                    if !selected(stat.spec.index) {
-                        continue;
-                    }
-                    let value = stat_value(&self.schema, stat, ts, row, captured)?;
-                    stat.absorb(value)?;
+        fold_stat_payload(&self.schema, &payload, from_ms, to_ms, running, only)
+    }
+
+    /// One exact `sum` and no row predicate.
+    ///
+    /// The timestamp column decides whether the block is fully inside the
+    /// range. A constant, stride, or stride pieces then update the accumulator.
+    /// Anything else uses the row visitor on this same block.
+    fn absorb_exact_sum_block(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        from_ms: i64,
+        to_ms: i64,
+        running: &mut [RunningStat],
+    ) -> Result<()> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let index = running[0].spec.index;
+        let through = self.schema.timestamp_index.max(index);
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(through),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        let Some(span) = timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? else {
+            return Ok(());
+        };
+        if !span.inside {
+            return fold_stat_payload(&self.schema, &payload, from_ms, to_ms, running, None);
+        }
+        let name = running[0].spec.name.clone();
+        match try_accumulate_exact_sum(&self.schema, &payload, index, &name, &mut running[0].exact)?
+        {
+            Some(contributed) => {
+                if contributed {
+                    running[0].contributed = true;
                 }
                 Ok(())
-            },
-        )
+            }
+            None => fold_stat_payload(&self.schema, &payload, from_ms, to_ms, running, None),
+        }
     }
 
     fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
@@ -2003,6 +2059,58 @@ enum ZoneMinMax {
         min: Scalar,
         max: Scalar,
     },
+}
+
+/// Fold rows already loaded. `only` limits the fold the way
+/// [`Store::absorb_decoded_stats`] does after it reads the block.
+fn fold_stat_payload(
+    schema: &Schema,
+    payload: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    running: &mut [RunningStat],
+    only: Option<&[usize]>,
+) -> Result<()> {
+    let selected = |index: usize| only.is_none_or(|indexes| indexes.contains(&index));
+    let mut captures = capture_columns(
+        running
+            .iter()
+            .map(|stat| stat.spec.index)
+            .filter(|index| selected(*index)),
+    );
+    visit_matching_timestamps(
+        schema,
+        payload,
+        from_ms,
+        to_ms,
+        &[],
+        &[],
+        &mut captures,
+        |ts, row, captured| {
+            for stat in running.iter_mut() {
+                if !selected(stat.spec.index) {
+                    continue;
+                }
+                let value = stat_value(schema, stat, ts, row, captured)?;
+                stat.absorb(value)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// One int, timestamp, or decimal `sum`, with no `min` and no `max`.
+fn exact_sum_request(running: &[RunningStat]) -> bool {
+    let [stat] = running else {
+        return false;
+    };
+    stat.spec.sum
+        && !stat.spec.min
+        && !stat.spec.max
+        && matches!(
+            stat.spec.ty,
+            FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. }
+        )
 }
 
 /// Int, decimal, and finite float extremes. Anything else, including tag `0`
@@ -5926,6 +6034,88 @@ mod tests {
     }
 
     #[test]
+    fn count_reads_one_string_period_and_still_walks_a_cut() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        for i in 0..8i64 {
+            let mut obj = serde_json::json!({
+                "ts": i * 10,
+                "user_id": i,
+                "score": 1.0,
+                "ok": i != 0,
+                "action": actions[i as usize % actions.len()],
+                "amount": "1.00",
+            });
+            if i % 4 != 3 {
+                obj["note"] = serde_json::json!(["landing", "checkout", "search"][i as usize % 3]);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 1);
+
+        let click = [Predicate::Eq("action".into(), "click".into())];
+        let counted = store.count_with_filter(0, 70, &click).unwrap();
+        let walked = store.query_with_filter(0, 70, &click).unwrap().len() as u64;
+        assert_eq!(counted, 2);
+        assert_eq!(counted, walked);
+        assert_eq!(
+            store
+                .count_with_filter(0, 70, &[Predicate::Eq("action".into(), "missing".into())])
+                .unwrap(),
+            0
+        );
+        let cut = store.count_with_filter(15, 45, &click).unwrap();
+        assert_eq!(cut, 1);
+        assert_eq!(
+            cut,
+            store.query_with_filter(15, 45, &click).unwrap().len() as u64
+        );
+        let both = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+        ];
+        assert_eq!(store.count_with_filter(0, 70, &both).unwrap(), 1);
+        assert_eq!(
+            store.count_with_filter(0, 70, &both).unwrap(),
+            store.query_with_filter(0, 70, &both).unwrap().len() as u64
+        );
+        let ranged = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(4)),
+        ];
+        assert_eq!(store.count_with_filter(0, 70, &ranged).unwrap(), 1);
+        assert_eq!(
+            store
+                .histogram_with_filter(0, 70, 10, &click)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            2
+        );
+
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = 0;
+            block.max_ts = 10;
+        }
+        assert_eq!(
+            store.count_with_filter(0, 10, &click).unwrap(),
+            1,
+            "the sparse index does not prove that every payload timestamp is inside"
+        );
+        assert_eq!(store.count_with_filter(0, 70, &click).unwrap(), 2);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn count_does_not_decode_a_proved_float_slice() {
         let dir = TempDir::new();
         let schema_text = r#"{
@@ -8305,6 +8495,235 @@ mod tests {
     }
 
     #[test]
+    fn exact_sum_adds_stride_pieces_and_keeps_a_cut_block_on_the_visitor() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2048)).unwrap();
+        let mut expected_full = 0i128;
+        let mut expected_cut = 0i128;
+        for i in 0..5000i64 {
+            let user = i % 1000;
+            expected_full += i128::from(user);
+            if (100..=4500).contains(&i) {
+                expected_cut += i128::from(user);
+            }
+            store
+                .append_json(&event(i, Some(user), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let full = store
+            .aggregate_with_filter(0, 4999, &[], &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&full, "user_id"), (expected_full, true));
+        assert_eq!(expected_full, 2_497_500);
+        let cut = store
+            .aggregate_with_filter(100, 4500, &[], &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&cut, "user_id"), (expected_cut, true));
+        let rows = store.query(100, 4500).unwrap();
+        let mut outside = 0i128;
+        for row in &rows {
+            let ts = row_value(&store, row)["ts"].as_i64().unwrap();
+            let user = row_value(&store, row)["user_id"].as_i64().unwrap();
+            assert!((100..=4500).contains(&ts));
+            outside += i128::from(user);
+        }
+        assert_eq!(outside, expected_cut);
+        let extremes = store
+            .aggregate_with_filter(0, 4999, &[], &[stat_req("user_id", true, true, true)])
+            .unwrap();
+        assert_eq!(exact_sum(&extremes, "user_id"), (expected_full, true));
+        assert_eq!(extremes[0].min, Some(Some(Scalar::Int(0))));
+        assert_eq!(extremes[0].max, Some(Some(Scalar::Int(999))));
+        let both = store
+            .aggregate_with_filter(
+                0,
+                4999,
+                &[],
+                &[
+                    stat_req("user_id", true, false, false),
+                    stat_req("ts", true, false, false),
+                ],
+            )
+            .unwrap();
+        assert_eq!(exact_sum(&both, "user_id"), (expected_full, true));
+        let ts_sum = i128::from(4999 * 5000 / 2);
+        assert_eq!(exact_sum(&both, "ts"), (ts_sum, true));
+        let timestamps = store
+            .aggregate_with_filter(0, 4999, &[], &[stat_req("ts", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&timestamps, "ts"), (ts_sum, true));
+        store.close().unwrap();
+
+        let cut_dir = TempDir::new();
+        let schema = write_schema(cut_dir.path());
+        let store =
+            Store::open_with(cut_dir.path().join("data"), &schema, test_options(4)).unwrap();
+        for i in 0..10i64 {
+            store
+                .append_json(&event(i, Some(i), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let partial = store
+            .aggregate_with_filter(2, 5, &[], &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&partial, "user_id"), (2 + 3 + 4 + 5, true));
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            assert_eq!(block.min_ts, 0);
+            block.min_ts = 2;
+            block.max_ts = 5;
+        }
+        let indexed = store
+            .aggregate_with_filter(2, 5, &[], &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            exact_sum(&indexed, "user_id"),
+            (2 + 3 + 4 + 5, true),
+            "the sparse index does not replace the payload timestamps"
+        );
+        store.close().unwrap();
+
+        let nulls = TempDir::new();
+        let schema = write_schema(nulls.path());
+        let store = Store::open_with(nulls.path().join("data"), &schema, test_options(8)).unwrap();
+        store
+            .append_json(&event(1, Some(4), "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(2, None, "click", None, "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(3, Some(6), "click", None, "1.00"))
+            .unwrap();
+        store.flush().unwrap();
+        let skipped = store
+            .aggregate_with_filter(0, 10, &[], &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&skipped, "user_id"), (10, true));
+        store.close().unwrap();
+
+        let amounts = TempDir::new();
+        let schema = write_schema(amounts.path());
+        let store =
+            Store::open_with(amounts.path().join("data"), &schema, test_options(64)).unwrap();
+        let mut cents = 0i128;
+        for i in 0..64i64 {
+            cents += i128::from(i);
+            let amount = format!("{}.{:02}", i / 100, i % 100);
+            store
+                .append_json(&event(i, Some(1), "click", None, &amount))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let summed = store
+            .aggregate_with_filter(0, 63, &[], &[stat_req("amount", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&summed, "amount"), (cents, true));
+        store.close().unwrap();
+
+        let wrapped = TempDir::new();
+        let schema = write_schema(wrapped.path());
+        let store =
+            Store::open_with(wrapped.path().join("data"), &schema, test_options(8)).unwrap();
+        let values = [i64::MAX, i64::MIN, i64::MIN.wrapping_add(1)];
+        let mut wrapped_sum = 0i128;
+        for (index, user) in values.into_iter().enumerate() {
+            wrapped_sum += i128::from(user);
+            store
+                .append_json(&event(index as i64, Some(user), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let summed = store
+            .aggregate_with_filter(0, 10, &[], &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&summed, "user_id"), (wrapped_sum, true));
+        let with_bounds = store
+            .aggregate_with_filter(0, 10, &[], &[stat_req("user_id", true, true, true)])
+            .unwrap();
+        assert_eq!(exact_sum(&with_bounds, "user_id"), (wrapped_sum, true));
+        store.close().unwrap();
+
+        let wide = TempDir::new();
+        let schema_path = wide.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "amount", "type": "decimal", "scale": 0}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let store =
+            Store::open_with(wide.path().join("data"), &schema_path, test_options(8)).unwrap();
+        let huge = i128::MAX.to_string();
+        for (ts, amount) in [(1i64, huge.as_str()), (2, huge.as_str())] {
+            store
+                .append_json(format!(r#"{{"ts":{ts},"amount":"{amount}"}}"#).as_bytes())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let overflow =
+            store.aggregate_with_filter(0, 10, &[], &[stat_req("amount", true, false, false)]);
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("overflow")),
+            "{overflow:?}"
+        );
+        let overflow_bounds =
+            store.aggregate_with_filter(0, 10, &[], &[stat_req("amount", true, true, true)]);
+        assert!(
+            matches!(overflow_bounds, Err(Error::Event(ref message)) if message.contains("overflow")),
+            "{overflow_bounds:?}"
+        );
+        store.close().unwrap();
+
+        let carried = TempDir::new();
+        let schema_path = carried.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "amount", "type": "decimal", "scale": 0}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let store =
+            Store::open_with(carried.path().join("data"), &schema_path, test_options(8)).unwrap();
+        let low = (i128::MIN + 1).to_string();
+        let high = i128::MAX.to_string();
+        store
+            .append_json(format!(r#"{{"ts":1,"amount":"{low}"}}"#).as_bytes())
+            .unwrap();
+        store.flush().unwrap();
+        for ts in [2i64, 3] {
+            store
+                .append_json(format!(r#"{{"ts":{ts},"amount":"{high}"}}"#).as_bytes())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let with_bounds = store
+            .aggregate_with_filter(0, 10, &[], &[stat_req("amount", true, true, true)])
+            .unwrap();
+        assert_eq!(exact_sum(&with_bounds, "amount"), (i128::MAX, true));
+        let alone = store
+            .aggregate_with_filter(0, 10, &[], &[stat_req("amount", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&alone, "amount"), (i128::MAX, true));
+        store.close().unwrap();
+    }
+
+    #[test]
     fn minmax_uses_zone_extremes_only_when_every_timestamp_is_inside() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -9335,8 +9754,6 @@ mod tests {
         assert!(matches!(unread, Err(Error::Schema(_))), "{unread:?}");
         store.close().unwrap();
     }
-
-
     #[test]
     fn distinct_count_ignores_nulls_and_rows_outside_the_range() {
         let dir = TempDir::new();
