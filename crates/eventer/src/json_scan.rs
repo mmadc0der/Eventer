@@ -5,9 +5,8 @@ pub fn validate_json_structure(text: &str) -> Result<()> {
     if text.trim() == "null" {
         return Err(Error::event("json field must not be null"));
     }
-    serde_json::from_str::<Box<serde_json::value::RawValue>>(text).map_err(|err| {
-        Error::event(format!("json field is not valid JSON: {err}"))
-    })?;
+    serde_json::from_str::<Box<serde_json::value::RawValue>>(text)
+        .map_err(|err| Error::event(format!("json field is not valid JSON: {err}")))?;
     Ok(())
 }
 

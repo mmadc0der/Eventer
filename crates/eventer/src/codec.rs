@@ -119,6 +119,21 @@ pub(crate) struct ColumnPredicate {
     pub allowed: Vec<Scalar>,
 }
 
+/// Byte prefix of one string or text column. Several prefixes on the same
+/// column are already reduced to the longest one that implies the others.
+/// A null does not match. An empty prefix is not stored.
+pub(crate) struct PrefixFilter {
+    pub index: usize,
+    pub prefix: String,
+}
+
+fn prefix_at<'a>(prefixes: &'a [PrefixFilter], index: usize) -> Option<&'a str> {
+    prefixes
+        .iter()
+        .find(|prefix| prefix.index == index)
+        .map(|prefix| prefix.prefix.as_str())
+}
+
 /// One end of an ordered comparison. `inclusive` is false for `>` and `<`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RangeEnd {
@@ -235,6 +250,28 @@ pub(crate) fn decode_rows_filtered(
     predicates: &[ColumnPredicate],
     ranges: &[RangeFilter],
 ) -> Result<Vec<Row>> {
+    decode_rows_filtered_with(
+        schema,
+        bytes,
+        from_ms,
+        to_ms,
+        max_string_bytes,
+        predicates,
+        ranges,
+        &[],
+    )
+}
+
+pub(crate) fn decode_rows_filtered_with(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    max_string_bytes: usize,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+    prefixes: &[PrefixFilter],
+) -> Result<Vec<Row>> {
     decode_rows_included(
         schema,
         bytes,
@@ -243,6 +280,7 @@ pub(crate) fn decode_rows_filtered(
         max_string_bytes,
         predicates,
         ranges,
+        prefixes,
         None,
     )
 }
@@ -261,9 +299,10 @@ pub(crate) fn decode_rows_included(
     max_string_bytes: usize,
     predicates: &[ColumnPredicate],
     ranges: &[RangeFilter],
+    prefixes: &[PrefixFilter],
     included: Option<&[bool]>,
 ) -> Result<Vec<Row>> {
-    if included.is_none() && predicates.is_empty() && ranges.is_empty() {
+    if included.is_none() && predicates.is_empty() && ranges.is_empty() && prefixes.is_empty() {
         return decode_rows(schema, bytes, Some((from_ms, to_ms)), max_string_bytes);
     }
     if from_ms > to_ms
@@ -286,7 +325,9 @@ pub(crate) fn decode_rows_included(
             if let Some(predicate) = predicates.iter().find(|pred| pred.index == index) {
                 apply_eq(&mut mask, &nulls, &predicate.allowed);
             }
-            if ranges.iter().any(|range| range.index == index) {
+            if ranges.iter().any(|range| range.index == index)
+                || prefix_at(prefixes, index).is_some()
+            {
                 mask.fill(false);
             }
             columns[index] = Some(nulls);
@@ -304,7 +345,9 @@ pub(crate) fn decode_rows_included(
                 if let Some(predicate) = predicates.iter().find(|pred| pred.index == rest) {
                     apply_eq(&mut mask, &nulls, &predicate.allowed);
                 }
-                if ranges.iter().any(|range| range.index == rest) {
+                if ranges.iter().any(|range| range.index == rest)
+                    || prefix_at(prefixes, rest).is_some()
+                {
                     mask.fill(false);
                 }
                 columns[rest] = Some(nulls);
@@ -313,26 +356,37 @@ pub(crate) fn decode_rows_included(
         }
         let predicate = predicates.iter().find(|pred| pred.index == index);
         let range = ranges.iter().find(|range| range.index == index);
+        let prefix = prefix_at(prefixes, index);
         let is_timestamp = index == schema.timestamp_index;
-        let is_filter = is_timestamp || predicate.is_some() || range.is_some();
+        let is_filter = is_timestamp || predicate.is_some() || range.is_some() || prefix.is_some();
         let filters_remain = (index + 1..schema.fields.len()).any(|later| {
             later == schema.timestamp_index
                 || predicates.iter().any(|pred| pred.index == later)
                 || ranges.iter().any(|range| range.index == later)
+                || prefix_at(prefixes, later).is_some()
         });
 
         if is_filter {
             if is_timestamp && timestamp_range_misses(bytes, cursor, nrows, from_ms, to_ms)? {
                 return finish_empty(schema, bytes, &mut cursor, index, included);
             }
-            if let Some(predicate) = predicate {
+            if predicate.is_some() || prefix.is_some() {
                 if matches!(
                     field.ty,
                     FieldType::String | FieldType::Text | FieldType::Json
                 ) {
                     let spans =
                         read_text_spans(bytes, &mut cursor, nrows, field.ty == FieldType::Json)?;
-                    mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
+                    if let Some(predicate) = predicate {
+                        mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
+                    }
+                    if let Some(prefix) = prefix {
+                        if field.ty == FieldType::Json {
+                            mask.fill(false);
+                        } else {
+                            mask_text_prefix(bytes, &spans, &mut mask, prefix);
+                        }
+                    }
                     if range.is_some() {
                         mask.fill(false);
                     }
@@ -367,6 +421,9 @@ pub(crate) fn decode_rows_included(
                 }
             }
             apply_constraints(&mut mask, &values, predicate, range);
+            if let Some(prefix) = prefix {
+                apply_prefix(&mut mask, &values, prefix);
+            }
             columns[index] = Some(values);
             if !mask.iter().any(|keep| *keep) {
                 return finish_empty(schema, bytes, &mut cursor, index + 1, included);
@@ -542,23 +599,39 @@ pub(crate) fn count_rows_filtered(
     predicates: &[ColumnPredicate],
     ranges: &[RangeFilter],
 ) -> Result<u64> {
-    if let Some(total) =
-        count_one_string_equality(schema, bytes, from_ms, to_ms, predicates, ranges)?
-    {
-        return Ok(total);
-    }
-    if let Some(total) = count_one_bool_equality(schema, bytes, from_ms, to_ms, predicates, ranges)?
-    {
-        return Ok(total);
+    count_rows_filtered_with(schema, bytes, from_ms, to_ms, predicates, ranges, &[])
+}
+
+pub(crate) fn count_rows_filtered_with(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+    prefixes: &[PrefixFilter],
+) -> Result<u64> {
+    if prefixes.is_empty() {
+        if let Some(total) =
+            count_one_string_equality(schema, bytes, from_ms, to_ms, predicates, ranges)?
+        {
+            return Ok(total);
+        }
+        if let Some(total) =
+            count_one_bool_equality(schema, bytes, from_ms, to_ms, predicates, ranges)?
+        {
+            return Ok(total);
+        }
     }
     let mut total = 0u64;
-    visit_matching_timestamps(
+    visit_matching_timestamps_with(
         schema,
         bytes,
         from_ms,
         to_ms,
         predicates,
         ranges,
+        prefixes,
         &mut [],
         |_ts, _row, _captured| {
             total = total
@@ -614,18 +687,45 @@ pub(crate) fn accumulate_histogram_filtered(
     first_start: i128,
     counts: &mut [u64],
 ) -> Result<()> {
-    if predicates.is_empty() && ranges.is_empty() {
-        if let Some(run) = plain_timestamp_run(schema, bytes, from_ms, to_ms)? {
-            return add_timestamp_run(&run, bucket_ms, first_start, counts);
-        }
-    }
-    visit_matching_timestamps(
+    accumulate_histogram_with(
         schema,
         bytes,
         from_ms,
         to_ms,
         predicates,
         ranges,
+        &[],
+        bucket_ms,
+        first_start,
+        counts,
+    )
+}
+
+pub(crate) fn accumulate_histogram_with(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+    prefixes: &[PrefixFilter],
+    bucket_ms: i64,
+    first_start: i128,
+    counts: &mut [u64],
+) -> Result<()> {
+    if predicates.is_empty() && ranges.is_empty() && prefixes.is_empty() {
+        if let Some(run) = plain_timestamp_run(schema, bytes, from_ms, to_ms)? {
+            return add_timestamp_run(&run, bucket_ms, first_start, counts);
+        }
+    }
+    visit_matching_timestamps_with(
+        schema,
+        bytes,
+        from_ms,
+        to_ms,
+        predicates,
+        ranges,
+        prefixes,
         &mut [],
         |ts, _row, _captured| {
             let start = (ts as i128).div_euclid(i128::from(bucket_ms)) * i128::from(bucket_ms);
@@ -1048,6 +1148,30 @@ pub(crate) fn visit_matching_timestamps(
     predicates: &[ColumnPredicate],
     ranges: &[RangeFilter],
     captures: &mut [CapturedColumn],
+    visit: impl FnMut(i64, usize, &[CapturedColumn]) -> Result<()>,
+) -> Result<()> {
+    visit_matching_timestamps_with(
+        schema,
+        bytes,
+        from_ms,
+        to_ms,
+        predicates,
+        ranges,
+        &[],
+        captures,
+        visit,
+    )
+}
+
+pub(crate) fn visit_matching_timestamps_with(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+    prefixes: &[PrefixFilter],
+    captures: &mut [CapturedColumn],
     mut visit: impl FnMut(i64, usize, &[CapturedColumn]) -> Result<()>,
 ) -> Result<()> {
     if from_ms > to_ms
@@ -1059,7 +1183,7 @@ pub(crate) fn visit_matching_timestamps(
     let capture_other = captures
         .iter()
         .any(|column| column.index != schema.timestamp_index);
-    if predicates.is_empty() && ranges.is_empty() && !capture_other {
+    if predicates.is_empty() && ranges.is_empty() && prefixes.is_empty() && !capture_other {
         let timestamps = read_timestamp_column(schema, bytes)?;
         for (row, ts) in timestamps.into_iter().enumerate() {
             if ts >= from_ms && ts <= to_ms {
@@ -1073,6 +1197,7 @@ pub(crate) fn visit_matching_timestamps(
         .iter()
         .map(|pred| pred.index)
         .chain(ranges.iter().map(|range| range.index))
+        .chain(prefixes.iter().map(|prefix| prefix.index))
         .chain(captures.iter().map(|column| column.index))
         .fold(schema.timestamp_index, usize::max);
     let mut cursor = 4usize;
@@ -1093,7 +1218,9 @@ pub(crate) fn visit_matching_timestamps(
                     let nulls = vec![Scalar::Null; nrows];
                     apply_eq(&mut mask, &nulls, &predicate.allowed);
                 }
-                if ranges.iter().any(|range| range.index == rest) {
+                if ranges.iter().any(|range| range.index == rest)
+                    || prefix_at(prefixes, rest).is_some()
+                {
                     mask.fill(false);
                 }
             }
@@ -1106,20 +1233,29 @@ pub(crate) fn visit_matching_timestamps(
         }
         let predicate = predicates.iter().find(|pred| pred.index == index);
         let range = ranges.iter().find(|range| range.index == index);
+        let prefix = prefix_at(prefixes, index);
         let is_timestamp = index == schema.timestamp_index;
         let capture_here = captures.iter().any(|column| column.index == index);
-        if is_timestamp || predicate.is_some() || range.is_some() || capture_here {
+        if is_timestamp
+            || predicate.is_some()
+            || range.is_some()
+            || capture_here
+            || prefix.is_some()
+        {
             if is_timestamp && timestamp_range_misses(bytes, cursor, nrows, from_ms, to_ms)? {
                 skip_column(field.ty, bytes, &mut cursor, nrows, true)?;
                 mask.fill(false);
                 continue;
             }
             if matches!(field.ty, FieldType::String | FieldType::Text)
-                && (capture_here || predicate.is_some())
+                && (capture_here || predicate.is_some() || prefix.is_some())
             {
                 let spans = read_text_spans(bytes, &mut cursor, nrows, false)?;
                 if let Some(predicate) = predicate {
                     mask_text_spans(bytes, &spans, &mut mask, &predicate.allowed);
+                }
+                if let Some(prefix) = prefix {
+                    mask_text_prefix(bytes, &spans, &mut mask, prefix);
                 }
                 if range.is_some() {
                     mask.fill(false);
@@ -1185,6 +1321,9 @@ pub(crate) fn visit_matching_timestamps(
                 timestamps = Some(column);
             }
             apply_constraints(&mut mask, &values, predicate, range);
+            if let Some(prefix) = prefix {
+                apply_prefix(&mut mask, &values, prefix);
+            }
         } else {
             skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
         }
@@ -3793,6 +3932,43 @@ fn finish_empty(
         return Err(Error::corrupt("block has trailing bytes"));
     }
     Ok(Vec::new())
+}
+
+fn apply_prefix(mask: &mut [bool], values: &[Scalar], prefix: &str) {
+    let needle = prefix.as_bytes();
+    for (row, value) in values.iter().enumerate() {
+        if !mask[row] {
+            continue;
+        }
+        let keep = match value {
+            Scalar::Str(text) => text.as_bytes().starts_with(needle),
+            _ => false,
+        };
+        if !keep {
+            mask[row] = false;
+        }
+    }
+}
+
+fn mask_text_prefix(
+    bytes: &[u8],
+    spans: &[Option<(usize, usize)>],
+    mask: &mut [bool],
+    prefix: &str,
+) {
+    let needle = prefix.as_bytes();
+    for (row, span) in spans.iter().enumerate() {
+        if !mask[row] {
+            continue;
+        }
+        let keep = match span {
+            Some((start, end)) => bytes[*start..*end].starts_with(needle),
+            None => false,
+        };
+        if !keep {
+            mask[row] = false;
+        }
+    }
 }
 
 fn apply_eq(mask: &mut [bool], values: &[Scalar], allowed: &[Scalar]) {

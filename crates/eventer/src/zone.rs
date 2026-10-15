@@ -210,6 +210,21 @@ pub(crate) fn may_match_ranges(
     predicates: &[ColumnPredicate],
     ranges: &[RangeFilter],
 ) -> bool {
+    may_match_filters(zone, predicates, ranges, &[])
+}
+
+/// Equality, numeric ranges, and string or text prefixes.
+///
+/// A prefix matches when some stored string starts with those bytes. An exact
+/// set rejects a block whose values all miss. A bloom cannot reject a prefix,
+/// because it was built from the whole value. Nulls do not match a prefix, so
+/// an all-null column is not a match. A missing zone column is not a skip.
+pub(crate) fn may_match_filters(
+    zone: &BlockZone,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+    prefixes: &[crate::codec::PrefixFilter],
+) -> bool {
     for predicate in predicates {
         match zone.columns.get(predicate.index) {
             Some(column) if !column.may_contain(&predicate.allowed) => return false,
@@ -221,6 +236,12 @@ pub(crate) fn may_match_ranges(
             Some(column) if !column.may_contain_range(range) => return false,
             None => return false,
             Some(_) => {}
+        }
+    }
+    for prefix in prefixes {
+        match zone.columns.get(prefix.index) {
+            Some(column) if !column.may_contain_prefix(prefix.prefix.as_bytes()) => return false,
+            Some(_) | None => {}
         }
     }
     true
@@ -482,6 +503,21 @@ fn string_zone(rows: &[Row], index: usize) -> ColumnZone {
 }
 
 impl ColumnZone {
+    fn may_contain_prefix(&self, prefix: &[u8]) -> bool {
+        match self {
+            ColumnZone::AllNull => false,
+            ColumnZone::Exact { values, .. } => values
+                .iter()
+                .any(|value| value.as_bytes().starts_with(prefix)),
+            ColumnZone::Unknown | ColumnZone::Bloom { .. } => true,
+            ColumnZone::I64 { .. }
+            | ColumnZone::I128 { .. }
+            | ColumnZone::F64 { .. }
+            | ColumnZone::Bool { .. }
+            | ColumnZone::IndexTs { .. } => true,
+        }
+    }
+
     fn may_contain(&self, allowed: &[Scalar]) -> bool {
         if allowed.is_empty() {
             return false;
