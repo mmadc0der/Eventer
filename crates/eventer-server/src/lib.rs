@@ -1654,8 +1654,8 @@ fn parse_filters(
 }
 
 /// Repeated `in=field=value` for one field is one set. A row matches when the
-/// column equals any listed scalar. The literal `null` is a null column, the
-/// same spelling `eq` uses.
+/// column equals any listed scalar. String and text keep the raw literal,
+/// including the word `null`. Other types spell a null column as `null`.
 fn parse_in_predicates(
     schema: &eventer::Schema,
     query: &str,
@@ -1722,9 +1722,13 @@ fn parse_in_value(
     }
 }
 
-/// `eq` and `in` share this spelling. The literal `null` is a null column.
+/// `eq` and `in` share this spelling. String and text use the raw literal, so
+/// the word `null` is that text. Int, timestamp, float, bool, decimal, and json
+/// accept `null` as a null column.
 fn equality_scalar(ty: eventer::FieldType, literal: &str) -> eventer::Result<eventer::Scalar> {
-    if literal == "null" {
+    if literal == "null"
+        && !matches!(ty, eventer::FieldType::String | eventer::FieldType::Text)
+    {
         return Ok(eventer::Scalar::Null);
     }
     eventer::scalar_from_literal(ty, literal)
@@ -4280,6 +4284,7 @@ mod tests {
             r#"{"ts":3000,"ok":true,"action":"buy","amount":"1.00"}"#,
             r#"{"ts":4000,"user_id":0,"ok":true,"action":"click","note":"a","amount":"3.00"}"#,
             r#"{"ts":5000,"user_id":2,"ok":false,"action":"scroll","amount":"1.00"}"#,
+            r#"{"ts":4500,"user_id":9,"ok":false,"action":"hold","note":"null","amount":"9.00"}"#,
         ];
         for body in rows {
             let (status, created) = post(&app, body).await;
@@ -4351,7 +4356,11 @@ mod tests {
         assert_eq!(with_null["count"], json!(2));
         let (status, notes) = get_json(&app, "/events/count?from=1000&to=5000&in=note=null").await;
         assert_eq!(status, StatusCode::OK, "{notes}");
-        assert_eq!(notes["count"], json!(2));
+        assert_eq!(notes["count"], json!(1));
+        let (status, eq_note) =
+            get_json(&app, "/events/count?from=1000&to=5000&eq=note=null").await;
+        assert_eq!(status, StatusCode::OK, "{eq_note}");
+        assert_eq!(eq_note["count"], json!(1));
         let (status, named) = get_json(&app, "/events/count?from=1000&to=5000&in=note=a").await;
         assert_eq!(status, StatusCode::OK, "{named}");
         assert_eq!(named["count"], json!(2));
@@ -4435,7 +4444,7 @@ mod tests {
 
         let (status, unchanged) = get_json(&app, "/events/count?from=1000&to=5000").await;
         assert_eq!(status, StatusCode::OK, "{unchanged}");
-        assert_eq!(unchanged["count"], json!(5));
+        assert_eq!(unchanged["count"], json!(6));
 
         for uri in [
             "/events/count?from=1000&to=5000&in",
@@ -4466,7 +4475,7 @@ mod tests {
         }
         let (status, still) = get_json(&app, "/events/count?from=1000&to=5000").await;
         assert_eq!(status, StatusCode::OK, "{still}");
-        assert_eq!(still["count"], json!(5));
+        assert_eq!(still["count"], json!(6));
 
         let (status, dropped) = post_json(
             &app,
@@ -4477,7 +4486,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
         assert_eq!(
             timestamps_of(&app, 1000, 5000).await,
-            vec![1000, 2000, 3000, 4000, 5000]
+            vec![1000, 2000, 3000, 4000, 5000, 4500]
         );
 
         store.close().unwrap();
