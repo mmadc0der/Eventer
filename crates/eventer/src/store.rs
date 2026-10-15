@@ -1129,14 +1129,16 @@ impl Store {
     /// IEEE-754 value of `(sum_of_squares / n) - (sum / n)^2`, including a
     /// negative result of cancellation. Both sums accumulate in ingest order
     /// inside a block and in block order across the store, the same order a
-    /// float sum uses. The square root is taken only when `stddev` was
-    /// requested. A negative float moment publishes `stddev` as `0` so the
-    /// JSON number stays finite and does not fail a co-requested sum or
-    /// extreme. A non-finite float moment, or a non-finite square root when
-    /// `stddev` was requested, returns [`Error::Event`](Error::Event). An int,
-    /// timestamp, or decimal variance is the exact rational
-    /// `(n * sum_of_squares - sum^2) / n^2` in
-    /// lowest terms, using the same integer units the 128-bit sum accumulates.
+    /// float sum uses. The square root runs only when `stddev` was requested.
+    /// A negative float variance together with `stddev` returns
+    /// [`Error::Event`](Error::Event) and no column stats; the message says
+    /// the computed variance is negative. A non-finite float moment, or a
+    /// non-finite square root when `stddev` was requested, returns that same
+    /// error for overflow. An int or timestamp variance is the exact rational
+    /// `(n * sum_of_squares - sum^2) / n^2` in lowest terms, in the same
+    /// integer units the 128-bit sum accumulates. A decimal variance divides
+    /// that rational by `10^(2*scale)` and reduces again, so it uses the same
+    /// decimal units as `sum`, `min`, and `max`. Scale 0 is unchanged.
     /// A denominator of 1 is the integer digits. A denominator whose prime
     /// factors are only 2 and 5 is the shortest decimal. Anything else is
     /// `numerator/denominator` with a positive denominator. `stddev` of those
@@ -2385,32 +2387,38 @@ impl RunningStat {
                 if !var.is_finite() {
                     return Err(variance_overflow(&self.spec.name));
                 }
-                // Cancellation can leave a tiny negative moment that still
-                // fits in f64. That is the variance. The square root is taken
-                // only when stddev was requested, and a negative radicand is
-                // published as 0 so the rest of the aggregate still succeeds.
+                // Cancellation can leave a finite negative moment. That number is
+                // the variance. The square root runs only when stddev was
+                // requested, and a negative radicand fails the whole response.
                 let dev = if self.spec.stddev {
                     if var < 0.0 {
-                        0.0
-                    } else {
-                        let dev = var.sqrt();
-                        if !dev.is_finite() {
-                            return Err(variance_overflow(&self.spec.name));
-                        }
-                        dev
+                        return Err(variance_negative(&self.spec.name));
                     }
+                    let dev = var.sqrt();
+                    if !dev.is_finite() {
+                        return Err(variance_overflow(&self.spec.name));
+                    }
+                    dev
                 } else {
                     0.0
                 };
                 (StatVar::Float(var), dev)
             }
             FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. } => {
-                let reduced = exact_population_var(self.n, self.exact, self.exact_sq)
+                let mut reduced = exact_population_var(self.n, self.exact, self.exact_sq)
                     .map_err(|_| variance_overflow(&self.spec.name))?;
-                let dev = reduced.stddev();
-                if !dev.is_finite() {
-                    return Err(variance_overflow(&self.spec.name));
+                if let FieldType::Decimal { scale } = self.spec.ty {
+                    reduced = scale_decimal_var(reduced, scale);
                 }
+                let dev = if self.spec.stddev {
+                    let dev = reduced.stddev();
+                    if !dev.is_finite() {
+                        return Err(variance_overflow(&self.spec.name));
+                    }
+                    dev
+                } else {
+                    0.0
+                };
                 (StatVar::Exact(reduced.format()), dev)
             }
             _ => {
@@ -2430,6 +2438,12 @@ impl RunningStat {
 
 fn variance_overflow(name: &str) -> Error {
     Error::event(format!("variance of `{name}` overflowed"))
+}
+
+fn variance_negative(name: &str) -> Error {
+    Error::event(format!(
+        "variance of `{name}` is negative; the computed variance is negative"
+    ))
 }
 
 /// Per-column answer copied out of the zone before the payload is read.
@@ -3783,9 +3797,15 @@ fn empty_column_stats(columns: &[ResolvedStat]) -> Vec<ColumnStats> {
 }
 
 /// Reduced population variance `(n * sum_sq - sum^2) / n^2`.
+///
+/// `extra_twos` and `extra_fives` are factors of the denominator that did not
+/// fit in `denom` after dividing a decimal variance by `10^(2*scale)`. The
+/// value is `numer / (denom * 2^extra_twos * 5^extra_fives)`.
 struct ReducedVar {
     numer: U256,
     denom: u128,
+    extra_twos: u32,
+    extra_fives: u32,
 }
 
 impl ReducedVar {
@@ -3793,39 +3813,182 @@ impl ReducedVar {
         if self.denom == 0 {
             return f64::INFINITY;
         }
-        (u256_to_f64(self.numer) / self.denom as f64).sqrt()
+        let mut value = u256_to_f64(self.numer) / self.denom as f64;
+        if self.extra_twos > 0 {
+            value /= 2f64.powi(self.extra_twos as i32);
+        }
+        if self.extra_fives > 0 {
+            value /= 5f64.powi(self.extra_fives as i32);
+        }
+        value.sqrt()
     }
 
     fn format(&self) -> String {
-        if self.denom == 1 {
-            return format_u256(self.numer);
+        if self.extra_twos == 0 && self.extra_fives == 0 {
+            return format_reduced(self.numer, self.denom);
         }
         if let Some((twos, fives)) = factor_two_five(self.denom) {
-            let places = twos.max(fives) as usize;
-            let (whole, mut rem) = div_rem_u128(self.numer, self.denom)
-                .expect("reduced variance denominator is non-zero");
-            let mut frac = String::new();
-            for _ in 0..places {
-                let prod = U256::from_u128(rem)
-                    .mul_u64(10)
-                    .expect("one decimal step of a u128 remainder fits");
-                let (digit, next) =
-                    div_rem_u128(prod, self.denom).expect("decimal digit divisor is non-zero");
-                frac.push(char::from(b'0' + digit.low_u64() as u8));
-                rem = next;
+            let twos = twos + self.extra_twos;
+            let fives = fives + self.extra_fives;
+            let places = twos.max(fives);
+            let mut numer = self.numer;
+            let mut fit = true;
+            for _ in 0..fives.saturating_sub(twos) {
+                match numer.mul_u64(2) {
+                    Some(next) => numer = next,
+                    None => fit = false,
+                }
+                if !fit {
+                    break;
+                }
             }
-            while frac.ends_with('0') {
-                frac.pop();
+            if fit {
+                for _ in 0..twos.saturating_sub(fives) {
+                    match numer.mul_u64(5) {
+                        Some(next) => numer = next,
+                        None => {
+                            fit = false;
+                            break;
+                        }
+                    }
+                }
             }
-            let whole = format_u256(whole);
-            if frac.is_empty() {
-                whole
-            } else {
-                format!("{whole}.{frac}")
+            if fit {
+                return insert_decimal_point(&format_u256(numer), places as usize);
             }
-        } else {
-            format!("{}/{}", format_u256(self.numer), self.denom)
         }
+        let mut denom = self.denom.to_string();
+        for _ in 0..self.extra_twos {
+            denom = mul_decimal_string(&denom, 2);
+        }
+        for _ in 0..self.extra_fives {
+            denom = mul_decimal_string(&denom, 5);
+        }
+        format!("{}/{}", format_u256(self.numer), denom)
+    }
+}
+
+fn format_reduced(numer: U256, denom: u128) -> String {
+    if denom == 1 {
+        return format_u256(numer);
+    }
+    if let Some((twos, fives)) = factor_two_five(denom) {
+        let places = twos.max(fives) as usize;
+        let (whole, mut rem) =
+            div_rem_u128(numer, denom).expect("reduced variance denominator is non-zero");
+        let mut frac = String::new();
+        for _ in 0..places {
+            let prod = U256::from_u128(rem)
+                .mul_u64(10)
+                .expect("one decimal step of a u128 remainder fits");
+            let (digit, next) =
+                div_rem_u128(prod, denom).expect("decimal digit divisor is non-zero");
+            frac.push(char::from(b'0' + digit.low_u64() as u8));
+            rem = next;
+        }
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        let whole = format_u256(whole);
+        if frac.is_empty() {
+            whole
+        } else {
+            format!("{whole}.{frac}")
+        }
+    } else {
+        format!("{}/{}", format_u256(numer), denom)
+    }
+}
+
+fn insert_decimal_point(digits: &str, places: usize) -> String {
+    if places == 0 {
+        return digits.to_string();
+    }
+    let digits = if digits.len() > places {
+        digits.to_string()
+    } else {
+        format!("{}{digits}", "0".repeat(places + 1 - digits.len()))
+    };
+    let split = digits.len() - places;
+    let whole = &digits[..split];
+    let mut frac = digits[split..].to_string();
+    while frac.ends_with('0') {
+        frac.pop();
+    }
+    if frac.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{frac}")
+    }
+}
+
+fn mul_decimal_string(digits: &str, factor: u32) -> String {
+    let bytes = digits.as_bytes();
+    let mut out = vec![b'0'; bytes.len() + 1];
+    let mut carry = 0u32;
+    for index in (0..bytes.len()).rev() {
+        let digit = u32::from(bytes[index] - b'0');
+        let prod = digit * factor + carry;
+        out[index + 1] = b'0' + (prod % 10) as u8;
+        carry = prod / 10;
+    }
+    out[0] = b'0' + carry as u8;
+    let text = String::from_utf8(out).expect("decimal digits are ascii");
+    let trimmed = text.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Divide a reduced population variance by `10^(2*scale)` and reduce again.
+fn scale_decimal_var(var: ReducedVar, scale: u32) -> ReducedVar {
+    if scale == 0 {
+        return var;
+    }
+    let exp = scale.saturating_mul(2);
+    let mut numer = var.numer;
+    let mut twos = exp;
+    let mut fives = exp;
+    while twos > 0 && !numer.is_zero() && numer.limbs[0] % 2 == 0 {
+        numer = numer.shr1();
+        twos -= 1;
+    }
+    while fives > 0 && !numer.is_zero() {
+        let Some((quot, rem)) = div_rem_u128(numer, 5) else {
+            break;
+        };
+        if rem != 0 {
+            break;
+        }
+        numer = quot;
+        fives -= 1;
+    }
+    let mut denom = var.denom;
+    while twos > 0 {
+        match denom.checked_mul(2) {
+            Some(next) => {
+                denom = next;
+                twos -= 1;
+            }
+            None => break,
+        }
+    }
+    while fives > 0 {
+        match denom.checked_mul(5) {
+            Some(next) => {
+                denom = next;
+                fives -= 1;
+            }
+            None => break,
+        }
+    }
+    ReducedVar {
+        numer,
+        denom,
+        extra_twos: twos,
+        extra_fives: fives,
     }
 }
 
@@ -3851,6 +4014,8 @@ fn exact_population_var(n: u64, sum: i128, sum_sq: i128) -> Result<ReducedVar> {
     Ok(ReducedVar {
         numer,
         denom: denom / gcd,
+        extra_twos: 0,
+        extra_fives: 0,
     })
 }
 
@@ -3899,6 +4064,17 @@ impl U256 {
 
     fn cmp(self, other: Self) -> Ordering {
         self.limbs.iter().rev().cmp(other.limbs.iter().rev())
+    }
+
+    fn shr1(self) -> Self {
+        let mut out = [0u64; 4];
+        let mut carry = 0u64;
+        for index in (0..4).rev() {
+            let next = self.limbs[index] & 1;
+            out[index] = (self.limbs[index] >> 1) | (carry << 63);
+            carry = next;
+        }
+        Self { limbs: out }
     }
 
     fn shl1_add(self, bit: u64) -> Self {
@@ -9388,7 +9564,16 @@ mod tests {
         let amounts = store
             .aggregate_with_filter(1000, 3000, &[], &[moment_req("amount", true, true)])
             .unwrap();
-        assert_eq!(exact_var(&amounts, "amount").0, "20000/3");
+        let (var, dev) = exact_var(&amounts, "amount");
+        assert_eq!(var, "2/3");
+        assert_eq!(dev.unwrap().to_bits(), (2.0f64 / 3.0).sqrt().to_bits());
+
+        let cents = store
+            .aggregate_with_filter(1000, 2000, &[], &[moment_req("amount", true, true)])
+            .unwrap();
+        let (var, dev) = exact_var(&cents, "amount");
+        assert_eq!(var, "0.25");
+        assert_eq!(dev.unwrap().to_bits(), 0.5f64.to_bits());
 
         let scores = store
             .aggregate_with_filter(1000, 2000, &[], &[moment_req("score", true, true)])
@@ -9522,7 +9707,7 @@ mod tests {
                     min: true,
                     max: false,
                     var: true,
-                    stddev: true,
+                    stddev: false,
                 }],
             )
             .unwrap();
@@ -9538,7 +9723,63 @@ mod tests {
             })
         );
         assert_eq!(with_sum[0].min, Some(Some(Scalar::Float(value))));
-        assert_eq!(with_sum[0].stddev, Some(Some(0.0)));
+        assert!(with_sum[0].stddev.is_none());
+
+        let with_dev = store.aggregate_with_filter(
+            1000,
+            3000,
+            &[],
+            &[StatRequest {
+                field: "score".to_string(),
+                sum: true,
+                min: true,
+                max: false,
+                var: true,
+                stddev: true,
+            }],
+        );
+        assert!(
+            matches!(with_dev, Err(Error::Event(ref message)) if message.contains("negative")),
+            "{with_dev:?}"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn float_variance_keeps_a_finite_negative_moment() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for (index, offset) in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0].into_iter().enumerate() {
+            let score = 1e10 + offset;
+            let obj = serde_json::json!({
+                "ts": 1000 + index as i64,
+                "user_id": 1,
+                "score": score,
+                "ok": true,
+                "action": "buy",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let scores = store
+            .aggregate_with_filter(1000, 2000, &[], &[moment_req("score", true, false)])
+            .unwrap();
+        match scores[0].var.as_ref().unwrap() {
+            Some(StatVar::Float(value)) => assert_eq!(value.to_bits(), (-16384.0f64).to_bits()),
+            other => panic!("negative float variance {other:?}"),
+        }
+        assert!(scores[0].stddev.is_none());
+
+        let with_dev =
+            store.aggregate_with_filter(1000, 2000, &[], &[moment_req("score", true, true)]);
+        assert!(
+            matches!(with_dev, Err(Error::Event(ref message)) if message.contains("negative")),
+            "{with_dev:?}"
+        );
         store.close().unwrap();
     }
 

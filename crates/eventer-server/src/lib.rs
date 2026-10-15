@@ -3075,7 +3075,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["groups"][0]["key"], json!("buy"));
         assert_eq!(body["groups"][0]["columns"]["amount"]["sum"], json!("3.00"));
-        assert_eq!(body["groups"][0]["columns"]["amount"]["var"], json!("2500"));
+        assert_eq!(body["groups"][0]["columns"]["amount"]["var"], json!("0.25"));
         assert_eq!(body["groups"][1]["key"], json!("other"));
         assert_eq!(body["groups"][1]["columns"]["amount"]["var"], json!("0"));
 
