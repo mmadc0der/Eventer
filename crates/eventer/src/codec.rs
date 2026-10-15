@@ -2465,6 +2465,151 @@ pub(crate) fn try_accumulate_exact_sum(
     Ok(None)
 }
 
+/// One inclusive run of integers, each repeated `mult` times.
+///
+/// A constant is a single integer whose multiplicity is the row count. A unit
+/// stride is one integer per row (`mult` is 1) from `start` through `end`.
+#[derive(Clone, Copy)]
+pub(crate) struct UnitRun {
+    pub start: i128,
+    pub end: i128,
+    pub mult: u64,
+}
+
+/// Null-free constant, stride, or stride pieces whose stride is -1, 0, or 1
+/// and whose values do not wrap.
+///
+/// `Ok(None)` leaves the caller on the sample path: a null, a missing column,
+/// bit packing, a frame of reference, any other stride, or wrapping arithmetic.
+/// `Ok(Some(runs))` is every present value, in pieces, without expanding a row.
+/// A truncated body is corrupt. The timestamp containment check is the caller's.
+pub(crate) fn try_unit_stride_runs(
+    schema: &Schema,
+    bytes: &[u8],
+    column: usize,
+) -> Result<Option<Vec<UnitRun>>> {
+    let nrows = block_row_count(bytes)?;
+    if nrows == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(field) = schema.fields.get(column) else {
+        return Err(Error::corrupt("quantile column is missing"));
+    };
+    let narrow = match field.ty {
+        FieldType::Int | FieldType::Timestamp => true,
+        FieldType::Decimal { .. } => false,
+        _ => return Ok(None),
+    };
+    let width = if narrow { 8 } else { 16 };
+    let mut cursor = 4usize;
+    for (index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            return Ok(None);
+        }
+        if index == column {
+            let flags = *bytes
+                .get(cursor)
+                .ok_or_else(|| Error::corrupt("truncated null flag"))?;
+            if flags != 0 {
+                return Ok(None);
+            }
+            cursor += 1;
+            return read_unit_runs(bytes, &mut cursor, nrows, width, narrow);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Ok(None)
+}
+
+fn read_unit_runs(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    width: usize,
+    narrow: bool,
+) -> Result<Option<Vec<UnitRun>>> {
+    if count == 0 {
+        expect_kind(bytes, cursor, KIND_EMPTY)?;
+        return Ok(Some(Vec::new()));
+    }
+    let kind = read_u8(bytes, cursor)?;
+    if kind == KIND_CONSTANT {
+        let base = if width == 8 {
+            i128::from(read_i64(bytes, cursor)?)
+        } else {
+            read_i128(bytes, cursor)?
+        };
+        let mut runs = Vec::new();
+        if push_unit_run(&mut runs, base, 0, count, narrow).is_none() {
+            return Ok(None);
+        }
+        return Ok(Some(runs));
+    }
+    if kind == KIND_STRIDE {
+        let (base, stride) = if width == 8 {
+            (
+                i128::from(read_i64(bytes, cursor)?),
+                i128::from(read_i64(bytes, cursor)?),
+            )
+        } else {
+            (read_i128(bytes, cursor)?, read_i128(bytes, cursor)?)
+        };
+        let mut runs = Vec::new();
+        if push_unit_run(&mut runs, base, stride, count, narrow).is_none() {
+            return Ok(None);
+        }
+        return Ok(Some(runs));
+    }
+    if kind == KIND_PIECES {
+        let pieces = read_stride_pieces(bytes, cursor, count, width)?;
+        let mut runs = Vec::with_capacity(pieces.len());
+        for (index, piece) in pieces.iter().enumerate() {
+            let end = pieces
+                .get(index + 1)
+                .map(|next| next.start as usize)
+                .unwrap_or(count);
+            let len = end - piece.start as usize;
+            if push_unit_run(&mut runs, piece.base, piece.stride, len, narrow).is_none() {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(runs));
+    }
+    Ok(None)
+}
+
+/// `None` when `stride` is not -1, 0, or 1, or `base + (len - 1) * stride` wraps.
+fn push_unit_run(
+    runs: &mut Vec<UnitRun>,
+    base: i128,
+    stride: i128,
+    len: usize,
+    narrow: bool,
+) -> Option<()> {
+    if len == 0 || (stride != -1 && stride != 0 && stride != 1) {
+        return None;
+    }
+    if narrow && (i64::try_from(base).is_err() || i64::try_from(stride).is_err()) {
+        return None;
+    }
+    let (start, end, mult) = if stride == 0 || len == 1 {
+        (base, base, u64::try_from(len).ok()?)
+    } else {
+        let steps = i128::try_from(len - 1).ok()?;
+        let end = base.checked_add(stride.checked_mul(steps)?)?;
+        if narrow && i64::try_from(end).is_err() {
+            return None;
+        }
+        if stride > 0 {
+            (base, end, 1)
+        } else {
+            (end, base, 1)
+        }
+    };
+    runs.push(UnitRun { start, end, mult });
+    Some(())
+}
+
 fn sum_overflow(name: &str) -> Error {
     Error::event(format!("sum of `{name}` overflowed"))
 }
@@ -5100,6 +5245,90 @@ mod tests {
             decode_i64s(&encoded, &mut cursor, nine.len()).unwrap(),
             nine.iter().copied().flatten().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn unit_stride_runs_keep_a_sawtooth_and_reject_a_wrap() {
+        let schema = schema();
+        let saw: Vec<Row> = (0..2048)
+            .map(|i| {
+                parse_event(
+                    &schema,
+                    format!(
+                        r#"{{"ts":{i},"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                        i % 1000
+                    )
+                    .as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let encoded = encode_block(&schema, &saw).unwrap();
+        let runs = try_unit_stride_runs(&schema, &encoded.bytes, 1)
+            .unwrap()
+            .expect("user_id is unit-stride pieces");
+        let rows: u128 = runs
+            .iter()
+            .map(|run| {
+                let start = (run.start as u128) ^ (1u128 << 127);
+                let end = (run.end as u128) ^ (1u128 << 127);
+                (end - start + 1) * u128::from(run.mult)
+            })
+            .sum();
+        assert_eq!(rows, 2048);
+        assert!(runs.iter().all(|run| run.mult == 1 && run.end >= run.start));
+
+        let wrapped = [
+            parse_event(
+                &schema,
+                format!(
+                    r#"{{"ts":1,"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                    i64::MAX
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+            parse_event(
+                &schema,
+                format!(
+                    r#"{{"ts":2,"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                    i64::MIN
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+            parse_event(
+                &schema,
+                format!(
+                    r#"{{"ts":3,"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                    i64::MIN + 1
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+        ];
+        let wrapped = encode_block(&schema, &wrapped).unwrap();
+        assert!(try_unit_stride_runs(&schema, &wrapped.bytes, 1)
+            .unwrap()
+            .is_none());
+
+        let wide: Vec<Row> = (0..8)
+            .map(|i| {
+                parse_event(
+                    &schema,
+                    format!(
+                        r#"{{"ts":{i},"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                        i * 2
+                    )
+                    .as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let wide = encode_block(&schema, &wide).unwrap();
+        assert!(try_unit_stride_runs(&schema, &wide.bytes, 1)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
