@@ -758,6 +758,12 @@ impl Store {
     /// The sparse index is not that check. A constant or a positive
     /// non-wrapping timestamp stride may prove it from its header. Any other
     /// timestamp encoding still expands.
+    ///
+    /// One equality on a bool column uses the same rule. A constant bool
+    /// contributes the block row count or zero. One bitmap period contributes
+    /// the matches in that period, repeated across the rows, without expanding
+    /// a bool per row. A null, a full per-row bitmap, a second predicate, a
+    /// range, or a timestamp outside the range still walks rows.
     pub fn count_with_filter(
         &self,
         from_ms: i64,
@@ -6485,6 +6491,95 @@ mod tests {
             "the sparse index does not prove that every payload timestamp is inside"
         );
         assert_eq!(store.count_with_filter(0, 70, &click).unwrap(), 2);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn count_reads_one_bool_period_and_still_walks_a_cut() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        for i in 0..64i64 {
+            let mut obj = serde_json::json!({
+                "ts": i * 10,
+                "user_id": i,
+                "score": 1.0,
+                "ok": i % 2 == 0,
+                "action": actions[i as usize % actions.len()],
+                "amount": "1.00",
+            });
+            if i % 4 != 3 {
+                obj["note"] = serde_json::json!(["landing", "checkout", "search"][i as usize % 3]);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 2);
+
+        let yes = [Predicate::Eq("ok".into(), Scalar::Bool(true))];
+        let no = [Predicate::Eq("ok".into(), Scalar::Bool(false))];
+        let counted = store.count_with_filter(0, 630, &yes).unwrap();
+        assert_eq!(counted, 32);
+        assert_eq!(
+            counted,
+            store.query_with_filter(0, 630, &yes).unwrap().len() as u64
+        );
+        let falses = store.count_with_filter(0, 630, &no).unwrap();
+        assert_eq!(falses, 32);
+        assert_eq!(
+            falses,
+            store.query_with_filter(0, 630, &no).unwrap().len() as u64
+        );
+        let cut = store.count_with_filter(0, 50, &yes).unwrap();
+        assert_eq!(cut, 3);
+        assert_eq!(
+            cut,
+            store.query_with_filter(0, 50, &yes).unwrap().len() as u64
+        );
+        let both = [
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+            Predicate::Eq("action".into(), "click".into()),
+        ];
+        assert_eq!(store.count_with_filter(0, 630, &both).unwrap(), 16);
+        assert_eq!(
+            store.count_with_filter(0, 630, &both).unwrap(),
+            store.query_with_filter(0, 630, &both).unwrap().len() as u64
+        );
+        let ranged = [
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(50)),
+        ];
+        assert_eq!(store.count_with_filter(0, 630, &ranged).unwrap(), 7);
+        assert_eq!(
+            store.count_with_filter(0, 630, &ranged).unwrap(),
+            store.query_with_filter(0, 630, &ranged).unwrap().len() as u64
+        );
+        assert_eq!(
+            store
+                .histogram_with_filter(0, 630, 10, &yes)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            32
+        );
+
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = 0;
+            block.max_ts = 50;
+        }
+        assert_eq!(
+            store.count_with_filter(0, 50, &yes).unwrap(),
+            3,
+            "the sparse index does not prove that every payload timestamp is inside"
+        );
+        assert_eq!(store.count_with_filter(0, 630, &yes).unwrap(), 32);
         store.close().unwrap();
     }
 
