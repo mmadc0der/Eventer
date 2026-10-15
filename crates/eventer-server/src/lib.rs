@@ -26,6 +26,8 @@
 //! column takes in the same filtered window. One int, timestamp, or decimal
 //! with no row predicate counts a fully contained, null-free constant or unit
 //! stride from the column body.
+//! `GET /events/topk?field=&k=` returns the values that occur most often in
+//! that column, including null, ordered by exact count.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
 //! with the caller's `before_ms`. The request `Content-Type` must be
 //! `application/json`, with an optional `charset=utf-8`. A block is removed
@@ -55,6 +57,7 @@ pub fn router(store: Arc<eventer::Store>) -> Router {
         .route("/health", get(health))
         .route("/events/count", get(count_events))
         .route("/events/distinct", get(distinct_events))
+        .route("/events/topk", get(topk_events))
         .route("/events/histogram", get(histogram_events))
         .route("/events/stats", get(stats_events))
         .route("/events/quantile", get(quantile_events))
@@ -125,9 +128,11 @@ async fn post_drop(
     body: Bytes,
 ) -> Response {
     let raw_query = raw.as_deref().unwrap_or("");
-    if let Err(response) =
-        reject_named_params(raw_query, "/events/drop", &["by", "latest", "distinct"])
-    {
+    if let Err(response) = reject_named_params(
+        raw_query,
+        "/events/drop",
+        &["by", "latest", "distinct", "topk"],
+    ) {
         return *response;
     }
     if let Err(response) = reject_select(raw_query, "/events/drop") {
@@ -234,7 +239,8 @@ async fn get_events(
     if let Err(response) = reject_quantile_param(raw_query, "/events") {
         return *response;
     }
-    if let Err(response) = reject_named_params(raw_query, "/events", &["by", "latest", "distinct"])
+    if let Err(response) =
+        reject_named_params(raw_query, "/events", &["by", "latest", "distinct", "topk"])
     {
         return *response;
     }
@@ -278,7 +284,8 @@ async fn count_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
-    if let Err(response) = reject_named_params(raw, "/events/count", &["by", "latest", "distinct"])
+    if let Err(response) =
+        reject_named_params(raw, "/events/count", &["by", "latest", "distinct", "topk"])
     {
         return *response;
     }
@@ -354,15 +361,61 @@ async fn distinct_events(
     }
 }
 
+async fn topk_events(
+    State(state): State<AppState>,
+    Query(params): Query<RangeParams>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let raw = raw.as_deref().unwrap_or("");
+    let (field, k) = match topk_params(raw) {
+        Ok(parsed) => parsed,
+        Err(response) => return *response,
+    };
+    if let Err(response) = reject_topk_field(state.store.schema(), &field) {
+        return *response;
+    }
+    let from = match parse_bound(params.from, "from") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let to = match parse_bound(params.to, "to") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let predicates = match parse_filters(state.store.schema(), raw) {
+        Ok(predicates) => predicates,
+        Err(response) => return *response,
+    };
+    let store = Arc::clone(&state.store);
+    let field_name = field.clone();
+    let joined =
+        tokio::task::spawn_blocking(move || store.topk(from, to, &predicates, &field_name, k))
+            .await;
+    match joined {
+        Ok(Ok(values)) => {
+            let body = topk_body(state.store.schema(), &field, &values);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Ok(Err(err)) => error_response(&err),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "topk task failed"})),
+        )
+            .into_response(),
+    }
+}
+
 async fn histogram_events(
     State(state): State<AppState>,
     Query(params): Query<RangeParams>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
-    if let Err(response) =
-        reject_named_params(raw, "/events/histogram", &["by", "latest", "distinct"])
-    {
+    if let Err(response) = reject_named_params(
+        raw,
+        "/events/histogram",
+        &["by", "latest", "distinct", "topk"],
+    ) {
         return *response;
     }
     if let Err(response) = reject_page_params(raw, "/events/histogram") {
@@ -420,7 +473,9 @@ async fn stats_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
-    if let Err(response) = reject_named_params(raw, "/events/stats", &["latest", "distinct"]) {
+    if let Err(response) =
+        reject_named_params(raw, "/events/stats", &["latest", "distinct", "topk"])
+    {
         return *response;
     }
     if let Err(response) = reject_stats_params(raw) {
@@ -1104,6 +1159,140 @@ fn distinct_field(query: &str) -> std::result::Result<String, Box<Response>> {
         }
     }
     found.ok_or_else(|| bad_request("missing `field` query parameter"))
+}
+
+fn topk_params(query: &str) -> std::result::Result<(String, usize), Box<Response>> {
+    let mut field = None;
+    let mut k = None;
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, value) = match pair.split_once('=') {
+                Some(pair) => pair,
+                None => {
+                    let key = percent_decode(pair, "query")?;
+                    if key == "field" {
+                        return Err(bad_request("`field` is missing a field name"));
+                    }
+                    if key == "k" {
+                        return Err(bad_request("`k` must be an integer in 1..=4096"));
+                    }
+                    if !topk_query_key(&key) {
+                        return Err(bad_request(&format!(
+                            "`{key}` is not a parameter of /events/topk"
+                        )));
+                    }
+                    continue;
+                }
+            };
+            let key = percent_decode(key, "query")?;
+            match key.as_str() {
+                "field" => {
+                    if field.is_some() {
+                        return Err(bad_request("`field` was given more than once"));
+                    }
+                    let name = percent_decode(value, "field")?;
+                    if name.is_empty() {
+                        return Err(bad_request("`field` is missing a field name"));
+                    }
+                    field = Some(name);
+                }
+                "k" => {
+                    if k.is_some() {
+                        return Err(bad_request("`k` was given more than once"));
+                    }
+                    let text = percent_decode(value, "k")?;
+                    k = Some(parse_topk(&text)?);
+                }
+                "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" => {}
+                _ => {
+                    return Err(bad_request(&format!(
+                        "`{key}` is not a parameter of /events/topk"
+                    )));
+                }
+            }
+        }
+    }
+    let field = field.ok_or_else(|| bad_request("missing `field` query parameter"))?;
+    let k = k.ok_or_else(|| bad_request("missing `k` query parameter"))?;
+    Ok((field, k))
+}
+
+fn topk_query_key(key: &str) -> bool {
+    matches!(
+        key,
+        "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" | "field" | "k"
+    )
+}
+
+fn parse_topk(text: &str) -> std::result::Result<usize, Box<Response>> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(bad_request("`k` must be an integer in 1..=4096"));
+    }
+    let value = text
+        .parse::<u32>()
+        .map_err(|_| bad_request("`k` must be an integer in 1..=4096"))?;
+    if !(1..=4096).contains(&value) {
+        return Err(bad_request("`k` must be an integer in 1..=4096"));
+    }
+    Ok(value as usize)
+}
+
+fn reject_topk_field(
+    schema: &eventer::Schema,
+    name: &str,
+) -> std::result::Result<(), Box<Response>> {
+    if name.is_empty() {
+        return Err(bad_request("`field` is missing a field name"));
+    }
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(bad_request(&format!("unknown field `{name}`")));
+    };
+    if matches!(field.ty, eventer::FieldType::Json) {
+        return Err(bad_request(&format!(
+            "`field` does not apply to json column `{name}`"
+        )));
+    }
+    Ok(())
+}
+
+fn topk_body(schema: &eventer::Schema, field: &str, values: &[eventer::TopValue]) -> Value {
+    let ty = schema
+        .fields
+        .iter()
+        .find(|candidate| candidate.name == field)
+        .map(|candidate| candidate.ty);
+    let list = values
+        .iter()
+        .map(|hit| {
+            json!({
+                "value": ty.map(|ty| top_value_json(ty, &hit.value)).unwrap_or(Value::Null),
+                "count": hit.count,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "values": list })
+}
+
+fn top_value_json(ty: eventer::FieldType, value: &eventer::Scalar) -> Value {
+    match (ty, value) {
+        (_, eventer::Scalar::Null) => Value::Null,
+        (eventer::FieldType::Int, eventer::Scalar::Int(number)) => json!(number),
+        (eventer::FieldType::Timestamp, eventer::Scalar::Timestamp(number)) => json!(number),
+        (eventer::FieldType::Decimal { scale }, eventer::Scalar::Decimal(number)) => {
+            Value::String(eventer::format_decimal(*number, scale))
+        }
+        (eventer::FieldType::Bool, eventer::Scalar::Bool(flag)) => json!(flag),
+        (eventer::FieldType::String | eventer::FieldType::Text, eventer::Scalar::Str(text)) => {
+            Value::String(text.clone())
+        }
+        (eventer::FieldType::Float, eventer::Scalar::Float(number)) => {
+            Value::Number(Number::from_f64(*number).expect("topk float is finite"))
+        }
+        _ => Value::Null,
+    }
 }
 
 fn reject_distinct_field(
@@ -3624,6 +3813,201 @@ mod tests {
             let message = body["error"].as_str().unwrap_or("");
             assert!(!message.contains("corrupt"), "{uri} read the store: {body}");
             assert!(body.get("count").is_none(), "{uri} {body}");
+        }
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn topk_returns_the_most_frequent_values() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-topk-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "text"},
+                    {"name": "amount", "type": "decimal", "scale": 2},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(2, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        for body in [
+            r#"{"ts":1000,"user_id":1,"score":0.0,"ok":true,"action":"click","note":"b","amount":"2.00","props":{"n":1}}"#,
+            r#"{"ts":2000,"score":-0.0,"ok":false,"action":"click","note":"a","amount":"1.00","props":{"n":2}}"#,
+            r#"{"ts":3000,"user_id":2,"score":0.0,"ok":true,"action":"view","amount":"1.00","props":[1]}"#,
+            r#"{"ts":4000,"user_id":0,"score":1.5,"ok":true,"action":"buy","note":"a","amount":"1.00","props":1}"#,
+        ] {
+            let (status, created) = post(&app, body).await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+        }
+
+        let (status, actions) =
+            get_json(&app, "/events/topk?from=1000&to=3000&field=action&k=1").await;
+        assert_eq!(status, StatusCode::OK, "{actions}");
+        assert_eq!(actions, json!({"values": [{"value": "click", "count": 2}]}));
+        let (status, tied) =
+            get_json(&app, "/events/topk?from=1000&to=4000&field=action&k=4").await;
+        assert_eq!(status, StatusCode::OK, "{tied}");
+        assert_eq!(
+            tied["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["click", "buy", "view"]
+        );
+        assert_eq!(tied["values"][0]["count"], 2);
+        assert_eq!(tied["values"][1]["count"], 1);
+        assert_eq!(tied["values"][1]["value"], "buy");
+        let (status, users) =
+            get_json(&app, "/events/topk?from=1000&to=4000&field=user_id&k=4").await;
+        assert_eq!(status, StatusCode::OK, "{users}");
+        assert!(users["values"][0]["value"].is_null(), "{users}");
+        assert_eq!(users["values"][0]["count"], 1);
+        assert_eq!(users["values"][1]["value"], 0);
+        assert!(
+            users["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["value"].is_null() && hit["count"] == 1),
+            "{users}"
+        );
+        let null_at = users["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|hit| hit["value"].is_null())
+            .unwrap();
+        let zero_at = users["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|hit| hit["value"] == 0)
+            .unwrap();
+        assert!(null_at < zero_at, "{users}");
+        let (status, early) =
+            get_json(&app, "/events/topk?from=1000&to=1000&field=user_id&k=4").await;
+        assert_eq!(status, StatusCode::OK, "{early}");
+        assert_eq!(early, json!({"values": [{"value": 1, "count": 1}]}));
+        let (status, none) =
+            get_json(&app, "/events/topk?from=9000&to=9000&field=action&k=1").await;
+        assert_eq!(status, StatusCode::OK, "{none}");
+        assert_eq!(none, json!({"values": []}));
+        let (status, ranged) = get_json(
+            &app,
+            "/events/topk?from=1000&to=4000&field=action&k=2&gt=user_id=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ranged}");
+        assert_eq!(ranged, json!({"values": [{"value": "view", "count": 1}]}));
+        let (status, amounts) =
+            get_json(&app, "/events/topk?from=1000&to=3000&field=amount&k=2").await;
+        assert_eq!(status, StatusCode::OK, "{amounts}");
+        assert_eq!(amounts["values"][0]["value"], "1.00");
+        assert_eq!(amounts["values"][0]["count"], 2);
+        assert_eq!(amounts["values"][1]["value"], "2.00");
+        let scores = get_raw(&app, "/events/topk?from=1000&to=4000&field=score&k=3").await;
+        let scores = String::from_utf8(scores).unwrap();
+        assert!(scores.contains("-0.0"), "{scores}");
+        assert!(scores.contains("0.0"), "{scores}");
+        let row = get_raw(&app, "/events?from=2000&to=2000&select=score").await;
+        let row = String::from_utf8(row).unwrap();
+        assert!(row.contains("-0.0"), "{row}");
+
+        for uri in [
+            "/events/topk?from=1000&to=3000&field=action",
+            "/events/topk?from=1000&to=3000&k=1",
+            "/events/topk?from=1000&to=3000&field=&k=1",
+            "/events/topk?from=1000&to=3000&field=action&k",
+            "/events/topk?from=1000&to=3000&field=action&k=0",
+            "/events/topk?from=1000&to=3000&field=action&k=4097",
+            "/events/topk?from=1000&to=3000&field=action&k=-1",
+            "/events/topk?from=1000&to=3000&field=missing&k=1",
+            "/events/topk?from=1000&to=3000&field=props&k=1",
+            "/events/topk?from=1000&to=3000&field=action&field=ok&k=1",
+            "/events/topk?from=1000&to=3000&field=action&k=1&k=2",
+            "/events/topk?from=1000&to=3000&field=action&k=1&by=ok",
+            "/events/topk?from=1000&to=3000&field=action&k=1&select=action",
+            "/events/topk?from=1000&to=3000&field=action&k=1&limit=1",
+            "/events/topk?from=1000&to=3000&field=action&k=1&offset=0",
+            "/events/topk?from=1000&to=3000&field=action&k=1&bucket_ms=1",
+            "/events/topk?from=1000&to=3000&field=action&k=1&sum=user_id",
+            "/events/topk?from=1000&to=3000&field=action&k=1&min=user_id",
+            "/events/topk?from=1000&to=3000&field=action&k=1&max=user_id",
+            "/events/topk?from=1000&to=3000&field=action&k=1&quantile=user_id",
+            "/events/topk?from=1000&to=3000&field=action&k=1&distinct=action",
+            "/events?from=1000&to=3000&topk=action",
+            "/events/count?from=1000&to=3000&topk=action",
+            "/events/histogram?from=1000&to=3000&bucket_ms=1000&topk=action",
+            "/events/stats?from=1000&to=3000&sum=user_id&topk=action",
+            "/events/latest?from=1000&to=3000&by=action&topk=1",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&topk=1",
+            "/events/distinct?from=1000&to=3000&field=action&topk=1",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+            assert!(body.get("values").is_none(), "{uri} {body}");
+            assert!(body.get("error").is_some(), "{uri}");
+        }
+        let (status, wide) =
+            get_json(&app, "/events/topk?from=1000&to=3000&field=action&k=4096").await;
+        assert_eq!(status, StatusCode::OK, "{wide}");
+        assert_eq!(wide["values"].as_array().unwrap().len(), 2);
+        let (status, dropped) =
+            post_json(&app, "/events/drop?topk=action", r#"{"before_ms":1}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+        assert!(dropped.get("ok").is_none(), "{dropped}");
+        let (status, still) = get_json(&app, "/events/count?from=1000&to=4000").await;
+        assert_eq!(status, StatusCode::OK, "{still}");
+        assert_eq!(still["count"], 4);
+
+        let data = root.join("data");
+        let dat = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("dat"))
+            .unwrap();
+        let mut bytes = fs::read(&dat).unwrap();
+        bytes[16] ^= 0xff;
+        fs::write(&dat, &bytes).unwrap();
+        for uri in [
+            "/events/topk?from=1000&to=3000&field=props&k=1",
+            "/events/topk?from=1000&to=3000&field=&k=1",
+            "/events/topk?from=1000&to=3000&field=missing&k=1",
+            "/events/topk?from=1000&to=3000&field=action&k=0",
+            "/events/topk?from=1000&to=3000&field=action&k=1&limit=1",
+            "/events?from=1000&to=3000&topk=action",
+            "/events/quantile?from=1000&to=3000&field=score&p=0.5&topk=1",
+            "/events/distinct?from=1000&to=3000&field=action&topk=1",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+            let message = body["error"].as_str().unwrap_or("");
+            assert!(!message.contains("corrupt"), "{uri} read the store: {body}");
+            assert!(body.get("values").is_none(), "{uri} {body}");
         }
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);
