@@ -23,7 +23,9 @@
 //! `GET /events/latest?by=field` returns the newest matching row for each value
 //! of that column, in the same key order.
 //! `GET /events/distinct?field=` returns how many distinct non-null values that
-//! column takes in the same filtered window.
+//! column takes in the same filtered window. With no row predicate, a bool or
+//! an exact string or text zone answers a block that sits entirely inside the
+//! range.
 //! `GET /events/topk?field=&k=` returns the values that occur most often in
 //! that column, including null, ordered by exact count.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)

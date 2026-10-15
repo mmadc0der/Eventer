@@ -2903,6 +2903,26 @@ fn column_was_not_stored(bytes: &[u8], cursor: usize) -> bool {
     cursor == bytes.len()
 }
 
+/// Whether `bytes` still holds column `index`.
+///
+/// A timestamp prefix of a sliced block ends on a column boundary. A column
+/// past that boundary is absent. A single frame holds every column, so a later
+/// field is present even when the caller asked only for the timestamp.
+pub(crate) fn image_contains_column(schema: &Schema, bytes: &[u8], index: usize) -> Result<bool> {
+    let nrows = block_row_count(bytes)?;
+    let mut cursor = 4usize;
+    for (field_index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            return Ok(false);
+        }
+        if field_index == index {
+            return Ok(true);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Ok(false)
+}
+
 fn skip_column(
     ty: FieldType,
     bytes: &[u8],
