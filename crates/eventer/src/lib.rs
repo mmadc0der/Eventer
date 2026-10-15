@@ -61,8 +61,9 @@
 //! predicate, a block whose every payload timestamp is inside the range
 //! contributes a bool or an exact string or text set from the zone and does
 //! not decode that column. A bloom, an unknown zone, a float, an int, a
-//! timestamp, a decimal, or a json column still walks. A cut block or a
-//! predicate still walks.
+//! timestamp, a decimal, or a json column still walks. One int, timestamp, or
+//! decimal with no row predicate counts a fully contained, null-free constant
+//! or unit stride from the column body. A cut block or a predicate still walks.
 //! [`Store::topk`](store::Store::topk) returns the values of one column that
 //! occur most often in that window, including null, with the same exact counts.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that

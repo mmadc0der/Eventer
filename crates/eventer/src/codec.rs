@@ -2479,10 +2479,12 @@ pub(crate) struct UnitRun {
 /// Null-free constant, stride, or stride pieces whose stride is -1, 0, or 1
 /// and whose values do not wrap.
 ///
-/// `Ok(None)` leaves the caller on the sample path: a null, a missing column,
+/// `Ok(None)` leaves the caller on the row path: a null, a missing column,
 /// bit packing, a frame of reference, any other stride, or wrapping arithmetic.
 /// `Ok(Some(runs))` is every present value, in pieces, without expanding a row.
 /// A truncated body is corrupt. The timestamp containment check is the caller's.
+/// Distinct count uses each run as an inclusive interval and ignores `mult`.
+/// A stride of 2 from 0 to 2 is not a unit run.
 pub(crate) fn try_unit_stride_runs(
     schema: &Schema,
     bytes: &[u8],
