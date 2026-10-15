@@ -8,11 +8,11 @@ use std::time::Duration;
 
 use crate::codec::{
     accumulate_histogram_filtered, block_row_count, cmp_numeric, count_header_equality,
-    count_rows_filtered, decode_rows_filtered, decode_rows_included, range_impossible,
-    range_matches, read_timestamp_column, read_timestamp_column_included, tighter_lower,
-    tighter_upper, timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float,
-    try_unit_stride_runs, visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd,
-    RangeFilter, UnitRun,
+    count_rows_filtered, decode_rows_filtered, decode_rows_included, image_contains_column,
+    range_impossible, range_matches, read_timestamp_column, read_timestamp_column_included,
+    tighter_lower, tighter_upper, timestamp_column_span, try_accumulate_exact_sum,
+    try_add_dense_float, try_unit_stride_runs, visit_matching_timestamps, CapturedColumn,
+    ColumnPredicate, RangeEnd, RangeFilter, UnitRun,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -56,7 +56,7 @@ pub struct TopValue {
     pub count: u64,
 }
 
-/// One column to aggregate. `sum`, `min`, and `max` may be combined.
+/// One column to aggregate. `sum`, `min`, `max`, `var`, and `stddev` may be combined.
 ///
 /// The same field may appear in more than one request; the flags are OR-ed and
 /// the column is reported once, in the order the field was first named.
@@ -66,6 +66,21 @@ pub struct StatRequest {
     pub sum: bool,
     pub min: bool,
     pub max: bool,
+    pub var: bool,
+    pub stddev: bool,
+}
+
+/// Population variance of one numeric column.
+///
+/// [`StatVar::Exact`] is the reduced rational of an int, timestamp, or decimal,
+/// already rendered: integer digits when the denominator is 1, the shortest
+/// decimal when the denominator's prime factors are only 2 and 5, otherwise
+/// `numerator/denominator` with a positive denominator. [`StatVar::Float`] is
+/// the IEEE-754 value of `(sum_of_squares / n) - (sum / n)^2`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatVar {
+    Exact(String),
+    Float(f64),
 }
 
 /// Total for one numeric column.
@@ -81,15 +96,19 @@ pub enum StatSum {
     Float { total: f64, contributed: bool },
 }
 
-/// Aggregates for one column. An absent `sum`, `min`, or `max` was not requested.
+/// Aggregates for one column. An absent stat was not requested.
 ///
 /// Requested `min` and `max` are `Some(None)` when no non-null value matched.
+/// Requested `var` and `stddev` are `Some(None)` in that same case. One
+/// non-null value has variance and standard deviation zero.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnStats {
     pub field: String,
     pub sum: Option<StatSum>,
     pub min: Option<Option<Scalar>>,
     pub max: Option<Option<Scalar>>,
+    pub var: Option<Option<StatVar>>,
+    pub stddev: Option<Option<f64>>,
 }
 
 /// One group from [`Store::aggregate_grouped`].
@@ -849,6 +868,30 @@ impl Store {
     /// [`MAX_QUERY_BYTES`], the scan returns `query response size limit
     /// exceeded` and no count. An empty name, an unknown field, or a json
     /// column is an error and does not read the store.
+    ///
+    /// One int, timestamp, or decimal, with no row predicate, reads each
+    /// surviving block's timestamp column. When every payload timestamp is
+    /// inside the inclusive range and the target column has no nulls, a
+    /// constant, a stride, or stride pieces whose stride is -1, 0, or 1 and
+    /// whose values do not wrap become inclusive intervals. The count is the
+    /// number of integers in the union of those intervals. Rows are not
+    /// inserted one by one. A null, a bit-packed or frame-of-reference column,
+    /// a stride other than -1, 0, or 1, wrapping arithmetic, a float, a bool,
+    /// a string, a text, a json column, a block the range cuts, or a predicate
+    /// still inserts the surviving values into the set. A stride of 2 whose
+    /// values are 0 and 2 counts as 2, not as the closed interval from 0 to 2.
+    /// The sparse index is not the inside check.
+    ///
+    /// When the request has no row predicate and the column is a bool, string,
+    /// or text, each surviving block is checked from its timestamp column. If
+    /// every payload timestamp is inside the inclusive range, a bool zone
+    /// contributes 0, 1, or 2 and an exact string or text zone contributes its
+    /// values. Nulls do not count, so an all-null column contributes nothing.
+    /// Those sets are unioned and the column is not decoded. A bloom, an
+    /// unknown zone, a float, an int, a timestamp, a decimal, or a json column
+    /// still walks the rows. A block the range cuts, or any predicate, still
+    /// walks. A span that mixes the two unions the proved blocks and walks
+    /// only the rest. The sparse index is not that inside check.
     pub fn distinct_count(
         &self,
         from_ms: i64,
@@ -861,56 +904,251 @@ impl Store {
             return Ok(0);
         };
         let _retention = self.pipeline.lock_for_read();
-        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut seen = DistinctSet::new(column.ty);
-        let timestamp_field = column.index == self.schema.timestamp_index;
         let mut dictionaries = HashMap::new();
-        for block in blocks {
-            if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
-                return Err(Error::event("query response size limit exceeded"));
-            }
-            let payload = self.read_block_bytes(
-                &block,
-                &mut dictionaries,
-                segment::BlockLoad {
-                    through_column: Some(needed_column(
-                        &self.schema,
-                        &resolved,
-                        Some(column.index),
-                    )),
-                    columns: None,
-                },
-            )?;
-            let nrows = block_row_count(&payload)?;
-            require_header_row_count(block.row_count, nrows)?;
-            let mut captures = if timestamp_field {
-                Vec::new()
-            } else {
-                capture_columns([column.index])
-            };
-            visit_matching_timestamps(
-                &self.schema,
-                &payload,
-                from_ms,
-                to_ms,
-                &resolved.predicates,
-                &resolved.ranges,
-                &mut captures,
-                |ts, row, captured| {
-                    if timestamp_field {
-                        return seen.note(&column.name, column.ty, &Scalar::Timestamp(ts));
+        if resolved.unfiltered() && zone_distinct_column(column.ty) {
+            let blocks = self.prepare_zone_distinct_blocks(from_ms, to_ms, &column);
+            for (block, answer) in blocks {
+                if let ZoneDistinct::Contained(values) = &answer {
+                    let payload = self.read_distinct_prefix(&block, &mut dictionaries)?;
+                    match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
+                        Some(span) if span.inside => {
+                            for value in values {
+                                seen.note(&column.name, column.ty, value)?;
+                            }
+                            continue;
+                        }
+                        _ => {}
                     }
-                    let scalar = captured
-                        .first()
-                        .and_then(|slot| slot.values.get(row))
-                        .ok_or_else(|| {
-                            Error::corrupt(format!("field `{}` is missing a row", column.name))
-                        })?;
-                    seen.note(&column.name, column.ty, scalar)
-                },
-            )?;
+                    if image_contains_column(&self.schema, &payload, column.index)? {
+                        self.absorb_distinct_payload(
+                            &payload, from_ms, to_ms, &resolved, &column, &mut seen,
+                        )?;
+                        continue;
+                    }
+                }
+                self.absorb_distinct_block(
+                    &block,
+                    &mut dictionaries,
+                    from_ms,
+                    to_ms,
+                    &resolved,
+                    &column,
+                    &mut seen,
+                )?;
+            }
+        } else if resolved.unfiltered()
+            && matches!(
+                column.ty,
+                FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. }
+            )
+        {
+            let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+            let timestamp_field = column.index == self.schema.timestamp_index;
+            let mut runs = Some(Vec::new());
+            for block in blocks {
+                if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+                    return Err(Error::event("query response size limit exceeded"));
+                }
+                let payload = self.read_block_bytes(
+                    &block,
+                    &mut dictionaries,
+                    segment::BlockLoad {
+                        through_column: Some(needed_column(
+                            &self.schema,
+                            &resolved,
+                            Some(column.index),
+                        )),
+                        columns: None,
+                    },
+                )?;
+                let nrows = block_row_count(&payload)?;
+                require_header_row_count(block.row_count, nrows)?;
+                if runs.is_some() {
+                    let contained =
+                        match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
+                            Some(span) if span.inside => {
+                                try_unit_stride_runs(&self.schema, &payload, column.index)?
+                            }
+                            Some(_) => None,
+                            None => Some(Vec::new()),
+                        };
+                    match contained {
+                        Some(block_runs) => {
+                            runs.as_mut()
+                                .expect("unit-stride runs are still open")
+                                .extend(block_runs.into_iter().map(|run| (run.start, run.end)));
+                            continue;
+                        }
+                        None => {
+                            let taken = runs.take().expect("unit-stride runs are still open");
+                            spill_distinct_runs(&taken, &mut seen)?;
+                        }
+                    }
+                }
+                let mut captures = if timestamp_field {
+                    Vec::new()
+                } else {
+                    capture_columns([column.index])
+                };
+                visit_matching_timestamps(
+                    &self.schema,
+                    &payload,
+                    from_ms,
+                    to_ms,
+                    &resolved.predicates,
+                    &resolved.ranges,
+                    &mut captures,
+                    |ts, row, captured| {
+                        if timestamp_field {
+                            return seen.note(&column.name, column.ty, &Scalar::Timestamp(ts));
+                        }
+                        let scalar = captured
+                            .first()
+                            .and_then(|slot| slot.values.get(row))
+                            .ok_or_else(|| {
+                                Error::corrupt(format!("field `{}` is missing a row", column.name))
+                            })?;
+                        seen.note(&column.name, column.ty, scalar)
+                    },
+                )?;
+            }
+            if let Some(collected) = runs {
+                return union_distinct_count(&collected);
+            }
+        } else {
+            let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+            for block in blocks {
+                self.absorb_distinct_block(
+                    &block,
+                    &mut dictionaries,
+                    from_ms,
+                    to_ms,
+                    &resolved,
+                    &column,
+                    &mut seen,
+                )?;
+            }
         }
         Ok(seen.len() as u64)
+    }
+
+    /// Overlapping blocks, with the zone set to union when the block is fully inside.
+    ///
+    /// A missing zone, a bloom, or any column this path cannot trust is
+    /// [`ZoneDistinct::Walk`]. The sparse index only drops blocks that cannot
+    /// overlap the range.
+    fn prepare_zone_distinct_blocks(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        column: &DistinctColumn,
+    ) -> Vec<(segment::BlockMeta, ZoneDistinct)> {
+        let catalog = self.catalog();
+        let mut blocks = Vec::new();
+        for segment in &catalog.segments {
+            for (index, block) in segment.blocks.iter().enumerate() {
+                if block.max_ts < from_ms || block.min_ts > to_ms {
+                    continue;
+                }
+                let answer = segment
+                    .zones
+                    .get(index)
+                    .and_then(|zone| zone.columns.get(column.index))
+                    .map(|zone| zone_distinct_values(column.ty, zone))
+                    .unwrap_or(ZoneDistinct::Walk);
+                blocks.push((block.clone(), answer));
+            }
+        }
+        blocks
+    }
+
+    /// Timestamp prefix of one block. A single frame is the whole block.
+    ///
+    /// An empty block is not a proof. The sparse index is not this check.
+    fn read_distinct_prefix(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+    ) -> Result<Vec<u8>> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(self.schema.timestamp_index),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        Ok(payload)
+    }
+
+    fn absorb_distinct_block(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+        column: &DistinctColumn,
+        seen: &mut DistinctSet,
+    ) -> Result<()> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(needed_column(&self.schema, resolved, Some(column.index))),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        self.absorb_distinct_payload(&payload, from_ms, to_ms, resolved, column, seen)
+    }
+
+    fn absorb_distinct_payload(
+        &self,
+        payload: &[u8],
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+        column: &DistinctColumn,
+        seen: &mut DistinctSet,
+    ) -> Result<()> {
+        let timestamp_field = column.index == self.schema.timestamp_index;
+        let mut captures = if timestamp_field {
+            Vec::new()
+        } else {
+            capture_columns([column.index])
+        };
+        visit_matching_timestamps(
+            &self.schema,
+            &payload,
+            from_ms,
+            to_ms,
+            &resolved.predicates,
+            &resolved.ranges,
+            &mut captures,
+            |ts, row, captured| {
+                if timestamp_field {
+                    return seen.note(&column.name, column.ty, &Scalar::Timestamp(ts));
+                }
+                let scalar = captured
+                    .first()
+                    .and_then(|slot| slot.values.get(row))
+                    .ok_or_else(|| {
+                        Error::corrupt(format!("field `{}` is missing a row", column.name))
+                    })?;
+                seen.note(&column.name, column.ty, scalar)
+            },
+        )
     }
 
     /// The `k` values of `field` that occur most often inside the filtered window.
@@ -1085,8 +1323,9 @@ impl Store {
     /// map can reject is not read. Rows that share a block with a match are
     /// filtered while the block is decoded.
     ///
-    /// A request that asks only for `min` and `max`, with no `sum` and no row
-    /// predicate, reads each surviving block's timestamp column. When every
+    /// A request that asks only for `min` and `max`, with no `sum`, no `var`,
+    /// no `stddev`, and no row predicate, reads each surviving block's timestamp
+    /// column. When every
     /// payload timestamp is inside the inclusive range, int, decimal, and float
     /// extremes come from that block's zone, including a column that also holds
     /// nulls. An all-null column contributes nothing. An unknown zone, including
@@ -1097,13 +1336,13 @@ impl Store {
     /// still decodes.
     ///
     /// A request for one int, timestamp, or decimal `sum`, with no `min`, no
-    /// `max`, and no row predicate, reads each surviving block's timestamp
+    /// `max`, no `var`, no `stddev`, and no row predicate, reads each surviving block's timestamp
     /// column. When every payload timestamp is inside the inclusive range and
     /// the target column has no nulls, a constant, a stride, or stride pieces
     /// are added in row order into the 128-bit accumulator. Other columns in
     /// that block are not decoded. A null, a bit-packed or frame-of-reference
     /// column, a block the timestamp column does not place entirely inside the
-    /// range, or a `min` or `max` keeps the row visitor, including the overflow
+    /// range, a `min` or `max`, or a variance keeps the row visitor, including the overflow
     /// error that visitor already returns. The sparse index is not that check.
     ///
     /// Nulls do not contribute. A column whose matching values are all null, or
@@ -1112,17 +1351,40 @@ impl Store {
     /// [`Error::Event`](Error::Event) if that accumulator would overflow. A
     /// float sum is IEEE-754 addition in ingest order inside a block and in
     /// block order across the store. When the request is that one float sum,
-    /// with no `min`, no `max`, and no row predicate, a block whose every
+    /// with no `min`, no `max`, no `var`, no `stddev`, and no row predicate, a block whose every
     /// payload timestamp is inside the range and whose float column has no
     /// nulls is added from the encoded constant, raw frame, or repeated decimal
     /// stride. The other columns of that block are not visited. The sparse
     /// index is not the inside check. A null, a non-finite value, a block the
-    /// range cuts, a `min` or `max`, or a predicate still visits matching rows,
+    /// range cuts, a `min` or `max`, a variance, or a predicate still visits matching rows,
     /// including the error a non-finite float already returns. A finished float
     /// sum that is not finite returns [`Error::Event`](Error::Event) and no
     /// column stats. A non-finite float already stored is
-    /// [`Error::Corrupt`](Error::Corrupt). At least one of `sum`, `min`, or
-    /// `max` is required. A bool, string, text, or json column is
+    /// [`Error::Corrupt`](Error::Corrupt).
+    ///
+    /// `var` is the population variance and `stddev` is its square root. Nulls
+    /// do not contribute to either. No non-null match leaves both empty, which
+    /// is not zero. One non-null value is zero. A float variance is the
+    /// IEEE-754 value of `(sum_of_squares / n) - (sum / n)^2`, including a
+    /// negative result of cancellation. Both sums accumulate in ingest order
+    /// inside a block and in block order across the store, the same order a
+    /// float sum uses. The square root runs only when `stddev` was requested.
+    /// A negative float variance together with `stddev` returns
+    /// [`Error::Event`](Error::Event) and no column stats; the message says
+    /// the computed variance is negative. A non-finite float moment, or a
+    /// non-finite square root when `stddev` was requested, returns that same
+    /// error for overflow. An int or timestamp variance is the exact rational
+    /// `(n * sum_of_squares - sum^2) / n^2` in lowest terms, in the same
+    /// integer units the 128-bit sum accumulates. A decimal variance divides
+    /// that rational by `10^(2*scale)` and reduces again, so it uses the same
+    /// decimal units as `sum`, `min`, and `max`. Scale 0 is unchanged.
+    /// A denominator of 1 is the integer digits. A denominator whose prime
+    /// factors are only 2 and 5 is the shortest decimal. Anything else is
+    /// `numerator/denominator` with a positive denominator. `stddev` of those
+    /// types is the f64 square root of that rational. A sum or a sum of squares
+    /// that does not fit in 128 bits returns [`Error::Event`](Error::Event)
+    /// and no column stats. At least one of `sum`, `min`, `max`, `var`, or
+    /// `stddev` is required. A bool, string, text, or json column is
     /// [`Error::Schema`](Error::Schema). Checks run before the store is read.
     pub fn aggregate_with_filter(
         &self,
@@ -1138,7 +1400,9 @@ impl Store {
         let _retention = self.pipeline.lock_for_read();
         let mut running: Vec<RunningStat> = specs.into_iter().map(RunningStat::new).collect();
         let dense_float = dense_float_sum(&running, &resolved);
-        let minmax_only = running.iter().all(|stat| !stat.spec.sum);
+        let minmax_only = running
+            .iter()
+            .all(|stat| !stat.spec.sum && !stat.spec.needs_moment());
         let exact_sum_only = exact_sum_request(&running);
         let mut dictionaries = HashMap::new();
         if minmax_only && resolved.unfiltered() {
@@ -1228,11 +1492,11 @@ impl Store {
     ///
     /// `by` is a bool, string, text, int, timestamp, or decimal field. A float
     /// or json column, an empty name, or an unknown field is an error and does
-    /// not read the store. The field may also be a `sum`, `min`, or `max`
-    /// target. At least one of those is still required.
+    /// not read the store. The field may also be a `sum`, `min`, `max`, `var`,
+    /// or `stddev` target. At least one of those is still required.
     ///
     /// Each group's `columns` are the aggregates of the rows with that key.
-    /// Nulls do not contribute to `sum`, `min`, or `max`. A null key is its own
+    /// Nulls do not contribute to `sum`, `min`, `max`, `var`, or `stddev`. A null key is its own
     /// group. Groups are ordered by the key: null first, then numeric order for
     /// int, timestamp, and decimal, `false` then `true` for bool, and byte order
     /// for string and text. An empty match is an empty list.
@@ -2249,6 +2513,14 @@ struct ResolvedStat {
     sum: bool,
     min: bool,
     max: bool,
+    var: bool,
+    stddev: bool,
+}
+
+impl ResolvedStat {
+    fn needs_moment(&self) -> bool {
+        self.var || self.stddev
+    }
 }
 
 struct ResolvedGroup {
@@ -2288,7 +2560,11 @@ struct LatestHit {
 struct RunningStat {
     spec: ResolvedStat,
     exact: i128,
+    exact_sq: i128,
     float_sum: f64,
+    float_sq: f64,
+    /// Non-null values folded into `var` and `stddev`.
+    n: u64,
     contributed: bool,
     min: Option<Scalar>,
     max: Option<Scalar>,
@@ -2299,7 +2575,10 @@ impl RunningStat {
         Self {
             spec,
             exact: 0,
+            exact_sq: 0,
             float_sum: 0.0,
+            float_sq: 0.0,
+            n: 0,
             contributed: false,
             min: None,
             max: None,
@@ -2328,12 +2607,18 @@ impl RunningStat {
                 )))
             }
         };
-        if self.spec.sum {
+        let moment = self.spec.needs_moment();
+        if self.spec.sum || moment {
             match numeric {
-                Scalar::Float(value) => self.float_sum += value,
-                Scalar::Int(value) => self.add_exact(i128::from(value))?,
-                Scalar::Timestamp(value) => self.add_exact(i128::from(value))?,
-                Scalar::Decimal(value) => self.add_exact(value)?,
+                Scalar::Float(value) => {
+                    self.float_sum += value;
+                    if moment {
+                        self.float_sq += value * value;
+                    }
+                }
+                Scalar::Int(value) => self.absorb_integer(i128::from(value), moment)?,
+                Scalar::Timestamp(value) => self.absorb_integer(i128::from(value), moment)?,
+                Scalar::Decimal(value) => self.absorb_integer(value, moment)?,
                 _ => {
                     return Err(Error::corrupt(format!(
                         "field `{}` has a value that does not match its type",
@@ -2341,6 +2626,12 @@ impl RunningStat {
                     )))
                 }
             }
+        }
+        if moment {
+            self.n = self
+                .n
+                .checked_add(1)
+                .ok_or_else(|| variance_overflow(&self.spec.name))?;
         }
         self.contributed = true;
         if self.spec.min {
@@ -2352,15 +2643,33 @@ impl RunningStat {
         Ok(())
     }
 
+    fn absorb_integer(&mut self, value: i128, moment: bool) -> Result<()> {
+        self.add_exact(value)?;
+        if moment {
+            let square = value
+                .checked_mul(value)
+                .ok_or_else(|| variance_overflow(&self.spec.name))?;
+            self.exact_sq = self
+                .exact_sq
+                .checked_add(square)
+                .ok_or_else(|| variance_overflow(&self.spec.name))?;
+        }
+        Ok(())
+    }
+
     fn add_exact(&mut self, value: i128) -> Result<()> {
-        self.exact = self
-            .exact
-            .checked_add(value)
-            .ok_or_else(|| Error::event(format!("sum of `{}` overflowed", self.spec.name)))?;
+        self.exact = self.exact.checked_add(value).ok_or_else(|| {
+            if self.spec.sum {
+                Error::event(format!("sum of `{}` overflowed", self.spec.name))
+            } else {
+                variance_overflow(&self.spec.name)
+            }
+        })?;
         Ok(())
     }
 
     fn finish(self) -> Result<ColumnStats> {
+        let (var, stddev) = self.moments()?;
         let sum = if self.spec.sum {
             Some(match self.spec.ty {
                 FieldType::Float => {
@@ -2388,8 +2697,86 @@ impl RunningStat {
             sum,
             min: self.spec.min.then_some(self.min),
             max: self.spec.max.then_some(self.max),
+            var,
+            stddev,
         })
     }
+
+    fn moments(&self) -> Result<(Option<Option<StatVar>>, Option<Option<f64>>)> {
+        if !self.spec.needs_moment() {
+            return Ok((None, None));
+        }
+        if self.n == 0 {
+            return Ok((
+                self.spec.var.then_some(None),
+                self.spec.stddev.then_some(None),
+            ));
+        }
+        let (var_value, dev) = match self.spec.ty {
+            FieldType::Float => {
+                let n = self.n as f64;
+                let mean = self.float_sum / n;
+                let var = (self.float_sq / n) - (mean * mean);
+                if !var.is_finite() {
+                    return Err(variance_overflow(&self.spec.name));
+                }
+                // Cancellation can leave a finite negative moment. That number is
+                // the variance. The square root runs only when stddev was
+                // requested, and a negative radicand fails the whole response.
+                let dev = if self.spec.stddev {
+                    if var < 0.0 {
+                        return Err(variance_negative(&self.spec.name));
+                    }
+                    let dev = var.sqrt();
+                    if !dev.is_finite() {
+                        return Err(variance_overflow(&self.spec.name));
+                    }
+                    dev
+                } else {
+                    0.0
+                };
+                (StatVar::Float(var), dev)
+            }
+            FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. } => {
+                let mut reduced = exact_population_var(self.n, self.exact, self.exact_sq)
+                    .map_err(|_| variance_overflow(&self.spec.name))?;
+                if let FieldType::Decimal { scale } = self.spec.ty {
+                    reduced = scale_decimal_var(reduced, scale);
+                }
+                let dev = if self.spec.stddev {
+                    let dev = reduced.stddev();
+                    if !dev.is_finite() {
+                        return Err(variance_overflow(&self.spec.name));
+                    }
+                    dev
+                } else {
+                    0.0
+                };
+                (StatVar::Exact(reduced.format()), dev)
+            }
+            _ => {
+                return Err(Error::schema(format!(
+                    "stat does not apply to {} column `{}`",
+                    self.spec.ty.name(),
+                    self.spec.name
+                )))
+            }
+        };
+        Ok((
+            self.spec.var.then_some(Some(var_value)),
+            self.spec.stddev.then_some(Some(dev)),
+        ))
+    }
+}
+
+fn variance_overflow(name: &str) -> Error {
+    Error::event(format!("variance of `{name}` overflowed"))
+}
+
+fn variance_negative(name: &str) -> Error {
+    Error::event(format!(
+        "variance of `{name}` is negative; the computed variance is negative"
+    ))
 }
 
 /// Per-column answer copied out of the zone before the payload is read.
@@ -2454,7 +2841,7 @@ fn fold_stat_payload(
     )
 }
 
-/// One int, timestamp, or decimal `sum`, with no `min` and no `max`.
+/// One int, timestamp, or decimal `sum`, with no `min`, `max`, or variance.
 fn exact_sum_request(running: &[RunningStat]) -> bool {
     let [stat] = running else {
         return false;
@@ -2462,6 +2849,7 @@ fn exact_sum_request(running: &[RunningStat]) -> bool {
     stat.spec.sum
         && !stat.spec.min
         && !stat.spec.max
+        && !stat.spec.needs_moment()
         && matches!(
             stat.spec.ty,
             FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. }
@@ -2552,15 +2940,17 @@ fn stat_value(
 }
 
 fn resolve_stat_requests(schema: &Schema, stats: &[StatRequest]) -> Result<Vec<ResolvedStat>> {
-    if stats.is_empty() || stats.iter().all(|stat| !stat.sum && !stat.min && !stat.max) {
-        return Err(Error::event("at least one of sum, min, or max is required"));
+    if stats.is_empty() || stats.iter().all(|stat| !stat_requested(stat)) {
+        return Err(Error::event(
+            "at least one of sum, min, max, var, or stddev is required",
+        ));
     }
     let mut resolved: Vec<ResolvedStat> = Vec::new();
     for stat in stats {
         if stat.field.is_empty() {
             return Err(Error::event("stat field name is empty"));
         }
-        if !stat.sum && !stat.min && !stat.max {
+        if !stat_requested(stat) {
             continue;
         }
         let index = schema
@@ -2583,6 +2973,8 @@ fn resolve_stat_requests(schema: &Schema, stats: &[StatRequest]) -> Result<Vec<R
             existing.sum |= stat.sum;
             existing.min |= stat.min;
             existing.max |= stat.max;
+            existing.var |= stat.var;
+            existing.stddev |= stat.stddev;
         } else {
             resolved.push(ResolvedStat {
                 index,
@@ -2591,13 +2983,21 @@ fn resolve_stat_requests(schema: &Schema, stats: &[StatRequest]) -> Result<Vec<R
                 sum: stat.sum,
                 min: stat.min,
                 max: stat.max,
+                var: stat.var,
+                stddev: stat.stddev,
             });
         }
     }
     if resolved.is_empty() {
-        return Err(Error::event("at least one of sum, min, or max is required"));
+        return Err(Error::event(
+            "at least one of sum, min, max, var, or stddev is required",
+        ));
     }
     Ok(resolved)
+}
+
+fn stat_requested(stat: &StatRequest) -> bool {
+    stat.sum || stat.min || stat.max || stat.var || stat.stddev
 }
 
 struct DistinctColumn {
@@ -3011,6 +3411,23 @@ impl DistinctSet {
         insert_new(values, bits)
     }
 
+    fn insert_i128(&mut self, value: i128) -> Result<()> {
+        match self {
+            DistinctSet::Int(_) => {
+                let value = i64::try_from(value)
+                    .map_err(|_| Error::corrupt("distinct integer does not fit in i64"))?;
+                self.insert_int(value)
+            }
+            DistinctSet::Timestamp(_) => {
+                let value = i64::try_from(value)
+                    .map_err(|_| Error::corrupt("distinct timestamp does not fit in i64"))?;
+                self.insert_timestamp(value)
+            }
+            DistinctSet::Decimal(_) => self.insert_decimal(value),
+            _ => Err(Error::corrupt("distinct set does not match the column")),
+        }
+    }
+
     fn insert_str(&mut self, value: &str) -> Result<()> {
         let DistinctSet::Str(values, bytes) = self else {
             return Err(Error::corrupt("distinct set does not match the column"));
@@ -3029,6 +3446,75 @@ impl DistinctSet {
         *bytes = next;
         Ok(())
     }
+}
+
+fn spill_distinct_runs(runs: &[(i128, i128)], seen: &mut DistinctSet) -> Result<()> {
+    for (lo, hi) in merge_distinct_runs(runs) {
+        let len = inclusive_run_len(lo, hi)
+            .ok_or_else(|| Error::event("distinct value limit exceeded"))?;
+        if seen.len() as u128 + len > MAX_DISTINCT_VALUES as u128 {
+            return Err(Error::event("distinct value limit exceeded"));
+        }
+        let mut value = lo;
+        loop {
+            seen.insert_i128(value)?;
+            if value == hi {
+                break;
+            }
+            value = value
+                .checked_add(1)
+                .ok_or_else(|| Error::event("distinct value limit exceeded"))?;
+        }
+    }
+    Ok(())
+}
+
+fn union_distinct_count(runs: &[(i128, i128)]) -> Result<u64> {
+    let mut total = 0u128;
+    for (lo, hi) in merge_distinct_runs(runs) {
+        let len = inclusive_run_len(lo, hi)
+            .ok_or_else(|| Error::event("distinct value limit exceeded"))?;
+        total = total.saturating_add(len);
+        if total > MAX_DISTINCT_VALUES as u128 {
+            return Err(Error::event("distinct value limit exceeded"));
+        }
+    }
+    Ok(total as u64)
+}
+
+fn merge_distinct_runs(runs: &[(i128, i128)]) -> Vec<(i128, i128)> {
+    let mut ordered: Vec<(i128, i128)> = runs
+        .iter()
+        .copied()
+        .map(|(lo, hi)| if lo <= hi { (lo, hi) } else { (hi, lo) })
+        .collect();
+    ordered.sort_unstable();
+    let mut merged = Vec::new();
+    let Some((mut cur_lo, mut cur_hi)) = ordered.first().copied() else {
+        return merged;
+    };
+    for (lo, hi) in ordered.into_iter().skip(1) {
+        let touches = match cur_hi.checked_add(1) {
+            Some(next) => lo <= next,
+            None => true,
+        };
+        if touches {
+            if hi > cur_hi {
+                cur_hi = hi;
+            }
+        } else {
+            merged.push((cur_lo, cur_hi));
+            cur_lo = lo;
+            cur_hi = hi;
+        }
+    }
+    merged.push((cur_lo, cur_hi));
+    merged
+}
+
+fn inclusive_run_len(lo: i128, hi: i128) -> Option<u128> {
+    let width = (hi as u128).wrapping_sub(lo as u128);
+    width.checked_add(1)
 }
 
 fn insert_new<T: Eq + std::hash::Hash>(values: &mut HashSet<T>, value: T) -> Result<()> {
@@ -3289,6 +3775,51 @@ fn cmp_top_value(left: &Scalar, right: &Scalar) -> Ordering {
         (Scalar::Float(left), Scalar::Float(right)) => left.total_cmp(right),
         (Scalar::Str(left), Scalar::Str(right)) => left.cmp(right),
         _ => Ordering::Equal,
+    }
+}
+
+enum ZoneDistinct {
+    /// Non-null values to union once every payload timestamp is inside the range.
+    Contained(Vec<Scalar>),
+    Walk,
+}
+
+fn zone_distinct_column(ty: FieldType) -> bool {
+    matches!(ty, FieldType::Bool | FieldType::String | FieldType::Text)
+}
+
+fn zone_distinct_values(ty: FieldType, column: &crate::zone::ColumnZone) -> ZoneDistinct {
+    match (ty, column) {
+        (FieldType::Bool, crate::zone::ColumnZone::AllNull) => ZoneDistinct::Contained(Vec::new()),
+        (
+            FieldType::Bool,
+            crate::zone::ColumnZone::Bool {
+                has_false,
+                has_true,
+                ..
+            },
+        ) => {
+            let mut values = Vec::new();
+            if *has_false {
+                values.push(Scalar::Bool(false));
+            }
+            if *has_true {
+                values.push(Scalar::Bool(true));
+            }
+            ZoneDistinct::Contained(values)
+        }
+        (FieldType::String | FieldType::Text, crate::zone::ColumnZone::AllNull) => {
+            ZoneDistinct::Contained(Vec::new())
+        }
+        (FieldType::String | FieldType::Text, crate::zone::ColumnZone::Exact { values, .. }) => {
+            ZoneDistinct::Contained(
+                values
+                    .iter()
+                    .map(|text| Scalar::Str(text.clone()))
+                    .collect(),
+            )
+        }
+        _ => ZoneDistinct::Walk,
     }
 }
 
@@ -3680,7 +4211,12 @@ fn dense_float_sum(stats: &[RunningStat], resolved: &ResolvedScan) -> Option<usi
         return None;
     }
     let stat = &stats[0];
-    if stat.spec.ty == FieldType::Float && stat.spec.sum && !stat.spec.min && !stat.spec.max {
+    if stat.spec.ty == FieldType::Float
+        && stat.spec.sum
+        && !stat.spec.min
+        && !stat.spec.max
+        && !stat.spec.needs_moment()
+    {
         Some(stat.spec.index)
     } else {
         None
@@ -3718,8 +4254,469 @@ fn empty_column_stats(columns: &[ResolvedStat]) -> Vec<ColumnStats> {
             }),
             min: column.min.then_some(None),
             max: column.max.then_some(None),
+            var: column.var.then_some(None),
+            stddev: column.stddev.then_some(None),
         })
         .collect()
+}
+
+/// Reduced population variance `(n * sum_sq - sum^2) / n^2`.
+///
+/// `extra_twos` and `extra_fives` are factors of the denominator that did not
+/// fit in `denom` after dividing a decimal variance by `10^(2*scale)`. The
+/// value is `numer / (denom * 2^extra_twos * 5^extra_fives)`.
+struct ReducedVar {
+    numer: U256,
+    denom: u128,
+    extra_twos: u32,
+    extra_fives: u32,
+}
+
+impl ReducedVar {
+    fn stddev(&self) -> f64 {
+        if self.denom == 0 {
+            return f64::INFINITY;
+        }
+        let mut value = u256_to_f64(self.numer) / self.denom as f64;
+        if self.extra_twos > 0 {
+            value /= 2f64.powi(self.extra_twos as i32);
+        }
+        if self.extra_fives > 0 {
+            value /= 5f64.powi(self.extra_fives as i32);
+        }
+        value.sqrt()
+    }
+
+    fn format(&self) -> String {
+        if self.extra_twos == 0 && self.extra_fives == 0 {
+            return format_reduced(self.numer, self.denom);
+        }
+        if let Some((twos, fives)) = factor_two_five(self.denom) {
+            let twos = twos + self.extra_twos;
+            let fives = fives + self.extra_fives;
+            let places = twos.max(fives);
+            let mut numer = self.numer;
+            let mut fit = true;
+            for _ in 0..fives.saturating_sub(twos) {
+                match numer.mul_u64(2) {
+                    Some(next) => numer = next,
+                    None => fit = false,
+                }
+                if !fit {
+                    break;
+                }
+            }
+            if fit {
+                for _ in 0..twos.saturating_sub(fives) {
+                    match numer.mul_u64(5) {
+                        Some(next) => numer = next,
+                        None => {
+                            fit = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if fit {
+                return insert_decimal_point(&format_u256(numer), places as usize);
+            }
+        }
+        let mut denom = self.denom.to_string();
+        for _ in 0..self.extra_twos {
+            denom = mul_decimal_string(&denom, 2);
+        }
+        for _ in 0..self.extra_fives {
+            denom = mul_decimal_string(&denom, 5);
+        }
+        format!("{}/{}", format_u256(self.numer), denom)
+    }
+}
+
+fn format_reduced(numer: U256, denom: u128) -> String {
+    if denom == 1 {
+        return format_u256(numer);
+    }
+    if let Some((twos, fives)) = factor_two_five(denom) {
+        let places = twos.max(fives) as usize;
+        let (whole, mut rem) =
+            div_rem_u128(numer, denom).expect("reduced variance denominator is non-zero");
+        let mut frac = String::new();
+        for _ in 0..places {
+            let prod = U256::from_u128(rem)
+                .mul_u64(10)
+                .expect("one decimal step of a u128 remainder fits");
+            let (digit, next) =
+                div_rem_u128(prod, denom).expect("decimal digit divisor is non-zero");
+            frac.push(char::from(b'0' + digit.low_u64() as u8));
+            rem = next;
+        }
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        let whole = format_u256(whole);
+        if frac.is_empty() {
+            whole
+        } else {
+            format!("{whole}.{frac}")
+        }
+    } else {
+        format!("{}/{}", format_u256(numer), denom)
+    }
+}
+
+fn insert_decimal_point(digits: &str, places: usize) -> String {
+    if places == 0 {
+        return digits.to_string();
+    }
+    let digits = if digits.len() > places {
+        digits.to_string()
+    } else {
+        format!("{}{digits}", "0".repeat(places + 1 - digits.len()))
+    };
+    let split = digits.len() - places;
+    let whole = &digits[..split];
+    let mut frac = digits[split..].to_string();
+    while frac.ends_with('0') {
+        frac.pop();
+    }
+    if frac.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{frac}")
+    }
+}
+
+fn mul_decimal_string(digits: &str, factor: u32) -> String {
+    let bytes = digits.as_bytes();
+    let mut out = vec![b'0'; bytes.len() + 1];
+    let mut carry = 0u32;
+    for index in (0..bytes.len()).rev() {
+        let digit = u32::from(bytes[index] - b'0');
+        let prod = digit * factor + carry;
+        out[index + 1] = b'0' + (prod % 10) as u8;
+        carry = prod / 10;
+    }
+    out[0] = b'0' + carry as u8;
+    let text = String::from_utf8(out).expect("decimal digits are ascii");
+    let trimmed = text.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Divide a reduced population variance by `10^(2*scale)` and reduce again.
+fn scale_decimal_var(var: ReducedVar, scale: u32) -> ReducedVar {
+    if scale == 0 {
+        return var;
+    }
+    let exp = scale.saturating_mul(2);
+    let mut numer = var.numer;
+    let mut twos = exp;
+    let mut fives = exp;
+    while twos > 0 && !numer.is_zero() && numer.limbs[0] % 2 == 0 {
+        numer = numer.shr1();
+        twos -= 1;
+    }
+    while fives > 0 && !numer.is_zero() {
+        let Some((quot, rem)) = div_rem_u128(numer, 5) else {
+            break;
+        };
+        if rem != 0 {
+            break;
+        }
+        numer = quot;
+        fives -= 1;
+    }
+    let mut denom = var.denom;
+    while twos > 0 {
+        match denom.checked_mul(2) {
+            Some(next) => {
+                denom = next;
+                twos -= 1;
+            }
+            None => break,
+        }
+    }
+    while fives > 0 {
+        match denom.checked_mul(5) {
+            Some(next) => {
+                denom = next;
+                fives -= 1;
+            }
+            None => break,
+        }
+    }
+    ReducedVar {
+        numer,
+        denom,
+        extra_twos: twos,
+        extra_fives: fives,
+    }
+}
+
+fn exact_population_var(n: u64, sum: i128, sum_sq: i128) -> Result<ReducedVar> {
+    if n == 0 || sum_sq < 0 {
+        return Err(Error::event("variance overflowed"));
+    }
+    let sum_sq = U256::from_u128(sum_sq as u128);
+    let n_sum_sq = sum_sq
+        .mul_u64(n)
+        .ok_or_else(|| Error::event("variance overflowed"))?;
+    let sum_squared = U256::from_limbs(mul_limbs(sum.unsigned_abs(), sum.unsigned_abs()));
+    let numer = n_sum_sq
+        .checked_sub(sum_squared)
+        .ok_or_else(|| Error::event("variance overflowed"))?;
+    let denom = u128::from(n)
+        .checked_mul(u128::from(n))
+        .ok_or_else(|| Error::event("variance overflowed"))?;
+    let gcd = gcd_u128(numer, denom);
+    let numer = div_rem_u128(numer, gcd)
+        .ok_or_else(|| Error::event("variance overflowed"))?
+        .0;
+    Ok(ReducedVar {
+        numer,
+        denom: denom / gcd,
+        extra_twos: 0,
+        extra_fives: 0,
+    })
+}
+
+/// Little-endian 64-bit limbs.
+#[derive(Clone, Copy, Debug)]
+struct U256 {
+    limbs: [u64; 4],
+}
+
+impl U256 {
+    fn zero() -> Self {
+        Self { limbs: [0; 4] }
+    }
+
+    fn from_limbs(limbs: [u64; 4]) -> Self {
+        Self { limbs }
+    }
+
+    fn from_u128(value: u128) -> Self {
+        Self {
+            limbs: [value as u64, (value >> 64) as u64, 0, 0],
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        self.limbs.iter().all(|limb| *limb == 0)
+    }
+
+    fn bit_len(self) -> u32 {
+        for (index, limb) in self.limbs.iter().copied().enumerate().rev() {
+            if limb != 0 {
+                return index as u32 * 64 + (64 - limb.leading_zeros());
+            }
+        }
+        0
+    }
+
+    fn bit(self, index: u32) -> u64 {
+        let limb = self.limbs[(index / 64) as usize];
+        (limb >> (index % 64)) & 1
+    }
+
+    fn set_bit(&mut self, index: u32) {
+        self.limbs[(index / 64) as usize] |= 1u64 << (index % 64);
+    }
+
+    fn cmp(self, other: Self) -> Ordering {
+        self.limbs.iter().rev().cmp(other.limbs.iter().rev())
+    }
+
+    fn shr1(self) -> Self {
+        let mut out = [0u64; 4];
+        let mut carry = 0u64;
+        for index in (0..4).rev() {
+            let next = self.limbs[index] & 1;
+            out[index] = (self.limbs[index] >> 1) | (carry << 63);
+            carry = next;
+        }
+        Self { limbs: out }
+    }
+
+    fn shl1_add(self, bit: u64) -> Self {
+        let mut out = [0u64; 4];
+        let mut carry = bit;
+        for i in 0..4 {
+            let next = self.limbs[i] >> 63;
+            out[i] = (self.limbs[i] << 1) | carry;
+            carry = next;
+        }
+        debug_assert_eq!(carry, 0);
+        Self { limbs: out }
+    }
+
+    fn checked_sub(self, other: Self) -> Option<Self> {
+        let mut out = [0u64; 4];
+        let mut borrow = 0u64;
+        for i in 0..4 {
+            let (diff, borrowed) = self.limbs[i].overflowing_sub(other.limbs[i]);
+            let (diff, borrowed_more) = diff.overflowing_sub(borrow);
+            out[i] = diff;
+            borrow = u64::from(borrowed || borrowed_more);
+        }
+        if borrow == 0 {
+            Some(Self { limbs: out })
+        } else {
+            None
+        }
+    }
+
+    fn mul_u64(self, rhs: u64) -> Option<Self> {
+        let mut out = [0u64; 4];
+        let mut carry = 0u128;
+        for i in 0..4 {
+            let prod = self.limbs[i] as u128 * u128::from(rhs) + carry;
+            out[i] = prod as u64;
+            carry = prod >> 64;
+        }
+        if carry == 0 {
+            Some(Self { limbs: out })
+        } else {
+            None
+        }
+    }
+
+    fn as_u128(self) -> Option<u128> {
+        if self.limbs[2] != 0 || self.limbs[3] != 0 {
+            None
+        } else {
+            Some((self.limbs[1] as u128) << 64 | self.limbs[0] as u128)
+        }
+    }
+
+    fn low_u64(self) -> u64 {
+        self.limbs[0]
+    }
+}
+
+fn div_rem_u128(numer: U256, denom: u128) -> Option<(U256, u128)> {
+    if denom == 0 {
+        return None;
+    }
+    let divisor = U256::from_u128(denom);
+    let mut quot = U256::zero();
+    let mut rem = U256::zero();
+    let bits = numer.bit_len();
+    for index in (0..bits).rev() {
+        rem = rem.shl1_add(numer.bit(index));
+        if rem.cmp(divisor) != Ordering::Less {
+            rem = rem.checked_sub(divisor)?;
+            quot.set_bit(index);
+        }
+    }
+    Some((quot, rem.as_u128()?))
+}
+
+fn gcd_u128(mut numer: U256, mut denom: u128) -> u128 {
+    while denom != 0 {
+        let Some((_, rem)) = div_rem_u128(numer, denom) else {
+            return 1;
+        };
+        numer = U256::from_u128(denom);
+        denom = rem;
+    }
+    numer.as_u128().unwrap_or(1)
+}
+
+fn factor_two_five(mut denom: u128) -> Option<(u32, u32)> {
+    if denom == 0 {
+        return None;
+    }
+    let mut twos = 0u32;
+    while denom % 2 == 0 {
+        denom /= 2;
+        twos += 1;
+    }
+    let mut fives = 0u32;
+    while denom % 5 == 0 {
+        denom /= 5;
+        fives += 1;
+    }
+    (denom == 1).then_some((twos, fives))
+}
+
+fn format_u256(mut value: U256) -> String {
+    if value.is_zero() {
+        return "0".to_string();
+    }
+    let mut digits = Vec::new();
+    while !value.is_zero() {
+        let (quot, rem) = div_rem_u128(value, 10).expect("dividing by ten");
+        digits.push(char::from(b'0' + rem as u8));
+        value = quot;
+    }
+    digits.iter().rev().collect()
+}
+
+/// Round `n` to the nearest f64, ties to even.
+fn u256_to_f64(n: U256) -> f64 {
+    let bits = n.bit_len();
+    if bits == 0 {
+        return 0.0;
+    }
+    if bits <= 53 {
+        return n.low_u64() as f64;
+    }
+    if bits > 1024 {
+        return f64::INFINITY;
+    }
+    let shift = bits - 54;
+    let top = shr_u256_u64(n, shift);
+    let mut mant = top >> 1;
+    let round = top & 1 == 1;
+    let sticky = shift > 0 && low_bits_nonzero(n, shift);
+    if round && (sticky || mant & 1 == 1) {
+        mant += 1;
+    }
+    let mut exp = bits - 1;
+    if mant == 1 << 53 {
+        mant >>= 1;
+        exp += 1;
+    }
+    if exp >= 1024 {
+        return f64::INFINITY;
+    }
+    let frac = mant & ((1u64 << 52) - 1);
+    f64::from_bits(((u64::from(exp) + 1023) << 52) | frac)
+}
+
+fn shr_u256_u64(n: U256, shift: u32) -> u64 {
+    if shift >= 256 {
+        return 0;
+    }
+    let limb = (shift / 64) as usize;
+    let offset = shift % 64;
+    let low = n.limbs.get(limb).copied().unwrap_or(0);
+    let high = n.limbs.get(limb + 1).copied().unwrap_or(0);
+    if offset == 0 {
+        low
+    } else {
+        (low >> offset) | (high << (64 - offset))
+    }
+}
+
+fn low_bits_nonzero(n: U256, bits: u32) -> bool {
+    if bits == 0 {
+        return false;
+    }
+    let full = (bits / 64) as usize;
+    if n.limbs.iter().take(full).any(|limb| *limb != 0) {
+        return true;
+    }
+    let rem = bits % 64;
+    if rem == 0 {
+        return false;
+    }
+    let mask = (1u64 << rem) - 1;
+    n.limbs[full] & mask != 0
 }
 
 fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<ResolvedScan> {
@@ -9199,7 +10196,384 @@ mod tests {
             sum,
             min,
             max,
+            var: false,
+            stddev: false,
         }
+    }
+
+    fn moment_req(field: &str, var: bool, stddev: bool) -> StatRequest {
+        StatRequest {
+            field: field.to_string(),
+            sum: false,
+            min: false,
+            max: false,
+            var,
+            stddev,
+        }
+    }
+
+    fn exact_var(columns: &[ColumnStats], field: &str) -> (String, Option<f64>) {
+        let column = columns.iter().find(|column| column.field == field).unwrap();
+        let text = match column.var.as_ref().unwrap() {
+            Some(StatVar::Exact(text)) => text.clone(),
+            other => panic!("expected an exact variance, got {other:?}"),
+        };
+        let dev = column.stddev.as_ref().map(|value| value.unwrap());
+        (text, dev)
+    }
+
+    #[test]
+    fn population_variance_uses_the_population_moment() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        for (ts, user, score, amount) in [
+            (1000i64, Some(1i64), 1.0f64, "1.00"),
+            (2000, Some(2), 3.0, "2.00"),
+            (3000, Some(3), 1.0, "3.00"),
+        ] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "score": score,
+                "ok": true,
+                "action": if ts == 3000 { "view" } else { "buy" },
+                "amount": amount,
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        let null_user = serde_json::json!({
+            "ts": 4000,
+            "score": 1.0,
+            "ok": false,
+            "action": "other",
+            "amount": "1.00",
+        });
+        store
+            .append_json(&serde_json::to_vec(&null_user).unwrap())
+            .unwrap();
+        store.flush().unwrap();
+
+        let users = store
+            .aggregate_with_filter(1000, 3000, &[], &[moment_req("user_id", true, true)])
+            .unwrap();
+        let (var, dev) = exact_var(&users, "user_id");
+        assert_eq!(var, "2/3");
+        assert_eq!(dev.unwrap().to_bits(), (2.0f64 / 3.0).sqrt().to_bits());
+        assert!(users[0].sum.is_none());
+        assert!(users[0].min.is_none());
+
+        let one = store
+            .aggregate_with_filter(1000, 1000, &[], &[moment_req("user_id", true, true)])
+            .unwrap();
+        let (var, dev) = exact_var(&one, "user_id");
+        assert_eq!(var, "0");
+        assert_eq!(dev.unwrap().to_bits(), 0.0f64.to_bits());
+
+        let pair = store
+            .aggregate_with_filter(1000, 2000, &[], &[moment_req("user_id", true, false)])
+            .unwrap();
+        assert_eq!(exact_var(&pair, "user_id").0, "0.25");
+        assert!(pair[0].stddev.is_none());
+
+        let timestamps = store
+            .aggregate_with_filter(1000, 3000, &[], &[moment_req("ts", true, true)])
+            .unwrap();
+        let (var, dev) = exact_var(&timestamps, "ts");
+        assert_eq!(var, "2000000/3");
+        assert_eq!(
+            dev.unwrap().to_bits(),
+            (2_000_000.0f64 / 3.0).sqrt().to_bits()
+        );
+
+        let amounts = store
+            .aggregate_with_filter(1000, 3000, &[], &[moment_req("amount", true, true)])
+            .unwrap();
+        let (var, dev) = exact_var(&amounts, "amount");
+        assert_eq!(var, "2/3");
+        assert_eq!(dev.unwrap().to_bits(), (2.0f64 / 3.0).sqrt().to_bits());
+
+        let cents = store
+            .aggregate_with_filter(1000, 2000, &[], &[moment_req("amount", true, true)])
+            .unwrap();
+        let (var, dev) = exact_var(&cents, "amount");
+        assert_eq!(var, "0.25");
+        assert_eq!(dev.unwrap().to_bits(), 0.5f64.to_bits());
+
+        let scores = store
+            .aggregate_with_filter(1000, 2000, &[], &[moment_req("score", true, true)])
+            .unwrap();
+        match scores[0].var.as_ref().unwrap() {
+            Some(StatVar::Float(value)) => assert_eq!(value.to_bits(), 1.0f64.to_bits()),
+            other => panic!("float variance {other:?}"),
+        }
+        assert_eq!(
+            scores[0].stddev.unwrap().unwrap().to_bits(),
+            1.0f64.to_bits()
+        );
+
+        let single_score = store
+            .aggregate_with_filter(1000, 1000, &[], &[moment_req("score", true, true)])
+            .unwrap();
+        match single_score[0].var.as_ref().unwrap() {
+            Some(StatVar::Float(value)) => assert_eq!(*value, 0.0),
+            other => panic!("single float variance {other:?}"),
+        }
+        assert_eq!(single_score[0].stddev.unwrap().unwrap(), 0.0);
+
+        let empty = store
+            .aggregate_with_filter(9000, 9000, &[], &[moment_req("user_id", true, true)])
+            .unwrap();
+        assert_eq!(empty[0].var, Some(None));
+        assert_eq!(empty[0].stddev, Some(None));
+        let only_null = store
+            .aggregate_with_filter(4000, 4000, &[], &[moment_req("user_id", true, true)])
+            .unwrap();
+        assert_eq!(only_null[0].var, Some(None));
+        assert_eq!(only_null[0].stddev, Some(None));
+
+        let text = store.aggregate_with_filter(0, 10, &[], &[moment_req("action", true, false)]);
+        assert!(matches!(text, Err(Error::Schema(_))), "{text:?}");
+
+        let grouped = store
+            .aggregate_grouped(
+                1000,
+                4000,
+                &[],
+                &[moment_req("user_id", true, false)],
+                "action",
+            )
+            .unwrap();
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(grouped[0].key, Scalar::Str("buy".into()));
+        assert_eq!(exact_var(&grouped[0].columns, "user_id").0, "0.25");
+        assert_eq!(grouped[1].key, Scalar::Str("other".into()));
+        assert_eq!(grouped[1].columns[0].var, Some(None));
+        assert_eq!(grouped[2].key, Scalar::Str("view".into()));
+        assert_eq!(exact_var(&grouped[2].columns, "user_id").0, "0");
+
+        let wide = TempDir::new();
+        let schema_path = wide.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let store =
+            Store::open_with(wide.path().join("data"), &schema_path, test_options(8)).unwrap();
+        let huge = i64::MIN;
+        for ts in [1i64, 2] {
+            store
+                .append_json(format!(r#"{{"ts":{ts},"user_id":{huge}}}"#).as_bytes())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let overflow =
+            store.aggregate_with_filter(0, 10, &[], &[moment_req("user_id", true, true)]);
+        assert!(
+            matches!(overflow, Err(Error::Event(ref message)) if message.contains("overflow")),
+            "{overflow:?}"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn negative_float_moment_of_three_tenths_stays_finite() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for ts in [1000i64, 2000, 3000] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": 1,
+                "score": 0.1,
+                "ok": true,
+                "action": "buy",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        let value = 0.1f64;
+        let n = 3.0f64;
+        let sum = value + value + value;
+        let sum_sq = (value * value) + (value * value) + (value * value);
+        let expected = (sum_sq / n) - ((sum / n) * (sum / n));
+        assert!(expected.is_finite() && expected < 0.0, "{expected}");
+
+        let alone = store
+            .aggregate_with_filter(1000, 3000, &[], &[moment_req("score", true, false)])
+            .unwrap();
+        match alone[0].var.as_ref().unwrap() {
+            Some(StatVar::Float(got)) => assert_eq!(got.to_bits(), expected.to_bits()),
+            other => panic!("float variance {other:?}"),
+        }
+        assert!(alone[0].sum.is_none());
+        assert!(alone[0].min.is_none());
+        assert!(alone[0].stddev.is_none());
+
+        let with_sum = store
+            .aggregate_with_filter(
+                1000,
+                3000,
+                &[],
+                &[StatRequest {
+                    field: "score".to_string(),
+                    sum: true,
+                    min: true,
+                    max: false,
+                    var: true,
+                    stddev: false,
+                }],
+            )
+            .unwrap();
+        match with_sum[0].var.as_ref().unwrap() {
+            Some(StatVar::Float(got)) => assert_eq!(got.to_bits(), expected.to_bits()),
+            other => panic!("float variance with sum {other:?}"),
+        }
+        assert_eq!(
+            with_sum[0].sum,
+            Some(StatSum::Float {
+                total: sum,
+                contributed: true,
+            })
+        );
+        assert_eq!(with_sum[0].min, Some(Some(Scalar::Float(value))));
+        assert!(with_sum[0].stddev.is_none());
+
+        let with_dev = store.aggregate_with_filter(
+            1000,
+            3000,
+            &[],
+            &[StatRequest {
+                field: "score".to_string(),
+                sum: true,
+                min: true,
+                max: false,
+                var: true,
+                stddev: true,
+            }],
+        );
+        assert!(
+            matches!(with_dev, Err(Error::Event(ref message)) if message.contains("negative")),
+            "{with_dev:?}"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn float_variance_keeps_a_finite_negative_moment() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for (index, offset) in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0].into_iter().enumerate() {
+            let score = 1e10 + offset;
+            let obj = serde_json::json!({
+                "ts": 1000 + index as i64,
+                "user_id": 1,
+                "score": score,
+                "ok": true,
+                "action": "buy",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let scores = store
+            .aggregate_with_filter(1000, 2000, &[], &[moment_req("score", true, false)])
+            .unwrap();
+        match scores[0].var.as_ref().unwrap() {
+            Some(StatVar::Float(value)) => assert_eq!(value.to_bits(), (-16384.0f64).to_bits()),
+            other => panic!("negative float variance {other:?}"),
+        }
+        assert!(scores[0].stddev.is_none());
+
+        let with_dev =
+            store.aggregate_with_filter(1000, 2000, &[], &[moment_req("score", true, true)]);
+        assert!(
+            matches!(with_dev, Err(Error::Event(ref message)) if message.contains("negative")),
+            "{with_dev:?}"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn population_variance_matches_the_stock_distribution() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2048)).unwrap();
+        let count = 100_000usize;
+        for i in 0..count {
+            let ts = 1_700_000_000_000i64 + i as i64;
+            let amount_cents = (i % 5_000) as i64;
+            let amount = format!("{}.{:02}", amount_cents / 100, amount_cents % 100);
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": (i % 1_000) as i64,
+                "score": (i % 100) as f64 / 10.0,
+                "ok": i % 2 == 0,
+                "action": "click",
+                "amount": amount,
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let from = 1_700_000_000_000i64;
+        let to = from + count as i64;
+        let scores = store
+            .aggregate_with_filter(from, to, &[], &[moment_req("score", true, true)])
+            .unwrap();
+        let expected = 8_332_500.0f64 / 1_000_000.0;
+        match scores[0].var.as_ref().unwrap() {
+            Some(StatVar::Float(value)) => assert_eq!(value.to_bits(), expected.to_bits()),
+            other => panic!("stock score variance {other:?}"),
+        }
+        assert_eq!(
+            scores[0].stddev.unwrap().unwrap().to_bits(),
+            expected.sqrt().to_bits()
+        );
+        let sample = {
+            let n = count as f64;
+            let mut sum = 0.0f64;
+            let mut sum_sq = 0.0f64;
+            for i in 0..count {
+                let value = (i % 100) as f64 / 10.0;
+                sum += value;
+                sum_sq += value * value;
+            }
+            (sum_sq - (sum * sum) / n) / (n - 1.0)
+        };
+        assert_ne!(sample.to_bits(), expected.to_bits());
+
+        let users = store
+            .aggregate_with_filter(from, to, &[], &[moment_req("user_id", true, true)])
+            .unwrap();
+        let (var, dev) = exact_var(&users, "user_id");
+        assert_eq!(var, "83333.25");
+        assert_eq!(
+            dev.unwrap().to_bits(),
+            (333_333.0f64 / 4.0).sqrt().to_bits()
+        );
+        let stored = store.stats();
+        assert!(stored.data_bytes > 0);
+        store.close().unwrap();
     }
 
     fn exact_sum(columns: &[ColumnStats], field: &str) -> (i128, bool) {
@@ -11324,6 +12698,179 @@ mod tests {
     }
 
     #[test]
+    fn unit_stride_distinct_counts_the_union_of_the_runs() {
+        let count_users = |rows: &[(i64, i64)], block_rows: usize, from: i64, to: i64| -> u64 {
+            let dir = TempDir::new();
+            let schema = write_schema(dir.path());
+            let store =
+                Store::open_with(dir.path().join("data"), &schema, test_options(block_rows))
+                    .unwrap();
+            for (ts, user) in rows {
+                store
+                    .append_json(&event(*ts, Some(*user), "click", None, "1.00"))
+                    .unwrap();
+            }
+            store.flush().unwrap();
+            let count = store.distinct_count(from, to, &[], "user_id").unwrap();
+            store.close().unwrap();
+            count
+        };
+
+        assert_eq!(count_users(&[(1, 0), (2, 1), (3, 2), (4, 3)], 8, 1, 4), 4);
+        assert_eq!(
+            count_users(&[(1, 0), (2, 1), (3, 2), (4, 3)], 8, 2, 3),
+            2,
+            "a cut block stays on the row set"
+        );
+        assert_eq!(count_users(&[(1, 5), (2, 4), (3, 3), (4, 2)], 8, 1, 4), 4);
+        assert_eq!(count_users(&[(1, 7), (2, 7), (3, 7)], 8, 1, 3), 1);
+        assert_eq!(
+            count_users(&[(1, 0), (2, 2)], 8, 1, 2),
+            2,
+            "stride 2 is not the closed interval"
+        );
+        assert_eq!(count_users(&[(1, 0), (2, 2), (3, 4)], 8, 1, 3), 3);
+        assert_eq!(
+            count_users(&[(1, 0), (2, 1), (3, 1), (4, 2), (5, 0), (6, 2)], 2, 1, 6),
+            3,
+            "a later stride of 2 is unioned with the unit runs"
+        );
+        assert_eq!(
+            count_users(&[(1, 0), (2, 1), (3, 3), (4, 4)], 2, 1, 4),
+            4,
+            "a gap between unit runs is not filled"
+        );
+        assert_eq!(
+            count_users(&[(1, i64::MAX), (2, i64::MIN), (3, i64::MIN + 1)], 8, 1, 3),
+            3,
+            "wrapping arithmetic is not the closed span of the endpoints"
+        );
+
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, amount) in [(1i64, "0.00"), (2, "0.01"), (3, "0.02")] {
+            store
+                .append_json(&event(ts, Some(1), "click", None, amount))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(1, 3, &[], "amount").unwrap(), 3);
+        store.close().unwrap();
+
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, amount) in [(1i64, "0.00"), (2, "0.02")] {
+            store
+                .append_json(&event(ts, Some(1), "click", None, amount))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(1, 2, &[], "amount").unwrap(), 2);
+        store.close().unwrap();
+
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for ts in [10i64, 20, 30] {
+            store
+                .append_json(&event(ts, Some(1), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(10, 30, &[], "ts").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 10, &[], "ts").unwrap(), 1);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn distinct_count_unions_proved_zones_and_walks_the_rest() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(2)).unwrap();
+        let row = |ts: i64, ok: Option<bool>, action: &str, note: Option<&str>| {
+            let mut value = serde_json::json!({
+                "ts": ts,
+                "user_id": 1,
+                "score": 1.0,
+                "action": action,
+                "amount": "1.00",
+            });
+            if let Some(ok) = ok {
+                value["ok"] = serde_json::json!(ok);
+            }
+            if let Some(note) = note {
+                value["note"] = serde_json::json!(note);
+            }
+            serde_json::to_vec(&value).unwrap()
+        };
+        store
+            .append_json(&row(10, Some(true), "click", Some("a")))
+            .unwrap();
+        store
+            .append_json(&row(11, Some(true), "view", None))
+            .unwrap();
+        store
+            .append_json(&row(20, Some(false), "buy", Some("b")))
+            .unwrap();
+        store
+            .append_json(&row(21, Some(true), "scroll", Some("c")))
+            .unwrap();
+        store.flush().unwrap();
+
+        assert_eq!(store.distinct_count(10, 21, &[], "action").unwrap(), 4);
+        assert_eq!(store.distinct_count(10, 20, &[], "action").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 11, &[], "action").unwrap(), 2);
+        assert_eq!(store.distinct_count(20, 20, &[], "action").unwrap(), 1);
+        assert_eq!(store.distinct_count(10, 11, &[], "note").unwrap(), 1);
+        assert_eq!(store.distinct_count(10, 21, &[], "note").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 11, &[], "ok").unwrap(), 1);
+        assert_eq!(store.distinct_count(10, 21, &[], "ok").unwrap(), 2);
+        assert_eq!(store.distinct_count(10, 20, &[], "ok").unwrap(), 2);
+        let ok_true = [Predicate::Eq("ok".into(), Scalar::Bool(true))];
+        assert_eq!(store.distinct_count(10, 21, &ok_true, "action").unwrap(), 3);
+        store.close().unwrap();
+
+        let wide = TempDir::new();
+        let schema = write_schema(wide.path());
+        let store = Store::open_with(wide.path().join("data"), &schema, test_options(40)).unwrap();
+        for id in 0..40i64 {
+            store
+                .append_json(&row(id, Some(true), &format!("run-{id}"), Some("n")))
+                .unwrap();
+        }
+        store
+            .append_json(&row(40, Some(false), "click", None))
+            .unwrap();
+        store
+            .append_json(&row(41, Some(false), "click", None))
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 2);
+        assert!(
+            matches!(
+                store.catalog().segments[0].zones[0].columns[4],
+                crate::zone::ColumnZone::Bloom { .. }
+            ),
+            "forty actions are a bloom, so that block still walks"
+        );
+        assert!(matches!(
+            store.catalog().segments[0].zones[1].columns[4],
+            crate::zone::ColumnZone::Exact { .. }
+        ));
+        assert!(matches!(
+            store.catalog().segments[0].zones[1].columns[5],
+            crate::zone::ColumnZone::AllNull
+        ));
+        assert_eq!(store.distinct_count(0, 41, &[], "action").unwrap(), 41);
+        assert_eq!(store.distinct_count(40, 41, &[], "action").unwrap(), 1);
+        assert_eq!(store.distinct_count(40, 41, &[], "note").unwrap(), 0);
+        assert_eq!(store.distinct_count(0, 41, &[], "user_id").unwrap(), 1);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn stock_events_have_the_distinct_counts_of_the_bench() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -11359,7 +12906,39 @@ mod tests {
             1000
         );
         assert_eq!(store.distinct_count(start, end, &[], "action").unwrap(), 4);
+        assert_eq!(store.distinct_count(start, end, &[], "ok").unwrap(), 2);
+        assert_eq!(store.distinct_count(start, end, &[], "note").unwrap(), 3);
         assert_eq!(store.distinct_count(start, end, &[], "score").unwrap(), 100);
+        assert_eq!(
+            store
+                .distinct_count(start, start + 10, &[], "action")
+                .unwrap(),
+            2,
+            "i in 0..=1 is click and view, not the four values on that block's zone"
+        );
+        let ok_true = [Predicate::Eq("ok".into(), Scalar::Bool(true))];
+        assert_eq!(
+            store
+                .distinct_count(start, end, &ok_true, "action")
+                .unwrap(),
+            2,
+            "ok=true is click and buy"
+        );
+        assert_eq!(
+            store.distinct_count(start, end, &[], "ts").unwrap(),
+            100_000
+        );
+        assert_eq!(
+            store
+                .distinct_count(start + 100 * 10, start + 200 * 10, &[], "user_id")
+                .unwrap(),
+            101
+        );
+        let even = [Predicate::Eq("ok".into(), Scalar::Bool(true))];
+        assert_eq!(
+            store.distinct_count(start, end, &even, "user_id").unwrap(),
+            500
+        );
         assert_eq!(
             store.distinct_count(start, start, &[], "user_id").unwrap(),
             1

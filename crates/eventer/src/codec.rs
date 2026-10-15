@@ -2537,10 +2537,12 @@ pub(crate) struct UnitRun {
 /// Null-free constant, stride, or stride pieces whose stride is -1, 0, or 1
 /// and whose values do not wrap.
 ///
-/// `Ok(None)` leaves the caller on the sample path: a null, a missing column,
+/// `Ok(None)` leaves the caller on the row path: a null, a missing column,
 /// bit packing, a frame of reference, any other stride, or wrapping arithmetic.
 /// `Ok(Some(runs))` is every present value, in pieces, without expanding a row.
 /// A truncated body is corrupt. The timestamp containment check is the caller's.
+/// Distinct count uses each run as an inclusive interval and ignores `mult`.
+/// A stride of 2 from 0 to 2 is not a unit run.
 pub(crate) fn try_unit_stride_runs(
     schema: &Schema,
     bytes: &[u8],
@@ -2964,6 +2966,26 @@ fn column_was_not_stored(bytes: &[u8], cursor: usize) -> bool {
 /// A sliced read left this column out. Its encoding is not in the buffer.
 fn column_is_hole(included: Option<&[bool]>, index: usize) -> bool {
     included.is_some_and(|included| !included.get(index).copied().unwrap_or(false))
+}
+
+/// Whether `bytes` still holds column `index`.
+///
+/// A timestamp prefix of a sliced block ends on a column boundary. A column
+/// past that boundary is absent. A single frame holds every column, so a later
+/// field is present even when the caller asked only for the timestamp.
+pub(crate) fn image_contains_column(schema: &Schema, bytes: &[u8], index: usize) -> Result<bool> {
+    let nrows = block_row_count(bytes)?;
+    let mut cursor = 4usize;
+    for (field_index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            return Ok(false);
+        }
+        if field_index == index {
+            return Ok(true);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Ok(false)
 }
 
 fn skip_column(

@@ -14,16 +14,20 @@
 //! same filters. `limit` and `offset` are rejected on both.
 //! `GET /events/histogram?from=&to=&bucket_ms=N` returns one count per epoch-aligned
 //! bucket that intersects that inclusive range.
-//! `GET /events/stats` returns `sum`, `min`, and `max` for numeric columns over
-//! that same range and the same filters, without the matching rows. `by=field`
-//! splits that result into one group per value of a single column.
+//! `GET /events/stats` returns `sum`, `min`, `max`, population `var`, and
+//! `stddev` for numeric columns over that same range and the same filters,
+//! without the matching rows. `by=field` splits that result into one group per
+//! value of a single column.
 //! `GET /events/quantile?field=&p=` returns one exact rank of a numeric column
 //! over that same range and the same filters. The body is that value, or JSON
 //! `null` when no non-null value matches.
 //! `GET /events/latest?by=field` returns the newest matching row for each value
 //! of that column, in the same key order.
 //! `GET /events/distinct?field=` returns how many distinct non-null values that
-//! column takes in the same filtered window.
+//! column takes in the same filtered window. With no row predicate, a bool or
+//! an exact string or text zone answers a block that sits entirely inside the
+//! range, and an int, timestamp, or decimal counts a fully contained,
+//! null-free constant or unit stride from the column body.
 //! `GET /events/topk?field=&k=` returns the values that occur most often in
 //! that column, including null, ordered by exact count.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
@@ -781,12 +785,22 @@ fn reject_stats_params(query: &str) -> std::result::Result<(), Box<Response>> {
         }
         let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
         let key = percent_decode(key, "query")?;
-        if key == "limit"
-            || key == "offset"
-            || key == "bucket_ms"
-            || key == "select"
-            || key == "quantile"
-        {
+        if !matches!(
+            key.as_str(),
+            "from"
+                | "to"
+                | "eq"
+                | "gt"
+                | "ge"
+                | "lt"
+                | "le"
+                | "by"
+                | "sum"
+                | "min"
+                | "max"
+                | "var"
+                | "stddev"
+        ) {
             return Err(bad_request(&format!(
                 "`{key}` is not a parameter of /events/stats"
             )));
@@ -807,14 +821,14 @@ fn stat_requests(query: &str) -> std::result::Result<Vec<eventer::StatRequest>, 
                 Some((key, value)) => (key, value),
                 None => {
                     let key = percent_decode(pair, "query")?;
-                    if matches!(key.as_str(), "sum" | "min" | "max") {
+                    if matches!(key.as_str(), "sum" | "min" | "max" | "var" | "stddev") {
                         return Err(bad_request(&format!("`{key}` is missing a field name")));
                     }
                     continue;
                 }
             };
             let key = percent_decode(key, "query")?;
-            if !matches!(key.as_str(), "sum" | "min" | "max") {
+            if !matches!(key.as_str(), "sum" | "min" | "max" | "var" | "stddev") {
                 continue;
             }
             saw = true;
@@ -827,6 +841,8 @@ fn stat_requests(query: &str) -> std::result::Result<Vec<eventer::StatRequest>, 
                     "sum" => existing.sum = true,
                     "min" => existing.min = true,
                     "max" => existing.max = true,
+                    "var" => existing.var = true,
+                    "stddev" => existing.stddev = true,
                     _ => {}
                 }
             } else {
@@ -835,13 +851,15 @@ fn stat_requests(query: &str) -> std::result::Result<Vec<eventer::StatRequest>, 
                     sum: key == "sum",
                     min: key == "min",
                     max: key == "max",
+                    var: key == "var",
+                    stddev: key == "stddev",
                 });
             }
         }
     }
     if !saw {
         return Err(bad_request(
-            "missing `sum`, `min`, or `max` query parameter",
+            "missing `sum`, `min`, `max`, `var`, or `stddev` query parameter",
         ));
     }
     Ok(requests)
@@ -920,8 +938,12 @@ fn reject_stat_fields(
                 "sum"
             } else if stat.min {
                 "min"
-            } else {
+            } else if stat.max {
                 "max"
+            } else if stat.var {
+                "var"
+            } else {
+                "stddev"
             };
             return Err(bad_request(&format!(
                 "`{op}` does not apply to {} column `{}`",
@@ -981,6 +1003,12 @@ fn columns_object(
         }
         if let Some(max) = &column.max {
             body.insert("max".to_string(), extreme_json(field.ty, max));
+        }
+        if let Some(var) = &column.var {
+            body.insert("var".to_string(), variance_json(var));
+        }
+        if let Some(stddev) = &column.stddev {
+            body.insert("stddev".to_string(), stddev_json(stddev));
         }
         out.insert(column.field.clone(), Value::Object(body));
     }
@@ -1046,6 +1074,25 @@ fn float_sum_json(total: f64, contributed: bool) -> Value {
 /// `min` and `max` use the same JSON number as `GET /events`, including `0.0`.
 fn float_extreme_json(value: f64) -> Value {
     Value::Number(Number::from_f64(value).expect("float extreme is finite"))
+}
+
+fn variance_json(var: &Option<eventer::StatVar>) -> Value {
+    match var {
+        None => Value::Null,
+        Some(eventer::StatVar::Float(value)) => moment_float_json(*value),
+        Some(eventer::StatVar::Exact(text)) => Value::String(text.clone()),
+    }
+}
+
+fn stddev_json(stddev: &Option<f64>) -> Value {
+    match stddev {
+        None => Value::Null,
+        Some(value) => moment_float_json(*value),
+    }
+}
+
+fn moment_float_json(value: f64) -> Value {
+    Value::Number(Number::from_f64(value).expect("variance float is finite"))
 }
 
 /// Refuse a span that would emit more than [`eventer::MAX_HISTOGRAM_BUCKETS`]
@@ -2941,6 +2988,119 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.get("columns").is_none(), "{body}");
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stats_report_population_variance() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("eventer-http-var-{}-{}", std::process::id(), nanos));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(8, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        for row in [
+            r#"{"ts":1000,"user_id":1,"score":1.0,"ok":true,"action":"buy","amount":"1.00"}"#,
+            r#"{"ts":2000,"user_id":2,"score":3.0,"ok":true,"action":"buy","amount":"2.00"}"#,
+            r#"{"ts":3000,"score":1.0,"ok":false,"action":"other","amount":"3.00"}"#,
+        ] {
+            let (status, body) = post(&app, row).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1000&to=2000&var=user_id&stddev=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["user_id"]["var"], json!("0.25"));
+        assert_eq!(body["columns"]["user_id"]["stddev"], json!(0.5));
+        assert!(body["columns"]["user_id"].get("sum").is_none());
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1000&to=1000&var=score&stddev=score",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["score"]["var"], json!(0.0));
+        assert_eq!(body["columns"]["score"]["stddev"], json!(0.0));
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=3000&to=3000&var=user_id&stddev=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["user_id"]["var"], Value::Null);
+        assert_eq!(body["columns"]["user_id"]["stddev"], Value::Null);
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=9000&to=9000&var=score&stddev=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"]["score"]["var"], Value::Null);
+        assert_eq!(body["columns"]["user_id"]["stddev"], Value::Null);
+        assert!(body["columns"]["score"].get("stddev").is_none());
+        assert!(body["columns"]["user_id"].get("var").is_none());
+
+        let (status, body) = get_json(
+            &app,
+            "/events/stats?from=1000&to=3000&by=action&var=amount&sum=amount",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["groups"][0]["key"], json!("buy"));
+        assert_eq!(body["groups"][0]["columns"]["amount"]["sum"], json!("3.00"));
+        assert_eq!(body["groups"][0]["columns"]["amount"]["var"], json!("0.25"));
+        assert_eq!(body["groups"][1]["key"], json!("other"));
+        assert_eq!(body["groups"][1]["columns"]["amount"]["var"], json!("0"));
+
+        for uri in [
+            "/events/stats?from=1000&to=3000&var=",
+            "/events/stats?from=1000&to=3000&var",
+            "/events/stats?from=1000&to=3000&stddev=",
+            "/events/stats?from=1000&to=3000&var=missing",
+            "/events/stats?from=1000&to=3000&var=action",
+            "/events/stats?from=1000&to=3000&stddev=ok",
+            "/events/stats?from=1000&to=3000&var=user_id&topk=action",
+            "/events/stats?from=1000&to=3000&var=user_id&select=action",
+            "/events/stats?from=1000&to=3000&var=user_id&quantile=1",
+            "/events/stats?from=1000&to=3000&var=user_id&distinct=action",
+            "/events/stats?from=1000&to=3000&var=user_id&bucket_ms=1",
+            "/events/stats?from=1000&to=3000&var=user_id&limit=1",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+            assert!(body.get("columns").is_none(), "{uri} -> {body}");
+            assert!(body.get("groups").is_none(), "{uri} -> {body}");
+        }
 
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);
