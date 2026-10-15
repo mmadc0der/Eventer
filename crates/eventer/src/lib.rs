@@ -49,7 +49,9 @@
 //! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
 //! row for each value of one column, in that same key order.
 //! [`Store::distinct_count`](store::Store::distinct_count) counts distinct
-//! non-null values of one column over that same filtered window.
+//! non-null values of one column over that same filtered window. One int,
+//! timestamp, or decimal with no row predicate counts a fully contained,
+//! null-free constant or unit stride from the column body.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares

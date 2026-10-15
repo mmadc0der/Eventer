@@ -10,7 +10,7 @@ use crate::codec::{
     accumulate_histogram_filtered, block_row_count, cmp_numeric, count_rows_filtered,
     decode_rows_filtered, decode_rows_included, range_impossible, range_matches,
     read_timestamp_column, read_timestamp_column_included, tighter_lower, tighter_upper,
-    timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float,
+    timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float, try_unit_stride_runs,
     visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd, RangeFilter,
 };
 use crate::error::{Error, Result};
@@ -811,6 +811,19 @@ impl Store {
     /// [`MAX_QUERY_BYTES`], the scan returns `query response size limit
     /// exceeded` and no count. An empty name, an unknown field, or a json
     /// column is an error and does not read the store.
+    ///
+    /// One int, timestamp, or decimal, with no row predicate, reads each
+    /// surviving block's timestamp column. When every payload timestamp is
+    /// inside the inclusive range and the target column has no nulls, a
+    /// constant, a stride, or stride pieces whose stride is -1, 0, or 1 and
+    /// whose values do not wrap become inclusive intervals. The count is the
+    /// number of integers in the union of those intervals. Rows are not
+    /// inserted one by one. A null, a bit-packed or frame-of-reference column,
+    /// a stride other than -1, 0, or 1, wrapping arithmetic, a float, a bool,
+    /// a string, a text, a json column, a block the range cuts, or a predicate
+    /// still inserts the surviving values into the set. A stride of 2 whose
+    /// values are 0 and 2 counts as 2, not as the closed interval from 0 to 2.
+    /// The sparse index is not the inside check.
     pub fn distinct_count(
         &self,
         from_ms: i64,
@@ -826,6 +839,12 @@ impl Store {
         let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut seen = DistinctSet::new(column.ty);
         let timestamp_field = column.index == self.schema.timestamp_index;
+        let mut runs = (resolved.unfiltered()
+            && matches!(
+                column.ty,
+                FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. }
+            ))
+        .then(Vec::new);
         let mut dictionaries = HashMap::new();
         for block in blocks {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
@@ -845,6 +864,20 @@ impl Store {
             )?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
+            if runs.is_some() {
+                match try_unit_stride_runs(&self.schema, &payload, column.index, from_ms, to_ms)? {
+                    Some(block_runs) => {
+                        runs.as_mut()
+                            .expect("unit-stride runs are still open")
+                            .extend(block_runs);
+                        continue;
+                    }
+                    None => {
+                        let taken = runs.take().expect("unit-stride runs are still open");
+                        spill_distinct_runs(&taken, &mut seen)?;
+                    }
+                }
+            }
             let mut captures = if timestamp_field {
                 Vec::new()
             } else {
@@ -871,6 +904,9 @@ impl Store {
                     seen.note(&column.name, column.ty, scalar)
                 },
             )?;
+        }
+        if let Some(collected) = runs {
+            return union_distinct_count(&collected);
         }
         Ok(seen.len() as u64)
     }
@@ -2488,6 +2524,23 @@ impl DistinctSet {
         insert_new(values, bits)
     }
 
+    fn insert_i128(&mut self, value: i128) -> Result<()> {
+        match self {
+            DistinctSet::Int(_) => {
+                let value = i64::try_from(value)
+                    .map_err(|_| Error::corrupt("distinct integer does not fit in i64"))?;
+                self.insert_int(value)
+            }
+            DistinctSet::Timestamp(_) => {
+                let value = i64::try_from(value)
+                    .map_err(|_| Error::corrupt("distinct timestamp does not fit in i64"))?;
+                self.insert_timestamp(value)
+            }
+            DistinctSet::Decimal(_) => self.insert_decimal(value),
+            _ => Err(Error::corrupt("distinct set does not match the column")),
+        }
+    }
+
     fn insert_str(&mut self, value: &str) -> Result<()> {
         let DistinctSet::Str(values, bytes) = self else {
             return Err(Error::corrupt("distinct set does not match the column"));
@@ -2506,6 +2559,75 @@ impl DistinctSet {
         *bytes = next;
         Ok(())
     }
+}
+
+fn spill_distinct_runs(runs: &[(i128, i128)], seen: &mut DistinctSet) -> Result<()> {
+    for (lo, hi) in merge_distinct_runs(runs) {
+        let len = inclusive_run_len(lo, hi)
+            .ok_or_else(|| Error::event("distinct value limit exceeded"))?;
+        if seen.len() as u128 + len > MAX_DISTINCT_VALUES as u128 {
+            return Err(Error::event("distinct value limit exceeded"));
+        }
+        let mut value = lo;
+        loop {
+            seen.insert_i128(value)?;
+            if value == hi {
+                break;
+            }
+            value = value
+                .checked_add(1)
+                .ok_or_else(|| Error::event("distinct value limit exceeded"))?;
+        }
+    }
+    Ok(())
+}
+
+fn union_distinct_count(runs: &[(i128, i128)]) -> Result<u64> {
+    let mut total = 0u128;
+    for (lo, hi) in merge_distinct_runs(runs) {
+        let len = inclusive_run_len(lo, hi)
+            .ok_or_else(|| Error::event("distinct value limit exceeded"))?;
+        total = total.saturating_add(len);
+        if total > MAX_DISTINCT_VALUES as u128 {
+            return Err(Error::event("distinct value limit exceeded"));
+        }
+    }
+    Ok(total as u64)
+}
+
+fn merge_distinct_runs(runs: &[(i128, i128)]) -> Vec<(i128, i128)> {
+    let mut ordered: Vec<(i128, i128)> = runs
+        .iter()
+        .copied()
+        .map(|(lo, hi)| if lo <= hi { (lo, hi) } else { (hi, lo) })
+        .collect();
+    ordered.sort_unstable();
+    let mut merged = Vec::new();
+    let Some((mut cur_lo, mut cur_hi)) = ordered.first().copied() else {
+        return merged;
+    };
+    for (lo, hi) in ordered.into_iter().skip(1) {
+        let touches = match cur_hi.checked_add(1) {
+            Some(next) => lo <= next,
+            None => true,
+        };
+        if touches {
+            if hi > cur_hi {
+                cur_hi = hi;
+            }
+        } else {
+            merged.push((cur_lo, cur_hi));
+            cur_lo = lo;
+            cur_hi = hi;
+        }
+    }
+    merged.push((cur_lo, cur_hi));
+    merged
+}
+
+fn inclusive_run_len(lo: i128, hi: i128) -> Option<u128> {
+    let width = (hi as u128).wrapping_sub(lo as u128);
+    width.checked_add(1)
 }
 
 fn insert_new<T: Eq + std::hash::Hash>(values: &mut HashSet<T>, value: T) -> Result<()> {
@@ -2540,7 +2662,6 @@ fn resolve_distinct_field(schema: &Schema, field: &str) -> Result<DistinctColumn
         ty,
     })
 }
-
 
 fn resolve_quantile_field(schema: &Schema, field: &str) -> Result<ResolvedQuantile> {
     if field.is_empty() {
@@ -9885,6 +10006,93 @@ mod tests {
     }
 
     #[test]
+    fn unit_stride_distinct_counts_the_union_of_the_runs() {
+        let count_users = |rows: &[(i64, i64)], block_rows: usize, from: i64, to: i64| -> u64 {
+            let dir = TempDir::new();
+            let schema = write_schema(dir.path());
+            let store =
+                Store::open_with(dir.path().join("data"), &schema, test_options(block_rows))
+                    .unwrap();
+            for (ts, user) in rows {
+                store
+                    .append_json(&event(*ts, Some(*user), "click", None, "1.00"))
+                    .unwrap();
+            }
+            store.flush().unwrap();
+            let count = store.distinct_count(from, to, &[], "user_id").unwrap();
+            store.close().unwrap();
+            count
+        };
+
+        assert_eq!(count_users(&[(1, 0), (2, 1), (3, 2), (4, 3)], 8, 1, 4), 4);
+        assert_eq!(
+            count_users(&[(1, 0), (2, 1), (3, 2), (4, 3)], 8, 2, 3),
+            2,
+            "a cut block stays on the row set"
+        );
+        assert_eq!(count_users(&[(1, 5), (2, 4), (3, 3), (4, 2)], 8, 1, 4), 4);
+        assert_eq!(count_users(&[(1, 7), (2, 7), (3, 7)], 8, 1, 3), 1);
+        assert_eq!(
+            count_users(&[(1, 0), (2, 2)], 8, 1, 2),
+            2,
+            "stride 2 is not the closed interval"
+        );
+        assert_eq!(count_users(&[(1, 0), (2, 2), (3, 4)], 8, 1, 3), 3);
+        assert_eq!(
+            count_users(&[(1, 0), (2, 1), (3, 1), (4, 2), (5, 0), (6, 2)], 2, 1, 6),
+            3,
+            "a later stride of 2 is unioned with the unit runs"
+        );
+        assert_eq!(
+            count_users(&[(1, 0), (2, 1), (3, 3), (4, 4)], 2, 1, 4),
+            4,
+            "a gap between unit runs is not filled"
+        );
+        assert_eq!(
+            count_users(&[(1, i64::MAX), (2, i64::MIN), (3, i64::MIN + 1)], 8, 1, 3),
+            3,
+            "wrapping arithmetic is not the closed span of the endpoints"
+        );
+
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, amount) in [(1i64, "0.00"), (2, "0.01"), (3, "0.02")] {
+            store
+                .append_json(&event(ts, Some(1), "click", None, amount))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(1, 3, &[], "amount").unwrap(), 3);
+        store.close().unwrap();
+
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, amount) in [(1i64, "0.00"), (2, "0.02")] {
+            store
+                .append_json(&event(ts, Some(1), "click", None, amount))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(1, 2, &[], "amount").unwrap(), 2);
+        store.close().unwrap();
+
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for ts in [10i64, 20, 30] {
+            store
+                .append_json(&event(ts, Some(1), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(10, 30, &[], "ts").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 10, &[], "ts").unwrap(), 1);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn stock_events_have_the_distinct_counts_of_the_bench() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -9921,6 +10129,21 @@ mod tests {
         );
         assert_eq!(store.distinct_count(start, end, &[], "action").unwrap(), 4);
         assert_eq!(store.distinct_count(start, end, &[], "score").unwrap(), 100);
+        assert_eq!(
+            store.distinct_count(start, end, &[], "ts").unwrap(),
+            100_000
+        );
+        assert_eq!(
+            store
+                .distinct_count(start + 100 * 10, start + 200 * 10, &[], "user_id")
+                .unwrap(),
+            101
+        );
+        let even = [Predicate::Eq("ok".into(), Scalar::Bool(true))];
+        assert_eq!(
+            store.distinct_count(start, end, &even, "user_id").unwrap(),
+            500
+        );
         assert_eq!(
             store.distinct_count(start, start, &[], "user_id").unwrap(),
             1
@@ -9970,7 +10193,13 @@ mod tests {
             note[..8].copy_from_slice(format!("{id:08}").as_bytes());
             let note = String::from_utf8(note).unwrap();
             store
-                .append_json(&event(start + id as i64, Some(1), "click", Some(&note), "1.00"))
+                .append_json(&event(
+                    start + id as i64,
+                    Some(1),
+                    "click",
+                    Some(&note),
+                    "1.00",
+                ))
                 .unwrap();
         }
         store.flush().unwrap();

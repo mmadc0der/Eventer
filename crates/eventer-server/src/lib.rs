@@ -23,7 +23,9 @@
 //! `GET /events/latest?by=field` returns the newest matching row for each value
 //! of that column, in the same key order.
 //! `GET /events/distinct?field=` returns how many distinct non-null values that
-//! column takes in the same filtered window.
+//! column takes in the same filtered window. One int, timestamp, or decimal
+//! with no row predicate counts a fully contained, null-free constant or unit
+//! stride from the column body.
 //! `POST /events/drop` calls [`Store::drop_blocks_before`](eventer::Store::drop_blocks_before)
 //! with the caller's `before_ms`. The request `Content-Type` must be
 //! `application/json`, with an optional `charset=utf-8`. A block is removed

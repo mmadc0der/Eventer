@@ -2345,6 +2345,166 @@ pub(crate) fn try_accumulate_exact_sum(
     Ok(None)
 }
 
+/// Inclusive runs of a null-free int, timestamp, or decimal column.
+///
+/// `Ok(Some(runs))` means every payload timestamp sits in `from_ms..=to_ms`
+/// and the column body is a constant, a stride, or stride pieces whose stride
+/// is -1, 0, or 1, with no wrapping step. Each run is an inclusive interval of
+/// the values that body actually stores. `Ok(None)` means the caller should
+/// keep the row visitor: a timestamp falls outside the range, the column has a
+/// null, or the body is bit-packed, a frame of reference, a stride other than
+/// -1, 0, or 1, or a wrapping step. A stride of 2 from 0 to 2 is two values,
+/// not the three integers in the closed span. The sparse index is not the
+/// containment check.
+pub(crate) fn try_unit_stride_runs(
+    schema: &Schema,
+    bytes: &[u8],
+    column: usize,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Option<Vec<(i128, i128)>>> {
+    let nrows = block_row_count(bytes)?;
+    if nrows == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(span) = timestamp_column_span(schema, bytes, from_ms, to_ms)? else {
+        return Ok(Some(Vec::new()));
+    };
+    if !span.inside {
+        return Ok(None);
+    }
+    let Some(field) = schema.fields.get(column) else {
+        return Err(Error::corrupt("distinct column is missing"));
+    };
+    let width = match field.ty {
+        FieldType::Int | FieldType::Timestamp => 8,
+        FieldType::Decimal { .. } => 16,
+        _ => return Ok(None),
+    };
+    let mut cursor = 4usize;
+    for (index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            return Ok(Some(Vec::new()));
+        }
+        if index == column {
+            let flags = *bytes
+                .get(cursor)
+                .ok_or_else(|| Error::corrupt("truncated null flag"))?;
+            if flags != 0 {
+                return Ok(None);
+            }
+            cursor += 1;
+            return integer_unit_runs(bytes, &mut cursor, nrows, width);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Ok(Some(Vec::new()))
+}
+
+fn integer_unit_runs(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    width: usize,
+) -> Result<Option<Vec<(i128, i128)>>> {
+    if count == 0 {
+        expect_kind(bytes, cursor, KIND_EMPTY)?;
+        return Ok(Some(Vec::new()));
+    }
+    let kind = read_u8(bytes, cursor)?;
+    if kind == KIND_CONSTANT {
+        let value = if width == 8 {
+            i128::from(read_i64(bytes, cursor)?)
+        } else {
+            read_i128(bytes, cursor)?
+        };
+        return Ok(Some(vec![(value, value)]));
+    }
+    if kind == KIND_STRIDE {
+        let run = if width == 8 {
+            let base = read_i64(bytes, cursor)?;
+            let stride = read_i64(bytes, cursor)?;
+            i64_unit_run(base, stride, count)
+        } else {
+            let base = read_i128(bytes, cursor)?;
+            let stride = read_i128(bytes, cursor)?;
+            i128_unit_run(base, stride, count)
+        };
+        return Ok(run.map(|interval| vec![interval]));
+    }
+    if kind == KIND_PIECES {
+        let pieces = read_stride_pieces(bytes, cursor, count, width)?;
+        let mut runs = Vec::with_capacity(pieces.len());
+        for (index, piece) in pieces.iter().enumerate() {
+            let end = pieces
+                .get(index + 1)
+                .map(|next| next.start as usize)
+                .unwrap_or(count);
+            if end < piece.start as usize {
+                return Err(Error::corrupt(
+                    "integer stride pieces are not strictly increasing",
+                ));
+            }
+            let len = end - piece.start as usize;
+            if len == 0 {
+                continue;
+            }
+            let run = if width == 8 {
+                i64_unit_run(piece.base as i64, piece.stride as i64, len)
+            } else {
+                i128_unit_run(piece.base, piece.stride, len)
+            };
+            let Some(run) = run else {
+                return Ok(None);
+            };
+            runs.push(run);
+        }
+        return Ok(Some(runs));
+    }
+    Ok(None)
+}
+
+/// Inclusive interval of a unit stride, or `None` when the stride is not -1,
+/// 0, or 1, or when a step leaves the integer width.
+fn i64_unit_run(base: i64, stride: i64, count: usize) -> Option<(i128, i128)> {
+    let (lo, hi) = unit_endpoints(
+        i128::from(base),
+        i128::from(stride),
+        count,
+        i128::from(i64::MIN),
+        i128::from(i64::MAX),
+    )?;
+    Some((lo, hi))
+}
+
+fn i128_unit_run(base: i128, stride: i128, count: usize) -> Option<(i128, i128)> {
+    unit_endpoints(base, stride, count, i128::MIN, i128::MAX)
+}
+
+fn unit_endpoints(
+    base: i128,
+    stride: i128,
+    count: usize,
+    min: i128,
+    max: i128,
+) -> Option<(i128, i128)> {
+    if count == 0 || !matches!(stride, -1 | 0 | 1) {
+        return None;
+    }
+    if count == 1 || stride == 0 {
+        if (min..=max).contains(&base) {
+            return Some((base, base));
+        }
+        return None;
+    }
+    let steps = i128::try_from(count - 1).ok()?;
+    let end = base.checked_add(stride.checked_mul(steps)?)?;
+    if end < min || end > max || base < min || base > max {
+        return None;
+    }
+    Some((base.min(end), base.max(end)))
+}
+
 fn sum_overflow(name: &str) -> Error {
     Error::event(format!("sum of `{name}` overflowed"))
 }
