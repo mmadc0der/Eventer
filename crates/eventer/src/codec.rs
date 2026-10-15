@@ -517,6 +517,12 @@ fn decode_rows(
 /// the range still walks rows. The sparse index is not that check. A constant
 /// or a positive non-wrapping timestamp stride may prove it. Any other
 /// timestamp encoding still expands.
+///
+/// One equality on a bool column uses the same rule. A constant bool
+/// contributes the row count or zero. One bitmap period contributes the
+/// matches in that period, repeated across the rows, and a bool is not
+/// expanded per row. A null, a full per-row bitmap, or a timestamp outside
+/// the range still walks rows.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn count_rows_in_range_filtered(
     schema: &Schema,
@@ -538,6 +544,10 @@ pub(crate) fn count_rows_filtered(
 ) -> Result<u64> {
     if let Some(total) =
         count_one_string_equality(schema, bytes, from_ms, to_ms, predicates, ranges)?
+    {
+        return Ok(total);
+    }
+    if let Some(total) = count_one_bool_equality(schema, bytes, from_ms, to_ms, predicates, ranges)?
     {
         return Ok(total);
     }
@@ -844,6 +854,116 @@ fn length_prefixed_equals(bytes: &[u8], cursor: &mut usize, needle: &str) -> Res
     let slice = read_lp_bytes(bytes, cursor)?;
     let text = std::str::from_utf8(slice).map_err(|_| Error::corrupt("string is not utf-8"))?;
     Ok(text == needle)
+}
+
+/// One bool equality, and nothing else, counted from a constant or one bitmap period.
+///
+/// `Ok(None)` means the row walk still has to run: a second predicate, a
+/// numeric range, a value that is not one bool, a null in the column, a full
+/// per-row bitmap, or a timestamp column this header cannot prove sits
+/// entirely inside the range.
+fn count_one_bool_equality(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+    ranges: &[RangeFilter],
+) -> Result<Option<u64>> {
+    if !ranges.is_empty() || predicates.len() != 1 {
+        return Ok(None);
+    }
+    let predicate = &predicates[0];
+    let [Scalar::Bool(want)] = predicate.allowed.as_slice() else {
+        return Ok(None);
+    };
+    let Some(field) = schema.fields.get(predicate.index) else {
+        return Ok(None);
+    };
+    if field.ty != FieldType::Bool {
+        return Ok(None);
+    }
+    if plain_timestamp_run(schema, bytes, from_ms, to_ms)?.is_none() {
+        return Ok(None);
+    }
+    count_constant_or_bool_period(schema, bytes, predicate.index, *want)
+}
+
+/// Constant bool (kind 1) or one period of packed bits (kind 4).
+///
+/// A null flag other than `0`, and every other bool kind, returns `Ok(None)`
+/// so the caller walks rows. Kind 4 counts matches in the stored period and
+/// repeats that pattern. It does not allocate a bool per row.
+fn count_constant_or_bool_period(
+    schema: &Schema,
+    bytes: &[u8],
+    column: usize,
+    want: bool,
+) -> Result<Option<u64>> {
+    let nrows = block_row_count(bytes)?;
+    let mut cursor = 4usize;
+    for (index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            return Ok(None);
+        }
+        if index == column {
+            if field.ty != FieldType::Bool {
+                return Ok(None);
+            }
+            let flag = *bytes
+                .get(cursor)
+                .ok_or_else(|| Error::corrupt("truncated null flag"))?;
+            if flag != 0 {
+                return Ok(None);
+            }
+            cursor += 1;
+            let kind = read_u8(bytes, &mut cursor)?;
+            if kind == 1 {
+                let value = read_u8(bytes, &mut cursor)?;
+                if value > 1 {
+                    return Err(Error::corrupt("bool constant is not 0 or 1"));
+                }
+                let hit = (value == 1) == want;
+                return Ok(Some(if hit { nrows as u64 } else { 0 }));
+            }
+            if kind == BOOL_PERIOD {
+                let (period, pattern) = read_bitmap_period(bytes, &mut cursor)?;
+                return Ok(Some(bitmap_period_matches(pattern, period, nrows, want)?));
+            }
+            return Ok(None);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Ok(None)
+}
+
+fn bitmap_period_matches(pattern: &[u8], period: usize, nrows: usize, want: bool) -> Result<u64> {
+    let mut hits = Vec::with_capacity(period);
+    let mut in_period = 0u64;
+    for bit in 0..period {
+        let byte = *pattern
+            .get(bit / 8)
+            .ok_or_else(|| Error::corrupt("truncated bool bitmap"))?;
+        let set = byte & (1 << (bit % 8)) != 0;
+        let hit = set == want;
+        hits.push(hit);
+        if hit {
+            in_period += 1;
+        }
+    }
+    let cycles = (nrows / period) as u64;
+    let remainder = nrows % period;
+    let mut total = in_period
+        .checked_mul(cycles)
+        .ok_or_else(|| Error::event("event count overflow"))?;
+    for hit in &hits[..remainder] {
+        if *hit {
+            total = total
+                .checked_add(1)
+                .ok_or_else(|| Error::event("event count overflow"))?;
+        }
+    }
+    Ok(total)
 }
 
 /// `base + (count - 1) * stride` when that product does not wrap in `i64`.
@@ -2343,6 +2463,151 @@ pub(crate) fn try_accumulate_exact_sum(
         skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
     }
     Ok(None)
+}
+
+/// One inclusive run of integers, each repeated `mult` times.
+///
+/// A constant is a single integer whose multiplicity is the row count. A unit
+/// stride is one integer per row (`mult` is 1) from `start` through `end`.
+#[derive(Clone, Copy)]
+pub(crate) struct UnitRun {
+    pub start: i128,
+    pub end: i128,
+    pub mult: u64,
+}
+
+/// Null-free constant, stride, or stride pieces whose stride is -1, 0, or 1
+/// and whose values do not wrap.
+///
+/// `Ok(None)` leaves the caller on the sample path: a null, a missing column,
+/// bit packing, a frame of reference, any other stride, or wrapping arithmetic.
+/// `Ok(Some(runs))` is every present value, in pieces, without expanding a row.
+/// A truncated body is corrupt. The timestamp containment check is the caller's.
+pub(crate) fn try_unit_stride_runs(
+    schema: &Schema,
+    bytes: &[u8],
+    column: usize,
+) -> Result<Option<Vec<UnitRun>>> {
+    let nrows = block_row_count(bytes)?;
+    if nrows == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(field) = schema.fields.get(column) else {
+        return Err(Error::corrupt("quantile column is missing"));
+    };
+    let narrow = match field.ty {
+        FieldType::Int | FieldType::Timestamp => true,
+        FieldType::Decimal { .. } => false,
+        _ => return Ok(None),
+    };
+    let width = if narrow { 8 } else { 16 };
+    let mut cursor = 4usize;
+    for (index, field) in schema.fields.iter().enumerate() {
+        if column_was_not_stored(bytes, cursor) {
+            return Ok(None);
+        }
+        if index == column {
+            let flags = *bytes
+                .get(cursor)
+                .ok_or_else(|| Error::corrupt("truncated null flag"))?;
+            if flags != 0 {
+                return Ok(None);
+            }
+            cursor += 1;
+            return read_unit_runs(bytes, &mut cursor, nrows, width, narrow);
+        }
+        skip_column(field.ty, bytes, &mut cursor, nrows, false)?;
+    }
+    Ok(None)
+}
+
+fn read_unit_runs(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    width: usize,
+    narrow: bool,
+) -> Result<Option<Vec<UnitRun>>> {
+    if count == 0 {
+        expect_kind(bytes, cursor, KIND_EMPTY)?;
+        return Ok(Some(Vec::new()));
+    }
+    let kind = read_u8(bytes, cursor)?;
+    if kind == KIND_CONSTANT {
+        let base = if width == 8 {
+            i128::from(read_i64(bytes, cursor)?)
+        } else {
+            read_i128(bytes, cursor)?
+        };
+        let mut runs = Vec::new();
+        if push_unit_run(&mut runs, base, 0, count, narrow).is_none() {
+            return Ok(None);
+        }
+        return Ok(Some(runs));
+    }
+    if kind == KIND_STRIDE {
+        let (base, stride) = if width == 8 {
+            (
+                i128::from(read_i64(bytes, cursor)?),
+                i128::from(read_i64(bytes, cursor)?),
+            )
+        } else {
+            (read_i128(bytes, cursor)?, read_i128(bytes, cursor)?)
+        };
+        let mut runs = Vec::new();
+        if push_unit_run(&mut runs, base, stride, count, narrow).is_none() {
+            return Ok(None);
+        }
+        return Ok(Some(runs));
+    }
+    if kind == KIND_PIECES {
+        let pieces = read_stride_pieces(bytes, cursor, count, width)?;
+        let mut runs = Vec::with_capacity(pieces.len());
+        for (index, piece) in pieces.iter().enumerate() {
+            let end = pieces
+                .get(index + 1)
+                .map(|next| next.start as usize)
+                .unwrap_or(count);
+            let len = end - piece.start as usize;
+            if push_unit_run(&mut runs, piece.base, piece.stride, len, narrow).is_none() {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(runs));
+    }
+    Ok(None)
+}
+
+/// `None` when `stride` is not -1, 0, or 1, or `base + (len - 1) * stride` wraps.
+fn push_unit_run(
+    runs: &mut Vec<UnitRun>,
+    base: i128,
+    stride: i128,
+    len: usize,
+    narrow: bool,
+) -> Option<()> {
+    if len == 0 || (stride != -1 && stride != 0 && stride != 1) {
+        return None;
+    }
+    if narrow && (i64::try_from(base).is_err() || i64::try_from(stride).is_err()) {
+        return None;
+    }
+    let (start, end, mult) = if stride == 0 || len == 1 {
+        (base, base, u64::try_from(len).ok()?)
+    } else {
+        let steps = i128::try_from(len - 1).ok()?;
+        let end = base.checked_add(stride.checked_mul(steps)?)?;
+        if narrow && i64::try_from(end).is_err() {
+            return None;
+        }
+        if stride > 0 {
+            (base, end, 1)
+        } else {
+            (end, base, 1)
+        }
+    };
+    runs.push(UnitRun { start, end, mult });
+    Some(())
 }
 
 fn sum_overflow(name: &str) -> Error {
@@ -4376,6 +4641,209 @@ mod tests {
         );
     }
 
+    #[test]
+    fn count_reads_one_bool_period_from_the_header() {
+        let schema = schema();
+        let from = 1_700_000_000_000i64;
+        let rows = (0..18)
+            .map(|i| action_row(&schema, from + i * 10, "click", i % 2 == 0, Some("note")))
+            .collect::<Vec<_>>();
+        let encoded = encode_block(&schema, &rows).unwrap();
+        assert_eq!(bool_encoding_kind(&schema, &encoded.bytes), BOOL_PERIOD);
+        let yes = bool_eq(3, true);
+        let no = bool_eq(3, false);
+        assert_eq!(
+            count_rows_filtered(&schema, &encoded.bytes, from, from + 170, &yes, &[]).unwrap(),
+            9
+        );
+        assert_eq!(
+            count_rows_filtered(&schema, &encoded.bytes, from, from + 170, &no, &[]).unwrap(),
+            9
+        );
+        assert_eq!(
+            count_rows_filtered(&schema, &encoded.bytes, from + 30, from + 50, &yes, &[]).unwrap(),
+            1,
+            "a cut window still walks and keeps the one true inside it"
+        );
+        assert_eq!(
+            count_rows_filtered(
+                &schema,
+                &encoded.bytes,
+                from,
+                from + 170,
+                &yes,
+                &[RangeFilter {
+                    index: 1,
+                    lower: Some(RangeEnd {
+                        inclusive: true,
+                        value: Scalar::Int(0),
+                    }),
+                    upper: Some(RangeEnd {
+                        inclusive: false,
+                        value: Scalar::Int(1),
+                    }),
+                }],
+            )
+            .unwrap(),
+            0,
+            "a numeric range still walks, and none of these rows sit below 1"
+        );
+        assert_eq!(
+            count_rows_filtered(
+                &schema,
+                &encoded.bytes,
+                from,
+                from + 170,
+                &[
+                    ColumnPredicate {
+                        index: 3,
+                        allowed: vec![Scalar::Bool(true)],
+                    },
+                    ColumnPredicate {
+                        index: 4,
+                        allowed: vec![Scalar::Str("missing".into())],
+                    },
+                ],
+                &[],
+            )
+            .unwrap(),
+            0,
+            "a second predicate still walks"
+        );
+
+        let wide: Vec<Row> = (0..40)
+            .map(|i| action_row(&schema, from + i * 10, "click", i % 9 == 0, Some("note")))
+            .collect();
+        let wide_block = encode_block(&schema, &wide).unwrap();
+        assert_eq!(bool_encoding_kind(&schema, &wide_block.bytes), BOOL_PERIOD);
+        assert_eq!(
+            count_rows_filtered(&schema, &wide_block.bytes, from, from + 390, &yes, &[]).unwrap(),
+            5,
+            "a period that crosses a pattern byte is counted from those bits"
+        );
+
+        let constant = (0..7)
+            .map(|i| action_row(&schema, from + i * 10, "click", true, Some("note")))
+            .collect::<Vec<_>>();
+        let constant_block = encode_block(&schema, &constant).unwrap();
+        assert_eq!(bool_encoding_kind(&schema, &constant_block.bytes), 1);
+        assert_eq!(
+            count_rows_filtered(&schema, &constant_block.bytes, from, from + 60, &yes, &[])
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            count_rows_filtered(&schema, &constant_block.bytes, from, from + 60, &no, &[]).unwrap(),
+            0
+        );
+
+        let with_nulls = (0..8)
+            .map(|i| {
+                let ok = if i % 4 == 0 { None } else { Some(i % 2 == 0) };
+                ok_row(&schema, from + i * 10, ok)
+            })
+            .collect::<Vec<_>>();
+        let null_block = encode_block(&schema, &with_nulls).unwrap();
+        assert_eq!(
+            count_rows_filtered(&schema, &null_block.bytes, from, from + 70, &yes, &[]).unwrap(),
+            2,
+            "a null in the bool column still walks"
+        );
+        assert_eq!(
+            count_rows_filtered(
+                &schema,
+                &null_block.bytes,
+                from,
+                from + 70,
+                &[ColumnPredicate {
+                    index: 3,
+                    allowed: vec![Scalar::Null],
+                }],
+                &[]
+            )
+            .unwrap(),
+            2
+        );
+
+        let tied: Vec<Row> = (0..16)
+            .map(|i| action_row(&schema, from + i * 10, "click", i % 2 == 0, Some("note")))
+            .collect();
+        let tied_block = encode_block(&schema, &tied).unwrap();
+        assert_eq!(bool_encoding_kind(&schema, &tied_block.bytes), 2);
+        assert_eq!(
+            count_rows_filtered(&schema, &tied_block.bytes, from, from + 150, &yes, &[]).unwrap(),
+            8,
+            "a full per-row bitmap still walks"
+        );
+
+        let decreasing = (0..8)
+            .map(|i| action_row(&schema, 1_000 - i * 10, "click", i % 2 == 0, Some("note")))
+            .collect::<Vec<_>>();
+        let decreasing_block = encode_block(&schema, &decreasing).unwrap();
+        assert_eq!(
+            count_rows_filtered(&schema, &decreasing_block.bytes, 900, 1_000, &yes, &[]).unwrap(),
+            4
+        );
+        assert_eq!(
+            count_rows_filtered(&schema, &decreasing_block.bytes, 940, 980, &yes, &[]).unwrap(),
+            3,
+            "a negative timestamp stride still walks a cut window"
+        );
+
+        let base = i64::MAX - 5;
+        let wrapped = [base, base.wrapping_add(10), base.wrapping_add(20)];
+        let wrapped_rows = wrapped
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| action_row(&schema, *ts, "click", i % 2 == 0, Some("note")))
+            .collect::<Vec<_>>();
+        let wrapped_block = encode_block(&schema, &wrapped_rows).unwrap();
+        assert_eq!(
+            count_rows_filtered(&schema, &wrapped_block.bytes, base, base, &yes, &[]).unwrap(),
+            1,
+            "a wrapping timestamp stride still walks"
+        );
+    }
+
+    fn bool_eq(index: usize, value: bool) -> Vec<ColumnPredicate> {
+        vec![ColumnPredicate {
+            index,
+            allowed: vec![Scalar::Bool(value)],
+        }]
+    }
+
+    fn bool_encoding_kind(schema: &Schema, bytes: &[u8]) -> u8 {
+        let nrows = block_row_count(bytes).unwrap();
+        let mut cursor = 4usize;
+        for (index, field) in schema.fields.iter().enumerate() {
+            if index == 3 {
+                assert_eq!(
+                    bytes[cursor], 0,
+                    "the bool column in this fixture has no nulls"
+                );
+                cursor += 1;
+                return bytes[cursor];
+            }
+            skip_column(field.ty, bytes, &mut cursor, nrows, false).unwrap();
+        }
+        panic!("bool column is missing");
+    }
+
+    fn ok_row(schema: &Schema, ts: i64, ok: Option<bool>) -> Row {
+        let mut obj = serde_json::json!({
+            "ts": ts,
+            "user_id": 1,
+            "score": 1.0,
+            "action": "click",
+            "amount": "1.00",
+            "note": "note",
+        });
+        if let Some(ok) = ok {
+            obj["ok"] = serde_json::json!(ok);
+        }
+        parse_event(schema, serde_json::to_vec(&obj).unwrap().as_slice()).unwrap()
+    }
+
     fn str_eq(index: usize, text: &str) -> Vec<ColumnPredicate> {
         vec![ColumnPredicate {
             index,
@@ -4777,6 +5245,90 @@ mod tests {
             decode_i64s(&encoded, &mut cursor, nine.len()).unwrap(),
             nine.iter().copied().flatten().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn unit_stride_runs_keep_a_sawtooth_and_reject_a_wrap() {
+        let schema = schema();
+        let saw: Vec<Row> = (0..2048)
+            .map(|i| {
+                parse_event(
+                    &schema,
+                    format!(
+                        r#"{{"ts":{i},"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                        i % 1000
+                    )
+                    .as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let encoded = encode_block(&schema, &saw).unwrap();
+        let runs = try_unit_stride_runs(&schema, &encoded.bytes, 1)
+            .unwrap()
+            .expect("user_id is unit-stride pieces");
+        let rows: u128 = runs
+            .iter()
+            .map(|run| {
+                let start = (run.start as u128) ^ (1u128 << 127);
+                let end = (run.end as u128) ^ (1u128 << 127);
+                (end - start + 1) * u128::from(run.mult)
+            })
+            .sum();
+        assert_eq!(rows, 2048);
+        assert!(runs.iter().all(|run| run.mult == 1 && run.end >= run.start));
+
+        let wrapped = [
+            parse_event(
+                &schema,
+                format!(
+                    r#"{{"ts":1,"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                    i64::MAX
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+            parse_event(
+                &schema,
+                format!(
+                    r#"{{"ts":2,"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                    i64::MIN
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+            parse_event(
+                &schema,
+                format!(
+                    r#"{{"ts":3,"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                    i64::MIN + 1
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+        ];
+        let wrapped = encode_block(&schema, &wrapped).unwrap();
+        assert!(try_unit_stride_runs(&schema, &wrapped.bytes, 1)
+            .unwrap()
+            .is_none());
+
+        let wide: Vec<Row> = (0..8)
+            .map(|i| {
+                parse_event(
+                    &schema,
+                    format!(
+                        r#"{{"ts":{i},"user_id":{},"score":1.0,"ok":true,"action":"click","amount":"1.00"}}"#,
+                        i * 2
+                    )
+                    .as_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let wide = encode_block(&schema, &wide).unwrap();
+        assert!(try_unit_stride_runs(&schema, &wide.bytes, 1)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

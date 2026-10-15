@@ -21,7 +21,10 @@
 //! no numeric range, counts a constant or one dictionary-code period from the
 //! column header when every payload timestamp is inside the range. A null, a
 //! full code vector, raw strings, or a timestamp outside the range still walks
-//! rows. Each column is its own zstd frame when that container is
+//! rows. One bool equality, with no other predicate and no numeric range,
+//! counts a constant or one bitmap period the same way, and does not expand a
+//! bool per row. A null or a full per-row bitmap still walks. Each column is
+//! its own zstd frame when that container is
 //! at most a quarter larger than one frame, so a filter does not decompress
 //! columns after the predicate.
 //! [`Store::query_json_columns`](store::Store::query_json_columns) returns
@@ -46,11 +49,18 @@
 //! result by one column.
 //! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns
 //! one exact rank of a numeric column over that same window. Nulls are left
-//! out of the sample. The encoder and the on-disk files are unchanged.
+//! out of the sample. One int, timestamp, or decimal with no row predicate
+//! selects that rank from a null-free constant, stride, or stride pieces whose
+//! stride is -1, 0, or 1 and whose values do not wrap, when every payload
+//! timestamp is inside the range. A null, any other encoding, a float, a cut
+//! block, or a predicate still sorts the sample. The encoder and the on-disk
+//! files are unchanged.
 //! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
 //! row for each value of one column, in that same key order.
 //! [`Store::distinct_count`](store::Store::distinct_count) counts distinct
 //! non-null values of one column over that same filtered window.
+//! [`Store::topk`](store::Store::topk) returns the values of one column that
+//! occur most often in that window, including null, with the same exact counts.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
 //! are entirely older than a caller-supplied cutoff and removes a segment file only
 //! when every block in it is gone. A row older than the cutoff stays when it shares
@@ -74,7 +84,7 @@ pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
 pub use store::{
     parse_quantile_p, CmpOp, ColumnStats, HistogramBucket, Predicate, QuantileP, RewriteReport,
-    StatGroup, StatRequest, StatSum, StatVar, Stats, Store, StoreOptions, StoredBytes,
+    StatGroup, StatRequest, StatSum, StatVar, Stats, Store, StoreOptions, StoredBytes, TopValue,
     MAX_DISTINCT_VALUES, MAX_HISTOGRAM_BUCKETS,
 };
 pub use value::format_decimal;
