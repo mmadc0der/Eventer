@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use crate::codec::{
     accumulate_histogram_filtered, block_row_count, cmp_numeric, count_rows_filtered,
-    decode_rows_filtered, decode_rows_included, range_impossible, range_matches,
-    read_timestamp_column, read_timestamp_column_included, tighter_lower, tighter_upper,
-    timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float, try_unit_stride_runs,
-    visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd, RangeFilter, UnitRun,
+    decode_rows_filtered, decode_rows_included, image_contains_column, range_impossible,
+    range_matches, read_timestamp_column, read_timestamp_column_included, tighter_lower,
+    tighter_upper, timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float,
+    try_unit_stride_runs, visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd,
+    RangeFilter, UnitRun,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -842,6 +843,17 @@ impl Store {
     /// still inserts the surviving values into the set. A stride of 2 whose
     /// values are 0 and 2 counts as 2, not as the closed interval from 0 to 2.
     /// The sparse index is not the inside check.
+    ///
+    /// When the request has no row predicate and the column is a bool, string,
+    /// or text, each surviving block is checked from its timestamp column. If
+    /// every payload timestamp is inside the inclusive range, a bool zone
+    /// contributes 0, 1, or 2 and an exact string or text zone contributes its
+    /// values. Nulls do not count, so an all-null column contributes nothing.
+    /// Those sets are unioned and the column is not decoded. A bloom, an
+    /// unknown zone, a float, an int, a timestamp, a decimal, or a json column
+    /// still walks the rows. A block the range cuts, or any predicate, still
+    /// walks. A span that mixes the two unions the proved blocks and walks
+    /// only the rest. The sparse index is not that inside check.
     pub fn distinct_count(
         &self,
         from_ms: i64,
@@ -854,89 +866,251 @@ impl Store {
             return Ok(0);
         };
         let _retention = self.pipeline.lock_for_read();
-        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut seen = DistinctSet::new(column.ty);
-        let timestamp_field = column.index == self.schema.timestamp_index;
-        let mut runs = (resolved.unfiltered()
+        let mut dictionaries = HashMap::new();
+        if resolved.unfiltered() && zone_distinct_column(column.ty) {
+            let blocks = self.prepare_zone_distinct_blocks(from_ms, to_ms, &column);
+            for (block, answer) in blocks {
+                if let ZoneDistinct::Contained(values) = &answer {
+                    let payload = self.read_distinct_prefix(&block, &mut dictionaries)?;
+                    match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
+                        Some(span) if span.inside => {
+                            for value in values {
+                                seen.note(&column.name, column.ty, value)?;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    if image_contains_column(&self.schema, &payload, column.index)? {
+                        self.absorb_distinct_payload(
+                            &payload, from_ms, to_ms, &resolved, &column, &mut seen,
+                        )?;
+                        continue;
+                    }
+                }
+                self.absorb_distinct_block(
+                    &block,
+                    &mut dictionaries,
+                    from_ms,
+                    to_ms,
+                    &resolved,
+                    &column,
+                    &mut seen,
+                )?;
+            }
+        } else if resolved.unfiltered()
             && matches!(
                 column.ty,
                 FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. }
-            ))
-        .then(Vec::new);
-        let mut dictionaries = HashMap::new();
-        for block in blocks {
-            if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
-                return Err(Error::event("query response size limit exceeded"));
-            }
-            let payload = self.read_block_bytes(
-                &block,
-                &mut dictionaries,
-                segment::BlockLoad {
-                    through_column: Some(needed_column(
-                        &self.schema,
-                        &resolved,
-                        Some(column.index),
-                    )),
-                    columns: None,
-                },
-            )?;
-            let nrows = block_row_count(&payload)?;
-            require_header_row_count(block.row_count, nrows)?;
-            if runs.is_some() {
-                let contained = match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)?
-                {
-                    Some(span) if span.inside => try_unit_stride_runs(
-                        &self.schema,
-                        &payload,
-                        column.index,
-                    )?,
-                    Some(_) => None,
-                    None => Some(Vec::new()),
-                };
-                match contained {
-                    Some(block_runs) => {
-                        runs.as_mut()
-                            .expect("unit-stride runs are still open")
-                            .extend(block_runs.into_iter().map(|run| (run.start, run.end)));
-                        continue;
-                    }
-                    None => {
-                        let taken = runs.take().expect("unit-stride runs are still open");
-                        spill_distinct_runs(&taken, &mut seen)?;
+            )
+        {
+            let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+            let timestamp_field = column.index == self.schema.timestamp_index;
+            let mut runs = Some(Vec::new());
+            for block in blocks {
+                if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+                    return Err(Error::event("query response size limit exceeded"));
+                }
+                let payload = self.read_block_bytes(
+                    &block,
+                    &mut dictionaries,
+                    segment::BlockLoad {
+                        through_column: Some(needed_column(
+                            &self.schema,
+                            &resolved,
+                            Some(column.index),
+                        )),
+                        columns: None,
+                    },
+                )?;
+                let nrows = block_row_count(&payload)?;
+                require_header_row_count(block.row_count, nrows)?;
+                if runs.is_some() {
+                    let contained =
+                        match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
+                            Some(span) if span.inside => {
+                                try_unit_stride_runs(&self.schema, &payload, column.index)?
+                            }
+                            Some(_) => None,
+                            None => Some(Vec::new()),
+                        };
+                    match contained {
+                        Some(block_runs) => {
+                            runs.as_mut()
+                                .expect("unit-stride runs are still open")
+                                .extend(block_runs.into_iter().map(|run| (run.start, run.end)));
+                            continue;
+                        }
+                        None => {
+                            let taken = runs.take().expect("unit-stride runs are still open");
+                            spill_distinct_runs(&taken, &mut seen)?;
+                        }
                     }
                 }
+                let mut captures = if timestamp_field {
+                    Vec::new()
+                } else {
+                    capture_columns([column.index])
+                };
+                visit_matching_timestamps(
+                    &self.schema,
+                    &payload,
+                    from_ms,
+                    to_ms,
+                    &resolved.predicates,
+                    &resolved.ranges,
+                    &mut captures,
+                    |ts, row, captured| {
+                        if timestamp_field {
+                            return seen.note(&column.name, column.ty, &Scalar::Timestamp(ts));
+                        }
+                        let scalar = captured
+                            .first()
+                            .and_then(|slot| slot.values.get(row))
+                            .ok_or_else(|| {
+                                Error::corrupt(format!("field `{}` is missing a row", column.name))
+                            })?;
+                        seen.note(&column.name, column.ty, scalar)
+                    },
+                )?;
             }
-            let mut captures = if timestamp_field {
-                Vec::new()
-            } else {
-                capture_columns([column.index])
-            };
-            visit_matching_timestamps(
-                &self.schema,
-                &payload,
-                from_ms,
-                to_ms,
-                &resolved.predicates,
-                &resolved.ranges,
-                &mut captures,
-                |ts, row, captured| {
-                    if timestamp_field {
-                        return seen.note(&column.name, column.ty, &Scalar::Timestamp(ts));
-                    }
-                    let scalar = captured
-                        .first()
-                        .and_then(|slot| slot.values.get(row))
-                        .ok_or_else(|| {
-                            Error::corrupt(format!("field `{}` is missing a row", column.name))
-                        })?;
-                    seen.note(&column.name, column.ty, scalar)
-                },
-            )?;
-        }
-        if let Some(collected) = runs {
-            return union_distinct_count(&collected);
+            if let Some(collected) = runs {
+                return union_distinct_count(&collected);
+            }
+        } else {
+            let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+            for block in blocks {
+                self.absorb_distinct_block(
+                    &block,
+                    &mut dictionaries,
+                    from_ms,
+                    to_ms,
+                    &resolved,
+                    &column,
+                    &mut seen,
+                )?;
+            }
         }
         Ok(seen.len() as u64)
+    }
+
+    /// Overlapping blocks, with the zone set to union when the block is fully inside.
+    ///
+    /// A missing zone, a bloom, or any column this path cannot trust is
+    /// [`ZoneDistinct::Walk`]. The sparse index only drops blocks that cannot
+    /// overlap the range.
+    fn prepare_zone_distinct_blocks(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        column: &DistinctColumn,
+    ) -> Vec<(segment::BlockMeta, ZoneDistinct)> {
+        let catalog = self.catalog();
+        let mut blocks = Vec::new();
+        for segment in &catalog.segments {
+            for (index, block) in segment.blocks.iter().enumerate() {
+                if block.max_ts < from_ms || block.min_ts > to_ms {
+                    continue;
+                }
+                let answer = segment
+                    .zones
+                    .get(index)
+                    .and_then(|zone| zone.columns.get(column.index))
+                    .map(|zone| zone_distinct_values(column.ty, zone))
+                    .unwrap_or(ZoneDistinct::Walk);
+                blocks.push((block.clone(), answer));
+            }
+        }
+        blocks
+    }
+
+    /// Timestamp prefix of one block. A single frame is the whole block.
+    ///
+    /// An empty block is not a proof. The sparse index is not this check.
+    fn read_distinct_prefix(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+    ) -> Result<Vec<u8>> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(self.schema.timestamp_index),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        Ok(payload)
+    }
+
+    fn absorb_distinct_block(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+        column: &DistinctColumn,
+        seen: &mut DistinctSet,
+    ) -> Result<()> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(needed_column(&self.schema, resolved, Some(column.index))),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        self.absorb_distinct_payload(&payload, from_ms, to_ms, resolved, column, seen)
+    }
+
+    fn absorb_distinct_payload(
+        &self,
+        payload: &[u8],
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+        column: &DistinctColumn,
+        seen: &mut DistinctSet,
+    ) -> Result<()> {
+        let timestamp_field = column.index == self.schema.timestamp_index;
+        let mut captures = if timestamp_field {
+            Vec::new()
+        } else {
+            capture_columns([column.index])
+        };
+        visit_matching_timestamps(
+            &self.schema,
+            &payload,
+            from_ms,
+            to_ms,
+            &resolved.predicates,
+            &resolved.ranges,
+            &mut captures,
+            |ts, row, captured| {
+                if timestamp_field {
+                    return seen.note(&column.name, column.ty, &Scalar::Timestamp(ts));
+                }
+                let scalar = captured
+                    .first()
+                    .and_then(|slot| slot.values.get(row))
+                    .ok_or_else(|| {
+                        Error::corrupt(format!("field `{}` is missing a row", column.name))
+                    })?;
+                seen.note(&column.name, column.ty, scalar)
+            },
+        )
     }
 
     /// The `k` values of `field` that occur most often inside the filtered window.
@@ -3307,6 +3481,51 @@ fn cmp_top_value(left: &Scalar, right: &Scalar) -> Ordering {
         (Scalar::Float(left), Scalar::Float(right)) => left.total_cmp(right),
         (Scalar::Str(left), Scalar::Str(right)) => left.cmp(right),
         _ => Ordering::Equal,
+    }
+}
+
+enum ZoneDistinct {
+    /// Non-null values to union once every payload timestamp is inside the range.
+    Contained(Vec<Scalar>),
+    Walk,
+}
+
+fn zone_distinct_column(ty: FieldType) -> bool {
+    matches!(ty, FieldType::Bool | FieldType::String | FieldType::Text)
+}
+
+fn zone_distinct_values(ty: FieldType, column: &crate::zone::ColumnZone) -> ZoneDistinct {
+    match (ty, column) {
+        (FieldType::Bool, crate::zone::ColumnZone::AllNull) => ZoneDistinct::Contained(Vec::new()),
+        (
+            FieldType::Bool,
+            crate::zone::ColumnZone::Bool {
+                has_false,
+                has_true,
+                ..
+            },
+        ) => {
+            let mut values = Vec::new();
+            if *has_false {
+                values.push(Scalar::Bool(false));
+            }
+            if *has_true {
+                values.push(Scalar::Bool(true));
+            }
+            ZoneDistinct::Contained(values)
+        }
+        (FieldType::String | FieldType::Text, crate::zone::ColumnZone::AllNull) => {
+            ZoneDistinct::Contained(Vec::new())
+        }
+        (FieldType::String | FieldType::Text, crate::zone::ColumnZone::Exact { values, .. }) => {
+            ZoneDistinct::Contained(
+                values
+                    .iter()
+                    .map(|text| Scalar::Str(text.clone()))
+                    .collect(),
+            )
+        }
+        _ => ZoneDistinct::Walk,
     }
 }
 
@@ -11165,6 +11384,92 @@ mod tests {
     }
 
     #[test]
+    fn distinct_count_unions_proved_zones_and_walks_the_rest() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(2)).unwrap();
+        let row = |ts: i64, ok: Option<bool>, action: &str, note: Option<&str>| {
+            let mut value = serde_json::json!({
+                "ts": ts,
+                "user_id": 1,
+                "score": 1.0,
+                "action": action,
+                "amount": "1.00",
+            });
+            if let Some(ok) = ok {
+                value["ok"] = serde_json::json!(ok);
+            }
+            if let Some(note) = note {
+                value["note"] = serde_json::json!(note);
+            }
+            serde_json::to_vec(&value).unwrap()
+        };
+        store
+            .append_json(&row(10, Some(true), "click", Some("a")))
+            .unwrap();
+        store
+            .append_json(&row(11, Some(true), "view", None))
+            .unwrap();
+        store
+            .append_json(&row(20, Some(false), "buy", Some("b")))
+            .unwrap();
+        store
+            .append_json(&row(21, Some(true), "scroll", Some("c")))
+            .unwrap();
+        store.flush().unwrap();
+
+        assert_eq!(store.distinct_count(10, 21, &[], "action").unwrap(), 4);
+        assert_eq!(store.distinct_count(10, 20, &[], "action").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 11, &[], "action").unwrap(), 2);
+        assert_eq!(store.distinct_count(20, 20, &[], "action").unwrap(), 1);
+        assert_eq!(store.distinct_count(10, 11, &[], "note").unwrap(), 1);
+        assert_eq!(store.distinct_count(10, 21, &[], "note").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 11, &[], "ok").unwrap(), 1);
+        assert_eq!(store.distinct_count(10, 21, &[], "ok").unwrap(), 2);
+        assert_eq!(store.distinct_count(10, 20, &[], "ok").unwrap(), 2);
+        let ok_true = [Predicate::Eq("ok".into(), Scalar::Bool(true))];
+        assert_eq!(store.distinct_count(10, 21, &ok_true, "action").unwrap(), 3);
+        store.close().unwrap();
+
+        let wide = TempDir::new();
+        let schema = write_schema(wide.path());
+        let store = Store::open_with(wide.path().join("data"), &schema, test_options(40)).unwrap();
+        for id in 0..40i64 {
+            store
+                .append_json(&row(id, Some(true), &format!("run-{id}"), Some("n")))
+                .unwrap();
+        }
+        store
+            .append_json(&row(40, Some(false), "click", None))
+            .unwrap();
+        store
+            .append_json(&row(41, Some(false), "click", None))
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 2);
+        assert!(
+            matches!(
+                store.catalog().segments[0].zones[0].columns[4],
+                crate::zone::ColumnZone::Bloom { .. }
+            ),
+            "forty actions are a bloom, so that block still walks"
+        );
+        assert!(matches!(
+            store.catalog().segments[0].zones[1].columns[4],
+            crate::zone::ColumnZone::Exact { .. }
+        ));
+        assert!(matches!(
+            store.catalog().segments[0].zones[1].columns[5],
+            crate::zone::ColumnZone::AllNull
+        ));
+        assert_eq!(store.distinct_count(0, 41, &[], "action").unwrap(), 41);
+        assert_eq!(store.distinct_count(40, 41, &[], "action").unwrap(), 1);
+        assert_eq!(store.distinct_count(40, 41, &[], "note").unwrap(), 0);
+        assert_eq!(store.distinct_count(0, 41, &[], "user_id").unwrap(), 1);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn stock_events_have_the_distinct_counts_of_the_bench() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -11200,7 +11505,24 @@ mod tests {
             1000
         );
         assert_eq!(store.distinct_count(start, end, &[], "action").unwrap(), 4);
+        assert_eq!(store.distinct_count(start, end, &[], "ok").unwrap(), 2);
+        assert_eq!(store.distinct_count(start, end, &[], "note").unwrap(), 3);
         assert_eq!(store.distinct_count(start, end, &[], "score").unwrap(), 100);
+        assert_eq!(
+            store
+                .distinct_count(start, start + 10, &[], "action")
+                .unwrap(),
+            2,
+            "i in 0..=1 is click and view, not the four values on that block's zone"
+        );
+        let ok_true = [Predicate::Eq("ok".into(), Scalar::Bool(true))];
+        assert_eq!(
+            store
+                .distinct_count(start, end, &ok_true, "action")
+                .unwrap(),
+            2,
+            "ok=true is click and buy"
+        );
         assert_eq!(
             store.distinct_count(start, end, &[], "ts").unwrap(),
             100_000
