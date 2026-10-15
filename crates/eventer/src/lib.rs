@@ -49,7 +49,12 @@
 //! column. One int, timestamp, or decimal `sum`, with no `min`, no `max`, no
 //! `var`, no `stddev`, and no row predicate, adds a null-free constant,
 //! stride, or stride pieces from the column body when every payload timestamp
-//! is inside the range. `min` and `max` with no `sum`, no variance, and no
+//! is inside the range. When that sum, or that one float sum, also has numeric
+//! ranges and no equality, a block whose zone implies every range drops those
+//! ranges and uses the same sum. A null in the zone is not a proof. A bound
+//! the zone does not cover, an equality, a minimum, a maximum, a variance, or
+//! a timestamp outside the range still walks. The sparse index is not that
+//! check. `min` and `max` with no `sum`, no variance, and no
 //! row predicate take int, decimal, and float extremes from the zone when
 //! every payload timestamp in the block is inside the range.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
