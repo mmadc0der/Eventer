@@ -7,7 +7,9 @@
 //! millisecond range. Repeat `eq=field=value` to AND equality filters into the scan.
 //! Repeat `in=field=value` to keep rows whose column equals any listed value.
 //! Values repeated for one field are one set. Different fields are AND-ed with
-//! `eq` and with the numeric ranges. The literal `null` matches a null column.
+//! `eq` and with the numeric ranges. String and text keep the word `null` as
+//! that text. Int, timestamp, float, bool, decimal, and json spell a null
+//! column as `null`.
 //! Repeat `gt`, `ge`, `lt`, and `le` as `field=value` to AND numeric ranges.
 //! `gt` and `lt` are exclusive. `ge` and `le` are inclusive.
 //! `limit` keeps the first matching rows and `offset` skips matches before that.
