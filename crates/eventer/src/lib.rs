@@ -37,16 +37,17 @@
 //! equality uses that fill when the zone implies every numeric range. A range
 //! the zone does not prove, an equality, a null in the zone, a negative stride,
 //! wrapping arithmetic, stride pieces, or a bit-packed timestamp still walks.
-//! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums
-//! and finds the minimum and maximum of numeric columns over that same filtered
-//! window, without building the rows. One float sum with no minimum, maximum,
-//! or row predicate adds a fully contained block from the encoded column.
-//! One int, timestamp, or decimal `sum`, with no `min`, no `max`, and no row
-//! predicate, adds a null-free constant, stride, or stride pieces from the
-//! column body when every payload timestamp is inside the range. `min` and
-//! `max` with no `sum` and no row predicate take int, decimal, and float
-//! extremes from the zone when every payload timestamp in the block is inside
-//! the range.
+//! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums,
+//! finds the minimum and maximum, and computes the population variance and
+//! standard deviation of numeric columns over that same filtered window,
+//! without building the rows. One float sum with no minimum, maximum,
+//! variance, or row predicate adds a fully contained block from the encoded
+//! column. One int, timestamp, or decimal `sum`, with no `min`, no `max`, no
+//! `var`, no `stddev`, and no row predicate, adds a null-free constant,
+//! stride, or stride pieces from the column body when every payload timestamp
+//! is inside the range. `min` and `max` with no `sum`, no variance, and no
+//! row predicate take int, decimal, and float extremes from the zone when
+//! every payload timestamp in the block is inside the range.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
 //! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns
@@ -60,7 +61,13 @@
 //! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
 //! row for each value of one column, in that same key order.
 //! [`Store::distinct_count`](store::Store::distinct_count) counts distinct
-//! non-null values of one column over that same filtered window.
+//! non-null values of one column over that same filtered window. With no row
+//! predicate, a block whose every payload timestamp is inside the range
+//! contributes a bool or an exact string or text set from the zone and does
+//! not decode that column. A bloom, an unknown zone, a float, an int, a
+//! timestamp, a decimal, or a json column still walks. One int, timestamp, or
+//! decimal with no row predicate counts a fully contained, null-free constant
+//! or unit stride from the column body. A cut block or a predicate still walks.
 //! [`Store::topk`](store::Store::topk) returns the values of one column that
 //! occur most often in that window, including null, with the same exact counts.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
@@ -86,7 +93,7 @@ pub use error::{Error, Result};
 pub use schema::{parse_schema, FieldType, Schema};
 pub use store::{
     parse_quantile_p, CmpOp, ColumnStats, HistogramBucket, Predicate, QuantileP, RewriteReport,
-    StatGroup, StatRequest, StatSum, Stats, Store, StoreOptions, StoredBytes, TopValue,
+    StatGroup, StatRequest, StatSum, StatVar, Stats, Store, StoreOptions, StoredBytes, TopValue,
     MAX_DISTINCT_VALUES, MAX_HISTOGRAM_BUCKETS,
 };
 pub use value::format_decimal;
