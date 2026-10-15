@@ -766,7 +766,8 @@ impl Store {
     /// minimum greater than or equal to it. `lt` and `le` use the maximum the
     /// same way. A null flag, tag `0`, or a bound the zone does not cover still
     /// decodes. An equality on a numeric or json column still reads that column.
-    /// The histogram path does not use this shortcut.
+    /// A histogram with no equality uses the same proof, then fills its buckets
+    /// from the timestamp header.
     ///
     /// One equality on a string or text column, with no other predicate and no
     /// numeric range, is counted from the column header when every payload
@@ -1243,14 +1244,16 @@ impl Store {
     /// `bucket_ms` is a positive integer. More than [`MAX_HISTOGRAM_BUCKETS`]
     /// buckets is an error, and no block is read for that call. A block the
     /// sparse index places outside the range is not read. A block the zone map
-    /// can reject is not read. A block with no predicates and no numeric range
-    /// reads the timestamp column only. When that column is a constant or a
-    /// positive stride that does not wrap, it has no nulls, and both encoded
-    /// endpoints sit inside the inclusive range, each run is added to the
-    /// buckets without expanding the column. A negative stride, wrapping
-    /// arithmetic, stride pieces, a bit-packed column, a null, a predicate, or
-    /// a range still walks the rows. A timestamp outside the range is not
-    /// counted. The sparse-index min/max are not that check.
+    /// can reject is not read. A block with no equality reads the timestamp
+    /// column only when it has no numeric range, or when the zone implies every
+    /// numeric range. When that column is a constant or a positive stride that
+    /// does not wrap, it has no nulls, and both encoded endpoints sit inside
+    /// the inclusive range, each run is added to the buckets without expanding
+    /// the column. A range the zone does not prove still walks the rows. An
+    /// equality, a null in the zone, a negative stride, wrapping arithmetic,
+    /// stride pieces, or a bit-packed timestamp still walks. A timestamp
+    /// outside the range is not counted. The sparse-index min/max are not that
+    /// check.
     pub fn histogram_with_filter(
         &self,
         from_ms: i64,
@@ -1265,30 +1268,40 @@ impl Store {
             return histogram_buckets(span);
         };
         let _retention = self.pipeline.lock_for_read();
-        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+        let blocks = self.blocks_for_count(from_ms, to_ms, &resolved);
         let mut counts = vec![0u64; span.buckets];
         let mut dictionaries = HashMap::new();
-        for block in blocks {
+        for (block, proved) in blocks {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                 return Err(Error::event("query response size limit exceeded"));
             }
+            let through = if proved {
+                self.schema.timestamp_index
+            } else {
+                needed_column(&self.schema, &resolved, None)
+            };
             let payload = self.read_block_bytes(
                 &block,
                 &mut dictionaries,
                 segment::BlockLoad {
-                    through_column: Some(needed_column(&self.schema, &resolved, None)),
+                    through_column: Some(through),
                     columns: None,
                 },
             )?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
+            let (predicates, ranges) = if proved {
+                ([].as_slice(), [].as_slice())
+            } else {
+                (resolved.predicates.as_slice(), resolved.ranges.as_slice())
+            };
             accumulate_histogram_filtered(
                 &self.schema,
                 &payload,
                 from_ms,
                 to_ms,
-                &resolved.predicates,
-                &resolved.ranges,
+                predicates,
+                ranges,
                 bucket_ms,
                 span.first_start,
                 &mut counts,
@@ -2010,11 +2023,11 @@ impl Store {
         blocks
     }
 
-    /// Blocks a count will read, and whether every range is already proved.
+    /// Blocks a count or histogram will read, and whether every range is already proved.
     ///
     /// `proved` is set only when the block has no equality predicate and the
-    /// zone implies every range. Histogram and row scans keep using
-    /// [`Store::blocks_in_range`] and still decode those columns.
+    /// zone implies every range. A proved block is read through the timestamp
+    /// column. Row scans keep using [`Store::blocks_in_range`].
     fn blocks_for_count(
         &self,
         from_ms: i64,
@@ -7924,14 +7937,18 @@ mod tests {
         )];
         assert_eq!(store.count_with_filter(0, 127, &covered).unwrap(), 128);
         assert_eq!(store.count_with_filter(0, 127, &partial).unwrap(), 63);
+        let covered_buckets = store.histogram_with_filter(0, 127, 1, &covered).unwrap();
         assert_eq!(
-            store
-                .histogram_with_filter(0, 127, 1, &covered)
-                .unwrap()
+            covered_buckets
                 .iter()
                 .map(|bucket| bucket.count)
                 .sum::<u64>(),
             128
+        );
+        assert_eq!(
+            covered_buckets,
+            store.histogram(0, 127, 1).unwrap(),
+            "a zone-proved range matches the unfiltered buckets"
         );
 
         flip_column_slice(&mut bytes, 1);
@@ -7942,9 +7959,42 @@ mod tests {
             "a proved float column is not decoded"
         );
         assert!(store.count_with_filter(0, 127, &partial).is_err());
-        assert!(store.histogram_with_filter(0, 127, 1, &covered).is_err());
+        assert_eq!(
+            store
+                .histogram_with_filter(0, 127, 1, &covered)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            128,
+            "a proved histogram does not decode the float column"
+        );
+        assert!(store.histogram_with_filter(0, 127, 1, &partial).is_err());
+        let above = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(100.0),
+        )];
+        assert_eq!(
+            store
+                .histogram_with_filter(0, 127, 1, &above)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            0,
+            "a range the zone rejects reads no payload"
+        );
         assert!(store
             .count_with_filter(0, 127, &[Predicate::Eq("score".into(), Scalar::Float(0.0))])
+            .is_err());
+        assert!(store
+            .histogram_with_filter(
+                0,
+                127,
+                1,
+                &[Predicate::Eq("score".into(), Scalar::Float(0.0))]
+            )
             .is_err());
         store.close().unwrap();
     }
