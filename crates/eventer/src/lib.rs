@@ -57,7 +57,12 @@
 //! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
 //! row for each value of one column, in that same key order.
 //! [`Store::distinct_count`](store::Store::distinct_count) counts distinct
-//! non-null values of one column over that same filtered window.
+//! non-null values of one column over that same filtered window. With no row
+//! predicate, a block whose every payload timestamp is inside the range
+//! contributes a bool or an exact string or text set from the zone and does
+//! not decode that column. A bloom, an unknown zone, a float, an int, a
+//! timestamp, a decimal, or a json column still walks. A cut block or a
+//! predicate still walks.
 //! [`Store::topk`](store::Store::topk) returns the values of one column that
 //! occur most often in that window, including null, with the same exact counts.
 //! [`Store::drop_blocks_before`](store::Store::drop_blocks_before) deletes blocks that
