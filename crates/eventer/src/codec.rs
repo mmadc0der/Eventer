@@ -543,11 +543,12 @@ pub(crate) fn count_rows_filtered(
     ranges: &[RangeFilter],
 ) -> Result<u64> {
     if let Some(total) =
-        count_one_string_equality(schema, bytes, from_ms, to_ms, predicates, ranges)?
+        count_one_string_equality(schema, bytes, from_ms, to_ms, predicates, ranges, None)?
     {
         return Ok(total);
     }
-    if let Some(total) = count_one_bool_equality(schema, bytes, from_ms, to_ms, predicates, ranges)?
+    if let Some(total) =
+        count_one_bool_equality(schema, bytes, from_ms, to_ms, predicates, ranges, None)?
     {
         return Ok(total);
     }
@@ -662,12 +663,28 @@ fn plain_timestamp_run(
     from_ms: i64,
     to_ms: i64,
 ) -> Result<Option<TimestampRun>> {
+    plain_timestamp_run_included(schema, bytes, from_ms, to_ms, None)
+}
+
+fn plain_timestamp_run_included(
+    schema: &Schema,
+    bytes: &[u8],
+    from_ms: i64,
+    to_ms: i64,
+    included: Option<&[bool]>,
+) -> Result<Option<TimestampRun>> {
     if from_ms > to_ms {
         return Ok(None);
     }
     let nrows = block_row_count(bytes)?;
     let mut cursor = 4usize;
     for (index, field) in schema.fields.iter().enumerate() {
+        if column_is_hole(included, index) {
+            if index == schema.timestamp_index {
+                return Err(Error::corrupt("timestamp column is missing"));
+            }
+            continue;
+        }
         if column_was_not_stored(bytes, cursor) {
             return Err(Error::corrupt("timestamp column is missing"));
         }
@@ -736,6 +753,31 @@ fn plain_i64_run(
 /// numeric range, a value that is not one string, a null in the column, a
 /// full code vector, raw strings, or a timestamp column this header cannot
 /// prove sits entirely inside the range.
+/// One string, text, or bool equality, counted from a constant or one period.
+///
+/// The caller has already dropped numeric ranges a zone proved. `included`
+/// names the columns whose encodings are in `bytes`. `None` means a normal
+/// block image. A false column is a hole and contributes no bytes. `Ok(None)`
+/// means this header cannot count the block: a second predicate, a value that
+/// is not one string or one bool, a null, a full code vector or bitmap, raw
+/// strings, or a timestamp column this header cannot prove sits inside the
+/// range. The row walk still has to run.
+pub(crate) fn count_header_equality(
+    schema: &Schema,
+    bytes: &[u8],
+    included: Option<&[bool]>,
+    from_ms: i64,
+    to_ms: i64,
+    predicates: &[ColumnPredicate],
+) -> Result<Option<u64>> {
+    if let Some(total) =
+        count_one_string_equality(schema, bytes, from_ms, to_ms, predicates, &[], included)?
+    {
+        return Ok(Some(total));
+    }
+    count_one_bool_equality(schema, bytes, from_ms, to_ms, predicates, &[], included)
+}
+
 fn count_one_string_equality(
     schema: &Schema,
     bytes: &[u8],
@@ -743,6 +785,7 @@ fn count_one_string_equality(
     to_ms: i64,
     predicates: &[ColumnPredicate],
     ranges: &[RangeFilter],
+    included: Option<&[bool]>,
 ) -> Result<Option<u64>> {
     if !ranges.is_empty() || predicates.len() != 1 {
         return Ok(None);
@@ -757,10 +800,10 @@ fn count_one_string_equality(
     if !matches!(field.ty, FieldType::String | FieldType::Text) {
         return Ok(None);
     }
-    if plain_timestamp_run(schema, bytes, from_ms, to_ms)?.is_none() {
+    if plain_timestamp_run_included(schema, bytes, from_ms, to_ms, included)?.is_none() {
         return Ok(None);
     }
-    count_constant_or_code_period(schema, bytes, predicate.index, needle)
+    count_constant_or_code_period(schema, bytes, predicate.index, needle, included)
 }
 
 /// Constant string (kind 3) or one period of dictionary codes (kind 4).
@@ -773,10 +816,17 @@ fn count_constant_or_code_period(
     bytes: &[u8],
     column: usize,
     needle: &str,
+    included: Option<&[bool]>,
 ) -> Result<Option<u64>> {
     let nrows = block_row_count(bytes)?;
     let mut cursor = 4usize;
     for (index, field) in schema.fields.iter().enumerate() {
+        if column_is_hole(included, index) {
+            if index == column {
+                return Ok(None);
+            }
+            continue;
+        }
         if column_was_not_stored(bytes, cursor) {
             return Ok(None);
         }
@@ -869,6 +919,7 @@ fn count_one_bool_equality(
     to_ms: i64,
     predicates: &[ColumnPredicate],
     ranges: &[RangeFilter],
+    included: Option<&[bool]>,
 ) -> Result<Option<u64>> {
     if !ranges.is_empty() || predicates.len() != 1 {
         return Ok(None);
@@ -883,10 +934,10 @@ fn count_one_bool_equality(
     if field.ty != FieldType::Bool {
         return Ok(None);
     }
-    if plain_timestamp_run(schema, bytes, from_ms, to_ms)?.is_none() {
+    if plain_timestamp_run_included(schema, bytes, from_ms, to_ms, included)?.is_none() {
         return Ok(None);
     }
-    count_constant_or_bool_period(schema, bytes, predicate.index, *want)
+    count_constant_or_bool_period(schema, bytes, predicate.index, *want, included)
 }
 
 /// Constant bool (kind 1) or one period of packed bits (kind 4).
@@ -899,10 +950,17 @@ fn count_constant_or_bool_period(
     bytes: &[u8],
     column: usize,
     want: bool,
+    included: Option<&[bool]>,
 ) -> Result<Option<u64>> {
     let nrows = block_row_count(bytes)?;
     let mut cursor = 4usize;
     for (index, field) in schema.fields.iter().enumerate() {
+        if column_is_hole(included, index) {
+            if index == column {
+                return Ok(None);
+            }
+            continue;
+        }
         if column_was_not_stored(bytes, cursor) {
             return Ok(None);
         }
@@ -2901,6 +2959,11 @@ pub(crate) fn read_timestamp_column_included(
 /// True when `cursor` is at the end of a block, so this column was not stored.
 fn column_was_not_stored(bytes: &[u8], cursor: usize) -> bool {
     cursor == bytes.len()
+}
+
+/// A sliced read left this column out. Its encoding is not in the buffer.
+fn column_is_hole(included: Option<&[bool]>, index: usize) -> bool {
+    included.is_some_and(|included| !included.get(index).copied().unwrap_or(false))
 }
 
 fn skip_column(

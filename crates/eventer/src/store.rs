@@ -7,11 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::codec::{
-    accumulate_histogram_filtered, block_row_count, cmp_numeric, count_rows_filtered,
-    decode_rows_filtered, decode_rows_included, range_impossible, range_matches,
-    read_timestamp_column, read_timestamp_column_included, tighter_lower, tighter_upper,
-    timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float, try_unit_stride_runs,
-    visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd, RangeFilter, UnitRun,
+    accumulate_histogram_filtered, block_row_count, cmp_numeric, count_header_equality,
+    count_rows_filtered, decode_rows_filtered, decode_rows_included, range_impossible,
+    range_matches, read_timestamp_column, read_timestamp_column_included, tighter_lower,
+    tighter_upper, timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float,
+    try_unit_stride_runs, visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd,
+    RangeFilter, UnitRun,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -748,22 +749,29 @@ impl Store {
     /// decodes. An equality on a numeric or json column still reads that column.
     /// The histogram path does not use this shortcut.
     ///
-    /// One equality on a string or text column, with no other predicate and no
-    /// numeric range, is counted from the column header when every payload
-    /// timestamp sits in the inclusive range. A constant string contributes the
-    /// block row count or zero. One period of dictionary codes contributes the
-    /// matches in that period, repeated across the rows, without expanding the
-    /// codes. A null, a full per-row code vector, raw strings, a second
-    /// predicate, a range, or a timestamp outside the range still walks rows.
-    /// The sparse index is not that check. A constant or a positive
-    /// non-wrapping timestamp stride may prove it from its header. Any other
-    /// timestamp encoding still expands.
+    /// One equality on a string or text column, with no other predicate, is
+    /// counted from the column header when every payload timestamp sits in the
+    /// inclusive range. A constant string contributes the block row count or
+    /// zero. One period of dictionary codes contributes the matches in that
+    /// period, repeated across the rows, without expanding the codes. A null,
+    /// a full per-row code vector, raw strings, a second predicate, or a
+    /// timestamp outside the range still walks rows. The sparse index is not
+    /// that check. A constant or a positive non-wrapping timestamp stride may
+    /// prove it from its header. Any other timestamp encoding still expands.
     ///
     /// One equality on a bool column uses the same rule. A constant bool
     /// contributes the block row count or zero. One bitmap period contributes
     /// the matches in that period, repeated across the rows, without expanding
-    /// a bool per row. A null, a full per-row bitmap, a second predicate, a
-    /// range, or a timestamp outside the range still walks rows.
+    /// a bool per row. A null, a full per-row bitmap, a second predicate, or a
+    /// timestamp outside the range still walks rows.
+    ///
+    /// A numeric range on that same count is not a residual when the zone
+    /// implies every range on the block. The count then drops those ranges
+    /// and uses the header path above, and does not decompress the range
+    /// columns. A null in the zone is not a proof. A block whose zone does
+    /// not cover a bound still walks, and so does a second equality, a bloom
+    /// or unknown zone that does not prove the range, or a timestamp outside
+    /// the range. The histogram path does not use this shortcut.
     pub fn count_with_filter(
         &self,
         from_ms: i64,
@@ -777,32 +785,44 @@ impl Store {
         let blocks = self.blocks_for_count(from_ms, to_ms, &resolved);
         let mut total = 0u64;
         let mut dictionaries = HashMap::new();
-        for (block, proved) in blocks {
+        for (block, plan) in blocks {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                 return Err(Error::event("query response size limit exceeded"));
             }
-            let through = if proved {
-                self.schema.timestamp_index
-            } else {
-                needed_column(&self.schema, &resolved, None)
+            let matched = match plan {
+                CountPlan::ProvedHeader { column } => self.count_zone_proved_header(
+                    &block,
+                    &mut dictionaries,
+                    from_ms,
+                    to_ms,
+                    &resolved,
+                    column,
+                )?,
+                CountPlan::ProvedRanges | CountPlan::Rows => {
+                    let proved = matches!(plan, CountPlan::ProvedRanges);
+                    let through = if proved {
+                        self.schema.timestamp_index
+                    } else {
+                        needed_column(&self.schema, &resolved, None)
+                    };
+                    let payload = self.read_block_bytes(
+                        &block,
+                        &mut dictionaries,
+                        segment::BlockLoad {
+                            through_column: Some(through),
+                            columns: None,
+                        },
+                    )?;
+                    let nrows = block_row_count(&payload)?;
+                    require_header_row_count(block.row_count, nrows)?;
+                    let (predicates, ranges) = if proved {
+                        ([].as_slice(), [].as_slice())
+                    } else {
+                        (resolved.predicates.as_slice(), resolved.ranges.as_slice())
+                    };
+                    count_rows_filtered(&self.schema, &payload, from_ms, to_ms, predicates, ranges)?
+                }
             };
-            let payload = self.read_block_bytes(
-                &block,
-                &mut dictionaries,
-                segment::BlockLoad {
-                    through_column: Some(through),
-                    columns: None,
-                },
-            )?;
-            let nrows = block_row_count(&payload)?;
-            require_header_row_count(block.row_count, nrows)?;
-            let (predicates, ranges) = if proved {
-                ([].as_slice(), [].as_slice())
-            } else {
-                (resolved.predicates.as_slice(), resolved.ranges.as_slice())
-            };
-            let matched =
-                count_rows_filtered(&self.schema, &payload, from_ms, to_ms, predicates, ranges)?;
             total = total
                 .checked_add(matched)
                 .ok_or_else(|| Error::event("event count overflow"))?;
@@ -1745,17 +1765,19 @@ impl Store {
         blocks
     }
 
-    /// Blocks a count will read, and whether every range is already proved.
+    /// Blocks a count will read, and which columns that count still needs.
     ///
-    /// `proved` is set only when the block has no equality predicate and the
-    /// zone implies every range. Histogram and row scans keep using
+    /// [`CountPlan::ProvedRanges`] is set only when the block has no equality
+    /// and the zone implies every range. [`CountPlan::ProvedHeader`] is set
+    /// when the only equality is one string, text, or bool value and that same
+    /// zone proof holds. Histogram and row scans keep using
     /// [`Store::blocks_in_range`] and still decode those columns.
     fn blocks_for_count(
         &self,
         from_ms: i64,
         to_ms: i64,
         resolved: &ResolvedScan,
-    ) -> Vec<(segment::BlockMeta, bool)> {
+    ) -> Vec<(segment::BlockMeta, CountPlan)> {
         if resolved.impossible {
             return Vec::new();
         }
@@ -1772,12 +1794,94 @@ impl Store {
                 }) {
                     continue;
                 }
-                let proved = resolved.predicates.is_empty()
-                    && zone.is_some_and(|zone| crate::zone::ranges_implied(zone, &resolved.ranges));
-                blocks.push((block.clone(), proved));
+                let proved =
+                    zone.is_some_and(|zone| crate::zone::ranges_implied(zone, &resolved.ranges));
+                let plan = if proved && resolved.predicates.is_empty() {
+                    CountPlan::ProvedRanges
+                } else if proved {
+                    match header_equality_column(&self.schema, &resolved.predicates) {
+                        Some(column) => CountPlan::ProvedHeader { column },
+                        None => CountPlan::Rows,
+                    }
+                } else {
+                    CountPlan::Rows
+                };
+                blocks.push((block.clone(), plan));
             }
         }
         blocks
+    }
+
+    /// Header count of one equality after the zone has proved every range.
+    ///
+    /// The timestamp column and the equality column are the only slices read.
+    /// A constant or one dictionary-code period, and a constant or one bool
+    /// bitmap period, are the only forms that return here. Anything else walks
+    /// the rows and does read the range columns.
+    fn count_zone_proved_header(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+        column: usize,
+    ) -> Result<u64> {
+        let mut keep = vec![false; self.schema.fields.len()];
+        if let Some(slot) = keep.get_mut(self.schema.timestamp_index) {
+            *slot = true;
+        }
+        if let Some(slot) = keep.get_mut(column) {
+            *slot = true;
+        }
+        let loaded = self.read_loaded_block(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(column.max(self.schema.timestamp_index)),
+                columns: Some(&keep),
+            },
+        )?;
+        let nrows = block_row_count(&loaded.bytes)?;
+        require_header_row_count(block.row_count, nrows)?;
+        if let Some(matched) = count_header_equality(
+            &self.schema,
+            &loaded.bytes,
+            loaded.included.as_deref(),
+            from_ms,
+            to_ms,
+            &resolved.predicates,
+        )? {
+            return Ok(matched);
+        }
+        if loaded.included.is_none() {
+            return count_rows_filtered(
+                &self.schema,
+                &loaded.bytes,
+                from_ms,
+                to_ms,
+                &resolved.predicates,
+                &resolved.ranges,
+            );
+        }
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(needed_column(&self.schema, resolved, None)),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        count_rows_filtered(
+            &self.schema,
+            &payload,
+            from_ms,
+            to_ms,
+            &resolved.predicates,
+            &resolved.ranges,
+        )
     }
 
     /// Blocks that overlap the range, with one zone answer per running stat.
@@ -2110,6 +2214,16 @@ impl Drop for Store {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+/// How [`Store::count_with_filter`] reads one block that survived the zone map.
+enum CountPlan {
+    /// Decode the timestamp and every predicate column.
+    Rows,
+    /// No equality, and the zone implies every range. Timestamps only.
+    ProvedRanges,
+    /// One string, text, or bool equality, and the zone implies every range.
+    ProvedHeader { column: usize },
 }
 
 /// Bytes already written, including the opening `[`. A further row needs at
@@ -3832,6 +3946,23 @@ fn columns_to_load(schema: &Schema, resolved: &ResolvedScan, keep: &[bool]) -> V
         }
     }
     load
+}
+
+/// The column of the only predicate when that predicate is one string, text,
+/// or bool value. Any other shape still walks rows.
+fn header_equality_column(schema: &Schema, predicates: &[ColumnPredicate]) -> Option<usize> {
+    let [predicate] = predicates else {
+        return None;
+    };
+    let field = schema.fields.get(predicate.index)?;
+    let one_value = match field.ty {
+        FieldType::String | FieldType::Text => {
+            matches!(predicate.allowed.as_slice(), [Scalar::Str(_)])
+        }
+        FieldType::Bool => matches!(predicate.allowed.as_slice(), [Scalar::Bool(_)]),
+        _ => false,
+    };
+    one_value.then_some(predicate.index)
 }
 
 fn needed_column(schema: &Schema, resolved: &ResolvedScan, extra: Option<usize>) -> usize {
@@ -6881,6 +7012,253 @@ mod tests {
             "the sparse index does not prove that every payload timestamp is inside"
         );
         assert_eq!(store.count_with_filter(0, 630, &yes).unwrap(), 32);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn count_drops_a_zone_proved_range_before_the_header() {
+        let dir = TempDir::new();
+        let schema_text = r#"{
+            "timestamp_field": "ts",
+            "fields": [
+                {"name": "ts", "type": "timestamp"},
+                {"name": "user_id", "type": "int"},
+                {"name": "score", "type": "float"},
+                {"name": "ok", "type": "bool"},
+                {"name": "action", "type": "string"},
+                {"name": "note", "type": "text"},
+                {"name": "amount", "type": "decimal", "scale": 2},
+                {"name": "blob", "type": "json"}
+            ]
+        }"#;
+        let schema = dir.path().join("schema.json");
+        fs::write(&schema, schema_text).unwrap();
+        let data = dir.path().join("data");
+        let options = test_options(128);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        let notes = ["landing", "checkout", "search"];
+        let rows_n = 128i64;
+        for i in 0..rows_n {
+            let blob: String = (0..512)
+                .map(|byte| {
+                    let mixed = (i as u32)
+                        .wrapping_mul(1_103_515_245)
+                        .wrapping_add(12_345)
+                        .wrapping_add(byte);
+                    char::from(b'A' + (mixed % 26) as u8)
+                })
+                .collect();
+            let mut obj = serde_json::json!({
+                "ts": i * 10,
+                "user_id": i,
+                "score": (i % 10) as f64,
+                "ok": i % 2 == 0,
+                "action": actions[i as usize % actions.len()],
+                "amount": "1.00",
+                "blob": {"n": i, "blob": blob},
+            });
+            if i % 4 != 3 {
+                obj["note"] = serde_json::json!(notes[i as usize % 3]);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 1);
+        let path = segment::data_path(&data, 1);
+        let original = fs::read(&path).unwrap();
+        assert!(
+            original.windows(4).any(|magic| magic == b"EVCS"),
+            "each column is its own slice"
+        );
+
+        let click = [Predicate::Eq("action".into(), "click".into())];
+        let covered = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let partial = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(5.0)),
+        ];
+        let above = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("score".into(), CmpOp::Gt, Scalar::Float(100.0)),
+        ];
+        let yes = [
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let both = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let amount_ty = crate::schema::FieldType::Decimal { scale: 2 };
+        let amount_zero = crate::value::scalar_from_literal(amount_ty, "0.00").unwrap();
+        let amount = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("amount".into(), CmpOp::Ge, amount_zero),
+        ];
+        let users = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0)),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let note = [
+            Predicate::Eq("note".into(), "landing".into()),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let end = (rows_n - 1) * 10;
+        let rows = |predicates: &[Predicate]| {
+            store.query_with_filter(0, end, predicates).unwrap().len() as u64
+        };
+        let clicks = rows_n as u64 / 4;
+        assert_eq!(store.count_with_filter(0, end, &click).unwrap(), clicks);
+        assert_eq!(store.count_with_filter(0, end, &covered).unwrap(), clicks);
+        assert_eq!(
+            store.count_with_filter(0, end, &covered).unwrap(),
+            rows(&covered)
+        );
+        let walked = store.count_with_filter(0, end, &partial).unwrap();
+        assert_eq!(walked, rows(&partial));
+        assert!(
+            walked < clicks,
+            "a score below 5 keeps the block on the row walk"
+        );
+        assert_eq!(store.count_with_filter(0, end, &above).unwrap(), 0);
+        assert_eq!(
+            store.count_with_filter(0, end, &yes).unwrap(),
+            rows_n as u64 / 2
+        );
+        assert_eq!(store.count_with_filter(0, end, &yes).unwrap(), rows(&yes));
+        assert_eq!(store.count_with_filter(0, end, &both).unwrap(), rows(&both));
+        assert_eq!(store.count_with_filter(0, end, &amount).unwrap(), clicks);
+        assert_eq!(store.count_with_filter(0, end, &users).unwrap(), clicks);
+        assert_eq!(store.count_with_filter(0, end, &note).unwrap(), rows(&note));
+        let cut = store.count_with_filter(15, 45, &covered).unwrap();
+        assert_eq!(
+            cut,
+            store.query_with_filter(15, 45, &covered).unwrap().len() as u64
+        );
+        assert_eq!(
+            store
+                .histogram_with_filter(0, end, 10, &covered)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            clicks
+        );
+
+        let bounds = {
+            let catalog = store.catalog();
+            let block = &catalog.segments[0].blocks[0];
+            [(block.min_ts, block.max_ts)]
+        };
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = 0;
+            block.max_ts = 10;
+        }
+        assert_eq!(
+            store.count_with_filter(0, 10, &covered).unwrap(),
+            1,
+            "the sparse index does not prove that every payload timestamp is inside"
+        );
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = bounds[0].0;
+            block.max_ts = bounds[0].1;
+        }
+        let zone_file = crate::zone::zone_path(&data, 1);
+        let zone_original = fs::read(&zone_file).unwrap();
+        let schema_ref = store.schema().clone();
+        store.close().unwrap();
+
+        crate::zone::rewrite_float_zones_unknown(
+            &zone_file,
+            crate::zone::schema_crc(&schema_ref),
+            crate::zone::field_count(&schema_ref).unwrap(),
+            &bounds,
+        )
+        .unwrap();
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        assert_eq!(
+            store.count_with_filter(0, end, &covered).unwrap(),
+            clicks,
+            "an unknown float zone does not prove the range"
+        );
+        store.close().unwrap();
+        let mut unknown = fs::read(&path).unwrap();
+        flip_column_slice(&mut unknown, 2);
+        fs::write(&path, &unknown).unwrap();
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        assert!(
+            store.count_with_filter(0, end, &covered).is_err(),
+            "a bloom or unknown zone still reads the range column"
+        );
+        store.close().unwrap();
+
+        fs::write(&path, &original).unwrap();
+        fs::write(&zone_file, &zone_original).unwrap();
+        let store = Store::open_with(&data, &schema, options).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        flip_column_slice(&mut bytes, 1);
+        flip_column_slice(&mut bytes, 2);
+        flip_column_slice(&mut bytes, 6);
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            store.count_with_filter(0, end, &covered).unwrap(),
+            clicks,
+            "a proved score column is not decoded"
+        );
+        assert_eq!(store.count_with_filter(0, end, &users).unwrap(), clicks);
+        assert_eq!(store.count_with_filter(0, end, &amount).unwrap(), clicks);
+        assert_eq!(
+            store.count_with_filter(0, end, &yes).unwrap(),
+            rows_n as u64 / 2
+        );
+        assert_eq!(store.count_with_filter(0, end, &above).unwrap(), 0);
+        assert!(store.count_with_filter(0, end, &partial).is_err());
+        assert!(store.count_with_filter(0, end, &both).is_err());
+        assert!(store.count_with_filter(0, end, &note).is_err());
+        assert!(store.count_with_filter(15, 45, &covered).is_err());
+        assert!(store.histogram_with_filter(0, end, 10, &covered).is_err());
+        assert!(store.query_with_filter(0, end, &covered).is_err());
+        store.close().unwrap();
+
+        let dir = TempDir::new();
+        let schema = dir.path().join("schema.json");
+        fs::write(&schema, schema_text).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(32)).unwrap();
+        for i in 0..4i64 {
+            let mut obj = serde_json::json!({
+                "ts": i * 10,
+                "user_id": i,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            if i != 1 {
+                obj["score"] = serde_json::json!(1.0);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let with_null = store.count_with_filter(0, 30, &covered).unwrap();
+        assert_eq!(
+            with_null,
+            store.query_with_filter(0, 30, &covered).unwrap().len() as u64
+        );
+        assert_eq!(with_null, 3, "a null score matches no range");
         store.close().unwrap();
     }
 
