@@ -746,13 +746,6 @@ fn plain_i64_run(
     Ok(None)
 }
 
-/// One string or text equality, and nothing else, counted from a constant or
-/// one dictionary-code period.
-///
-/// `Ok(None)` means the row walk still has to run: a second predicate, a
-/// numeric range, a value that is not one string, a null in the column, a
-/// full code vector, raw strings, or a timestamp column this header cannot
-/// prove sits entirely inside the range.
 /// One string, text, or bool equality, counted from a constant or one period.
 ///
 /// The caller has already dropped numeric ranges a zone proved. `included`
@@ -778,6 +771,13 @@ pub(crate) fn count_header_equality(
     count_one_bool_equality(schema, bytes, from_ms, to_ms, predicates, &[], included)
 }
 
+/// One string or text equality, and nothing else, counted from a constant or
+/// one dictionary-code period.
+///
+/// `Ok(None)` means the row walk still has to run: a second predicate, a
+/// numeric range, a value that is not one string, a null in the column, a
+/// full code vector, raw strings, or a timestamp column this header cannot
+/// prove sits entirely inside the range.
 fn count_one_string_equality(
     schema: &Schema,
     bytes: &[u8],
