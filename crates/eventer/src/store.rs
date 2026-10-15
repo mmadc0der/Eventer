@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use crate::codec::{
     accumulate_histogram_filtered, block_row_count, cmp_numeric, count_rows_filtered,
-    decode_rows_filtered, decode_rows_included, range_impossible, range_matches,
-    read_timestamp_column, read_timestamp_column_included, tighter_lower, tighter_upper,
-    timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float, try_unit_stride_runs,
-    visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd, RangeFilter, UnitRun,
+    decode_rows_filtered, decode_rows_included, image_contains_column, range_impossible,
+    range_matches, read_timestamp_column, read_timestamp_column_included, tighter_lower,
+    tighter_upper, timestamp_column_span, try_accumulate_exact_sum, try_add_dense_float,
+    try_unit_stride_runs, visit_matching_timestamps, CapturedColumn, ColumnPredicate, RangeEnd,
+    RangeFilter, UnitRun,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -858,10 +859,23 @@ impl Store {
             let blocks = self.prepare_zone_distinct_blocks(from_ms, to_ms, &column);
             for (block, answer) in blocks {
                 if let ZoneDistinct::Contained(values) = &answer {
-                    if self.distinct_block_inside(&block, &mut dictionaries, from_ms, to_ms)? {
-                        for value in values {
-                            seen.note(&column.name, column.ty, value)?;
+                    let payload = self.read_distinct_prefix(&block, &mut dictionaries)?;
+                    match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
+                        Some(span) if span.inside => {
+                            for value in values {
+                                seen.note(&column.name, column.ty, value)?;
+                            }
+                            continue;
                         }
+                        _ => {}
+                    }
+                    // The prefix already holds this column on a single frame,
+                    // and on a slice that did not stop before it. Visit that
+                    // buffer. Read further only when the prefix stopped short.
+                    if image_contains_column(&self.schema, &payload, column.index)? {
+                        self.absorb_distinct_payload(
+                            &payload, from_ms, to_ms, &resolved, &column, &mut seen,
+                        )?;
                         continue;
                     }
                 }
@@ -922,16 +936,14 @@ impl Store {
         blocks
     }
 
-    /// True when every payload timestamp sits in `from_ms..=to_ms`.
+    /// Timestamp prefix of one block. A single frame is the whole block.
     ///
     /// An empty block is not a proof. The sparse index is not this check.
-    fn distinct_block_inside(
+    fn read_distinct_prefix(
         &self,
         block: &segment::BlockMeta,
         dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
-        from_ms: i64,
-        to_ms: i64,
-    ) -> Result<bool> {
+    ) -> Result<Vec<u8>> {
         if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
             return Err(Error::event("query response size limit exceeded"));
         }
@@ -945,10 +957,7 @@ impl Store {
         )?;
         let nrows = block_row_count(&payload)?;
         require_header_row_count(block.row_count, nrows)?;
-        let Some(span) = timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? else {
-            return Ok(false);
-        };
-        Ok(span.inside)
+        Ok(payload)
     }
 
     fn absorb_distinct_block(
@@ -974,6 +983,18 @@ impl Store {
         )?;
         let nrows = block_row_count(&payload)?;
         require_header_row_count(block.row_count, nrows)?;
+        self.absorb_distinct_payload(&payload, from_ms, to_ms, resolved, column, seen)
+    }
+
+    fn absorb_distinct_payload(
+        &self,
+        payload: &[u8],
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+        column: &DistinctColumn,
+        seen: &mut DistinctSet,
+    ) -> Result<()> {
         let timestamp_field = column.index == self.schema.timestamp_index;
         let mut captures = if timestamp_field {
             Vec::new()
