@@ -20,13 +20,17 @@
 //! a float column stored as the old unknown tag stay unpruned.
 //! [`Store::count_with_filter`](store::Store::count_with_filter) counts those
 //! rows without building the JSON array. A block with no predicates reads
-//! timestamps only. One string or text equality, with no other predicate and
-//! no numeric range, counts a constant or one dictionary-code period from the
-//! column header when every payload timestamp is inside the range. A null, a
-//! full code vector, raw strings, or a timestamp outside the range still walks
-//! rows. One bool equality, with no other predicate and no numeric range,
-//! counts a constant or one bitmap period the same way, and does not expand a
-//! bool per row. A null or a full per-row bitmap still walks. Each column is
+//! timestamps only. One string or text equality, with no other predicate,
+//! counts a constant or one dictionary-code period from the column header
+//! when every payload timestamp is inside the range. A null, a full code
+//! vector, raw strings, or a timestamp outside the range still walks rows.
+//! One bool equality, with no other predicate, counts a constant or one
+//! bitmap period the same way, and does not expand a bool per row. A null or
+//! a full per-row bitmap still walks. When that count also has numeric
+//! ranges and the zone implies every one of them, those ranges are dropped
+//! before the header count and the range columns stay compressed. A null in
+//! the zone is not a proof. A bound the zone does not cover, a second
+//! equality, or a timestamp outside the range still walks. Each column is
 //! its own zstd frame when that container is
 //! at most a quarter larger than one frame, so a filter does not decompress
 //! columns after the predicate.
@@ -36,7 +40,10 @@
 //! [`Store::histogram_with_filter`](store::Store::histogram_with_filter) counts
 //! the same rows into fixed epoch-aligned time buckets. A constant or positive
 //! non-wrapping timestamp stride with no nulls, and with both endpoints inside
-//! the range, fills those buckets from the column header.
+//! the range, fills those buckets from the column header. A histogram with no
+//! equality uses that fill when the zone implies every numeric range. A range
+//! the zone does not prove, an equality, a null in the zone, a negative stride,
+//! wrapping arithmetic, stride pieces, or a bit-packed timestamp still walks.
 //! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums,
 //! finds the minimum and maximum, and computes the population variance and
 //! standard deviation of numeric columns over that same filtered window,
