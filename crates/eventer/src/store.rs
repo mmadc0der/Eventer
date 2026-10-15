@@ -775,8 +775,9 @@ impl Store {
     /// minimum greater than or equal to it. `lt` and `le` use the maximum the
     /// same way. A null flag, tag `0`, or a bound the zone does not cover still
     /// decodes. An equality on a numeric or json column still reads that column.
-    /// A histogram with no equality uses the same proof, then fills its buckets
-    /// from the timestamp header.
+    /// A histogram with no equality, no `in` list, and no prefix uses the same
+    /// proof, then fills its buckets from the timestamp header. An equality,
+    /// an `in` list, or a prefix still walks.
     ///
     /// One equality on a string or text column, with no other predicate, is
     /// counted from the column header when every payload timestamp sits in the
@@ -2083,9 +2084,11 @@ impl Store {
 
     /// Blocks a count or histogram will read, and which columns that read still needs.
     ///
-    /// [`CountPlan::ProvedRanges`] is set only when the block has no equality
-    /// and the zone implies every range. A histogram uses that plan to fill
-    /// buckets from the timestamp header. [`CountPlan::ProvedHeader`] is set
+    /// [`CountPlan::ProvedRanges`] is set only when the block has no equality,
+    /// no `in` list, and no prefix, and the zone implies every range. A
+    /// histogram uses that plan to fill buckets from the timestamp header.
+    /// An equality, an `in` list, or a prefix still walks.
+    /// [`CountPlan::ProvedHeader`] is set
     /// when the only equality is one string, text, or bool value and that same
     /// zone proof holds. A histogram does not take the header plan: an equality
     /// still walks. Row scans keep using [`Store::blocks_in_range`].
@@ -2542,7 +2545,8 @@ impl Drop for Store {
 enum CountPlan {
     /// Decode the timestamp and every predicate column.
     Rows,
-    /// No equality, and the zone implies every range. Timestamps only.
+    /// No equality, no `in` list, and no prefix, and the zone implies every
+    /// range. Timestamps only.
     ProvedRanges,
     /// One string, text, or bool equality, and the zone implies every range.
     ProvedHeader { column: usize },

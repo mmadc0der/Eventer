@@ -41,9 +41,10 @@
 //! the same rows into fixed epoch-aligned time buckets. A constant or positive
 //! non-wrapping timestamp stride with no nulls, and with both endpoints inside
 //! the range, fills those buckets from the column header. A histogram with no
-//! equality uses that fill when the zone implies every numeric range. A range
-//! the zone does not prove, an equality, a null in the zone, a negative stride,
-//! wrapping arithmetic, stride pieces, or a bit-packed timestamp still walks.
+//! equality, no `in` list, and no prefix uses that fill when the zone implies
+//! every numeric range. A range the zone does not prove, an equality, an `in`
+//! list, a prefix, a null in the zone, a negative stride, wrapping arithmetic,
+//! stride pieces, or a bit-packed timestamp still walks.
 //! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums,
 //! finds the minimum and maximum, and computes the population variance and
 //! standard deviation of numeric columns over that same filtered window,
