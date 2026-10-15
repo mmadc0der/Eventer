@@ -5,6 +5,11 @@
 //! queued, then queued together so the batch shares one fsync.
 //! `GET /events?from=&to=` returns a JSON array of events in that inclusive
 //! millisecond range. Repeat `eq=field=value` to AND equality filters into the scan.
+//! Repeat `in=field=value` to keep rows whose column equals any listed value.
+//! Values repeated for one field are one set. Different fields are AND-ed with
+//! `eq` and with the numeric ranges. String and text keep the word `null` as
+//! that text. Int, timestamp, float, bool, decimal, and json spell a null
+//! column as `null`.
 //! Repeat `gt`, `ge`, `lt`, and `le` as `field=value` to AND numeric ranges.
 //! `gt` and `lt` are exclusive. `ge` and `le` are inclusive.
 //! `limit` keeps the first matching rows and `offset` skips matches before that.
@@ -133,7 +138,7 @@ async fn post_drop(
     if let Err(response) = reject_named_params(
         raw_query,
         "/events/drop",
-        &["by", "latest", "distinct", "topk"],
+        &["by", "latest", "distinct", "topk", "in"],
     ) {
         return *response;
     }
@@ -705,7 +710,7 @@ fn quantile_params(
                             .map_err(|_| bad_request("`p` must be a decimal in 0..=1"))?,
                     );
                 }
-                "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" => {}
+                "from" | "to" | "eq" | "in" | "gt" | "ge" | "lt" | "le" => {}
                 _ => {
                     return Err(bad_request(&format!(
                         "`{key}` is not a parameter of /events/quantile"
@@ -722,7 +727,7 @@ fn quantile_params(
 fn quantile_query_key(key: &str) -> bool {
     matches!(
         key,
-        "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" | "field" | "p"
+        "from" | "to" | "eq" | "in" | "gt" | "ge" | "lt" | "le" | "field" | "p"
     )
 }
 
@@ -790,6 +795,7 @@ fn reject_stats_params(query: &str) -> std::result::Result<(), Box<Response>> {
             "from"
                 | "to"
                 | "eq"
+                | "in"
                 | "gt"
                 | "ge"
                 | "lt"
@@ -1162,7 +1168,7 @@ fn reject_distinct_params(query: &str) -> std::result::Result<(), Box<Response>>
         let key = percent_decode(key, "query")?;
         if !matches!(
             key.as_str(),
-            "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" | "field"
+            "from" | "to" | "eq" | "in" | "gt" | "ge" | "lt" | "le" | "field"
         ) {
             return Err(bad_request(&format!(
                 "`{key}` is not a parameter of /events/distinct"
@@ -1251,7 +1257,7 @@ fn topk_params(query: &str) -> std::result::Result<(String, usize), Box<Response
                     let text = percent_decode(value, "k")?;
                     k = Some(parse_topk(&text)?);
                 }
-                "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" => {}
+                "from" | "to" | "eq" | "in" | "gt" | "ge" | "lt" | "le" => {}
                 _ => {
                     return Err(bad_request(&format!(
                         "`{key}` is not a parameter of /events/topk"
@@ -1268,7 +1274,7 @@ fn topk_params(query: &str) -> std::result::Result<(String, usize), Box<Response
 fn topk_query_key(key: &str) -> bool {
     matches!(
         key,
-        "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" | "field" | "k"
+        "from" | "to" | "eq" | "in" | "gt" | "ge" | "lt" | "le" | "field" | "k"
     )
 }
 
@@ -1367,7 +1373,7 @@ fn reject_latest_params(query: &str) -> std::result::Result<(), Box<Response>> {
         let key = percent_decode(key, "query")?;
         if !matches!(
             key.as_str(),
-            "from" | "to" | "eq" | "gt" | "ge" | "lt" | "le" | "select" | "by"
+            "from" | "to" | "eq" | "in" | "gt" | "ge" | "lt" | "le" | "select" | "by"
         ) {
             return Err(bad_request(&format!(
                 "`{key}` is not a parameter of /events/latest"
@@ -1510,7 +1516,7 @@ fn projection(
         let key = percent_decode(key, "query")?;
         if !matches!(
             key.as_str(),
-            "from" | "to" | "limit" | "offset" | "eq" | "gt" | "ge" | "lt" | "le" | "select"
+            "from" | "to" | "limit" | "offset" | "eq" | "in" | "gt" | "ge" | "lt" | "le" | "select"
         ) && !also_allowed.contains(&key.as_str())
         {
             return Err(bad_request(&format!(
@@ -1642,10 +1648,92 @@ fn parse_filters(
     for spec in eq_specs(query)? {
         predicates.push(parse_eq(schema, &spec)?);
     }
+    predicates.extend(parse_in_predicates(schema, query)?);
     for (op, spec) in cmp_specs(query)? {
         predicates.push(parse_cmp(schema, op, &spec)?);
     }
     Ok(predicates)
+}
+
+/// Repeated `in=field=value` for one field is one set. A row matches when the
+/// column equals any listed scalar. String and text keep the raw literal,
+/// including the word `null`. Other types spell a null column as `null`.
+fn parse_in_predicates(
+    schema: &eventer::Schema,
+    query: &str,
+) -> std::result::Result<Vec<Predicate>, Box<Response>> {
+    let mut names = Vec::new();
+    let mut groups: Vec<Vec<eventer::Scalar>> = Vec::new();
+    for spec in in_specs(query)? {
+        let (name, scalar) = parse_in_value(schema, &spec)?;
+        if let Some(index) = names.iter().position(|existing| existing == &name) {
+            groups[index].push(scalar);
+        } else {
+            names.push(name);
+            groups.push(vec![scalar]);
+        }
+    }
+    Ok(names
+        .into_iter()
+        .zip(groups)
+        .map(|(name, values)| Predicate::In(name, values))
+        .collect())
+}
+
+fn in_specs(query: &str) -> std::result::Result<Vec<String>, Box<Response>> {
+    let mut specs = Vec::new();
+    if query.is_empty() {
+        return Ok(specs);
+    }
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = pair.split_once('=') else {
+            if percent_decode(pair, "in")? == "in" {
+                return Err(bad_request("`in` must be field=value"));
+            }
+            continue;
+        };
+        if percent_decode(key, "in")? == "in" {
+            specs.push(percent_decode(value, "in")?);
+        }
+    }
+    Ok(specs)
+}
+
+fn parse_in_value(
+    schema: &eventer::Schema,
+    spec: &str,
+) -> std::result::Result<(String, eventer::Scalar), Box<Response>> {
+    let Some((name, literal)) = spec.split_once('=') else {
+        return Err(bad_request("`in` must be field=value"));
+    };
+    if name.is_empty() {
+        return Err(bad_request("`in` is missing a field name"));
+    }
+    if literal.is_empty() {
+        return Err(bad_request("`in` is missing a value"));
+    }
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(bad_request(&format!("unknown filter field `{name}`")));
+    };
+    match equality_scalar(field.ty, literal) {
+        Ok(scalar) => Ok((name.to_string(), scalar)),
+        Err(err) => Err(Box::new(error_response(&err))),
+    }
+}
+
+/// `eq` and `in` share this spelling. String and text use the raw literal, so
+/// the word `null` is that text. Int, timestamp, float, bool, decimal, and json
+/// accept `null` as a null column.
+fn equality_scalar(ty: eventer::FieldType, literal: &str) -> eventer::Result<eventer::Scalar> {
+    if literal == "null"
+        && !matches!(ty, eventer::FieldType::String | eventer::FieldType::Text)
+    {
+        return Ok(eventer::Scalar::Null);
+    }
+    eventer::scalar_from_literal(ty, literal)
 }
 
 fn cmp_specs(query: &str) -> std::result::Result<Vec<(eventer::CmpOp, String)>, Box<Response>> {
@@ -1752,7 +1840,7 @@ fn parse_eq(schema: &eventer::Schema, spec: &str) -> std::result::Result<Predica
                 .into_response(),
         ));
     };
-    match eventer::scalar_from_literal(field.ty, literal) {
+    match equality_scalar(field.ty, literal) {
         Ok(scalar) => Ok(Predicate::Eq(name.to_string(), scalar)),
         Err(err) => Err(Box::new(error_response(&err))),
     }
@@ -4167,6 +4255,326 @@ mod tests {
             assert!(!message.contains("corrupt"), "{uri} read the store: {body}");
             assert!(body.get("values").is_none(), "{uri} {body}");
         }
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn in_list_matches_any_listed_value_and_rejects_a_bad_list() {
+        let (root, schema, data) = temp_store("in-list");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "text"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(2, eventer::StoreOptions::default().segment_bytes);
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        let rows = [
+            r#"{"ts":1000,"user_id":0,"ok":true,"action":"click","note":"a","amount":"1.00"}"#,
+            r#"{"ts":2000,"user_id":1,"ok":false,"action":"view","note":"b","amount":"2.00"}"#,
+            r#"{"ts":3000,"ok":true,"action":"buy","amount":"1.00"}"#,
+            r#"{"ts":4000,"user_id":0,"ok":true,"action":"click","note":"a","amount":"3.00"}"#,
+            r#"{"ts":5000,"user_id":2,"ok":false,"action":"scroll","amount":"1.00"}"#,
+            r#"{"ts":4500,"user_id":9,"ok":false,"action":"hold","note":"null","amount":"9.00"}"#,
+        ];
+        for body in rows {
+            let (status, created) = post(&app, body).await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+        }
+
+        let (status, either) = get_json(
+            &app,
+            "/events/count?from=1000&to=5000&in=action=click&in=action=buy",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{either}");
+        assert_eq!(either["count"], json!(3));
+        let listed = query(
+            &app,
+            "/events?from=1000&to=5000&in=action=click&in=action=buy&select=action",
+        )
+        .await;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|row| row["action"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["click", "buy", "click"]
+        );
+        assert!(listed.iter().all(|row| row.get("note").is_none()));
+
+        let (status, clicked) = get_json(
+            &app,
+            "/events/count?from=1000&to=5000&in=action=click&eq=ok=true",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{clicked}");
+        assert_eq!(clicked["count"], json!(2));
+        let (status, same) = get_json(
+            &app,
+            "/events/count?from=1000&to=5000&in=action=click&in=ok=true",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{same}");
+        assert_eq!(same["count"], json!(2));
+
+        let (status, missing) =
+            get_json(&app, "/events/count?from=1000&to=5000&in=action=missing").await;
+        assert_eq!(status, StatusCode::OK, "{missing}");
+        assert_eq!(missing["count"], json!(0));
+
+        let (status, users) = get_json(
+            &app,
+            "/events/count?from=1000&to=5000&in=user_id=0&in=user_id=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{users}");
+        assert_eq!(users["count"], json!(3));
+        let (status, null_user) =
+            get_json(&app, "/events/count?from=1000&to=5000&in=user_id=null").await;
+        assert_eq!(status, StatusCode::OK, "{null_user}");
+        assert_eq!(null_user["count"], json!(1));
+        let (status, eq_null) =
+            get_json(&app, "/events/count?from=1000&to=5000&eq=user_id=null").await;
+        assert_eq!(status, StatusCode::OK, "{eq_null}");
+        assert_eq!(eq_null["count"], json!(1));
+        let (status, with_null) = get_json(
+            &app,
+            "/events/count?from=1000&to=5000&in=user_id=1&in=user_id=null",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{with_null}");
+        assert_eq!(with_null["count"], json!(2));
+        let (status, notes) = get_json(&app, "/events/count?from=1000&to=5000&in=note=null").await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes["count"], json!(1));
+        let (status, eq_note) =
+            get_json(&app, "/events/count?from=1000&to=5000&eq=note=null").await;
+        assert_eq!(status, StatusCode::OK, "{eq_note}");
+        assert_eq!(eq_note["count"], json!(1));
+        let (status, named) = get_json(&app, "/events/count?from=1000&to=5000&in=note=a").await;
+        assert_eq!(status, StatusCode::OK, "{named}");
+        assert_eq!(named["count"], json!(2));
+
+        let (status, ranged) = get_json(
+            &app,
+            "/events/count?from=1000&to=5000&in=action=click&in=action=buy&ge=user_id=0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ranged}");
+        assert_eq!(ranged["count"], json!(2));
+
+        let (status, amounts) = get_json(
+            &app,
+            "/events/count?from=1000&to=5000&in=amount=1.00&in=amount=2.00",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{amounts}");
+        assert_eq!(amounts["count"], json!(4));
+
+        let (status, encoded) =
+            get_json(&app, "/events/count?from=1000&to=5000&in=action%3Dclick").await;
+        assert_eq!(status, StatusCode::OK, "{encoded}");
+        assert_eq!(encoded["count"], json!(2));
+
+        let (status, histogram) = get_json(
+            &app,
+            "/events/histogram?from=1000&to=5000&bucket_ms=1000&in=action=click&in=action=buy",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{histogram}");
+        let buckets = histogram["buckets"].as_array().unwrap();
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|bucket| bucket["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            3
+        );
+
+        let (status, stats) = get_json(
+            &app,
+            "/events/stats?from=1000&to=5000&in=action=click&in=action=buy&sum=user_id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{stats}");
+        assert_eq!(stats["columns"]["user_id"]["sum"], json!("0"));
+
+        let (status, latest) = get_json(
+            &app,
+            "/events/latest?from=1000&to=5000&by=action&in=action=click&in=action=buy&select=ts",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{latest}");
+        assert_eq!(latest, json!([{"ts": 3000}, {"ts": 4000}]));
+
+        let (status, distinct) = get_json(
+            &app,
+            "/events/distinct?from=1000&to=5000&field=action&in=user_id=0&in=user_id=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{distinct}");
+        assert_eq!(distinct["count"], json!(2));
+
+        let (status, quantile) = get_json(
+            &app,
+            "/events/quantile?from=1000&to=5000&field=user_id&p=0&in=action=click",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{quantile}");
+        assert_eq!(quantile, json!(0));
+
+        let (status, topk) = get_json(
+            &app,
+            "/events/topk?from=1000&to=5000&field=action&k=2&in=user_id=0&in=user_id=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{topk}");
+        assert_eq!(topk["values"][0], json!({"value": "click", "count": 2}));
+        assert_eq!(topk["values"][1]["value"], json!("view"));
+
+        let (status, unchanged) = get_json(&app, "/events/count?from=1000&to=5000").await;
+        assert_eq!(status, StatusCode::OK, "{unchanged}");
+        assert_eq!(unchanged["count"], json!(6));
+
+        for uri in [
+            "/events/count?from=1000&to=5000&in",
+            "/events/count?from=1000&to=5000&in=",
+            "/events/count?from=1000&to=5000&in=action",
+            "/events/count?from=1000&to=5000&in=action=",
+            "/events/count?from=1000&to=5000&in==click",
+            "/events/count?from=1000&to=5000&in=missing=click",
+            "/events/count?from=1000&to=5000&in=user_id=nope",
+            "/events/count?from=1000&to=5000&in=amount=nope",
+            "/events/count?from=1000&to=5000&in=ok=yes",
+            "/events?from=1000&to=5000&in=action",
+            "/events/histogram?from=1000&to=5000&bucket_ms=1000&in=action",
+            "/events/stats?from=1000&to=5000&sum=user_id&in=action",
+            "/events/latest?from=1000&to=5000&by=action&in=",
+            "/events/distinct?from=1000&to=5000&field=action&in==click",
+            "/events/quantile?from=1000&to=5000&field=user_id&p=0&in=user_id=nope",
+            "/events/topk?from=1000&to=5000&field=action&k=1&in=missing=click",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+            let message = body["error"].as_str().unwrap_or("");
+            assert!(!message.contains("corrupt"), "{uri} read the store: {body}");
+            assert!(body.get("count").is_none(), "{uri} {body}");
+            assert!(body.get("buckets").is_none(), "{uri} {body}");
+            assert!(body.get("columns").is_none(), "{uri} {body}");
+            assert!(body.get("values").is_none(), "{uri} {body}");
+        }
+        let (status, still) = get_json(&app, "/events/count?from=1000&to=5000").await;
+        assert_eq!(status, StatusCode::OK, "{still}");
+        assert_eq!(still["count"], json!(6));
+
+        let (status, dropped) = post_json(
+            &app,
+            "/events/drop?in=action=click",
+            r#"{"before_ms":9000}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+        assert_eq!(
+            timestamps_of(&app, 1000, 5000).await,
+            vec![1000, 2000, 3000, 4000, 5000, 4500]
+        );
+
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stock_events_count_an_in_list() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-stock-in-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "text"},
+                    {"name": "amount", "type": "decimal", "scale": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let data = root.join("data");
+        let options = store_options(2048, eventer::StoreOptions::default().segment_bytes);
+        let store = Arc::new(eventer::Store::open_with(&data, &schema, options).unwrap());
+        let actions = ["click", "view", "buy", "scroll"];
+        let notes = ["landing", "checkout", "search", ""];
+        let count = 100_000usize;
+        for i in 0..count {
+            let ts = 1_700_000_000_000i64 + i as i64 * 10;
+            let amount_cents = (i % 5_000) as i64;
+            let amount = format!("{}.{:02}", amount_cents / 100, amount_cents % 100);
+            let note = notes[i % notes.len()];
+            let mut value = serde_json::json!({
+                "ts": ts,
+                "user_id": (i % 1_000) as i64,
+                "score": (i % 100) as f64 / 10.0,
+                "ok": i % 2 == 0,
+                "action": actions[i % actions.len()],
+                "amount": amount,
+            });
+            if !note.is_empty() {
+                value["note"] = serde_json::json!(note);
+            }
+            store
+                .append_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        }
+        let app = router(Arc::clone(&store));
+        let start = 1_700_000_000_000i64;
+        let end = start + (count as i64 - 1) * 10;
+        let count_of = |path: &str| {
+            let app = app.clone();
+            let path = path.to_string();
+            async move {
+                let (status, body) = get_json(&app, &format!("{path}&from={start}&to={end}")).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                body["count"].as_u64().unwrap()
+            }
+        };
+        assert_eq!(
+            count_of("/events/count?in=action=click&in=action=buy").await,
+            50_000
+        );
+        assert_eq!(
+            count_of("/events/count?in=action=click&eq=ok=true").await,
+            25_000
+        );
+        assert_eq!(count_of("/events/count?in=action=missing").await, 0);
+        assert_eq!(
+            count_of("/events/count?in=user_id=0&in=user_id=1").await,
+            200
+        );
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
