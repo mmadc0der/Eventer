@@ -1126,10 +1126,16 @@ impl Store {
     /// `var` is the population variance and `stddev` is its square root. Nulls
     /// do not contribute to either. No non-null match leaves both empty, which
     /// is not zero. One non-null value is zero. A float variance is the
-    /// IEEE-754 value of `(sum_of_squares / n) - (sum / n)^2`. Both sums
-    /// accumulate in ingest order inside a block and in block order across the
-    /// store, the same order a float sum uses. An int, timestamp, or decimal
-    /// variance is the exact rational `(n * sum_of_squares - sum^2) / n^2` in
+    /// IEEE-754 value of `(sum_of_squares / n) - (sum / n)^2`, including a
+    /// negative result of cancellation. Both sums accumulate in ingest order
+    /// inside a block and in block order across the store, the same order a
+    /// float sum uses. The square root is taken only when `stddev` was
+    /// requested. A negative float moment publishes `stddev` as `0` so the
+    /// JSON number stays finite and does not fail a co-requested sum or
+    /// extreme. A non-finite float moment, or a non-finite square root when
+    /// `stddev` was requested, returns [`Error::Event`](Error::Event). An int,
+    /// timestamp, or decimal variance is the exact rational
+    /// `(n * sum_of_squares - sum^2) / n^2` in
     /// lowest terms, using the same integer units the 128-bit sum accumulates.
     /// A denominator of 1 is the integer digits. A denominator whose prime
     /// factors are only 2 and 5 is the shortest decimal. Anything else is
@@ -2379,10 +2385,23 @@ impl RunningStat {
                 if !var.is_finite() {
                     return Err(variance_overflow(&self.spec.name));
                 }
-                let dev = var.sqrt();
-                if !dev.is_finite() {
-                    return Err(variance_overflow(&self.spec.name));
-                }
+                // Cancellation can leave a tiny negative moment that still
+                // fits in f64. That is the variance. The square root is taken
+                // only when stddev was requested, and a negative radicand is
+                // published as 0 so the rest of the aggregate still succeeds.
+                let dev = if self.spec.stddev {
+                    if var < 0.0 {
+                        0.0
+                    } else {
+                        let dev = var.sqrt();
+                        if !dev.is_finite() {
+                            return Err(variance_overflow(&self.spec.name));
+                        }
+                        dev
+                    }
+                } else {
+                    0.0
+                };
                 (StatVar::Float(var), dev)
             }
             FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. } => {
@@ -9451,6 +9470,75 @@ mod tests {
             matches!(overflow, Err(Error::Event(ref message)) if message.contains("overflow")),
             "{overflow:?}"
         );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn negative_float_moment_of_three_tenths_stays_finite() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(8)).unwrap();
+        for ts in [1000i64, 2000, 3000] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": 1,
+                "score": 0.1,
+                "ok": true,
+                "action": "buy",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        let value = 0.1f64;
+        let n = 3.0f64;
+        let sum = value + value + value;
+        let sum_sq = (value * value) + (value * value) + (value * value);
+        let expected = (sum_sq / n) - ((sum / n) * (sum / n));
+        assert!(expected.is_finite() && expected < 0.0, "{expected}");
+
+        let alone = store
+            .aggregate_with_filter(1000, 3000, &[], &[moment_req("score", true, false)])
+            .unwrap();
+        match alone[0].var.as_ref().unwrap() {
+            Some(StatVar::Float(got)) => assert_eq!(got.to_bits(), expected.to_bits()),
+            other => panic!("float variance {other:?}"),
+        }
+        assert!(alone[0].sum.is_none());
+        assert!(alone[0].min.is_none());
+        assert!(alone[0].stddev.is_none());
+
+        let with_sum = store
+            .aggregate_with_filter(
+                1000,
+                3000,
+                &[],
+                &[StatRequest {
+                    field: "score".to_string(),
+                    sum: true,
+                    min: true,
+                    max: false,
+                    var: true,
+                    stddev: true,
+                }],
+            )
+            .unwrap();
+        match with_sum[0].var.as_ref().unwrap() {
+            Some(StatVar::Float(got)) => assert_eq!(got.to_bits(), expected.to_bits()),
+            other => panic!("float variance with sum {other:?}"),
+        }
+        assert_eq!(
+            with_sum[0].sum,
+            Some(StatSum::Float {
+                total: sum,
+                contributed: true,
+            })
+        );
+        assert_eq!(with_sum[0].min, Some(Some(Scalar::Float(value))));
+        assert_eq!(with_sum[0].stddev, Some(Some(0.0)));
         store.close().unwrap();
     }
 
