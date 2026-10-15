@@ -7,8 +7,11 @@
 //! fields. That index file is a plain zstd frame when the frame is smaller than
 //! the raw bytes, and an older raw index still opens. A zone map stores per-column
 //! equality stats (exact sets or a bloom filter for strings, min/max for numbers)
-//! so a filtered query can skip the payload as well. Equality predicates and
-//! numeric ranges that still need the block are applied while it is decoded.
+//! so a filtered query can skip the payload as well. Equality predicates,
+//! numeric ranges, and string or text prefixes that still need the block are
+//! applied while it is decoded. A prefix is a byte prefix. A null does not
+//! match one. An exact string or text zone rejects a block when no stored
+//! value starts with the prefix. A bloom cannot reject a prefix.
 //! An integer, decimal, or float zone whose min/max cannot overlap the range is
 //! not read. When those bounds sit inside every range and the null flag is
 //! clear, [`Store::count_with_filter`](store::Store::count_with_filter) counts
@@ -38,9 +41,10 @@
 //! the same rows into fixed epoch-aligned time buckets. A constant or positive
 //! non-wrapping timestamp stride with no nulls, and with both endpoints inside
 //! the range, fills those buckets from the column header. A histogram with no
-//! equality uses that fill when the zone implies every numeric range. A range
-//! the zone does not prove, an equality, a null in the zone, a negative stride,
-//! wrapping arithmetic, stride pieces, or a bit-packed timestamp still walks.
+//! equality, no `in` list, and no prefix uses that fill when the zone implies
+//! every numeric range. A range the zone does not prove, an equality, an `in`
+//! list, a prefix, a null in the zone, a negative stride, wrapping arithmetic,
+//! stride pieces, or a bit-packed timestamp still walks.
 //! [`Store::aggregate_with_filter`](store::Store::aggregate_with_filter) sums,
 //! finds the minimum and maximum, and computes the population variance and
 //! standard deviation of numeric columns over that same filtered window,

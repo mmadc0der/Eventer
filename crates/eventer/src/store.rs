@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::codec::{
-    accumulate_histogram_filtered, block_row_count, cmp_numeric, count_header_equality,
-    count_rows_filtered, decode_rows_filtered, decode_rows_included, image_contains_column,
-    range_impossible, range_matches, read_timestamp_column, read_timestamp_column_included,
-    tighter_lower, tighter_upper, timestamp_column_span, try_accumulate_exact_sum,
-    try_add_dense_float, try_unit_stride_runs, visit_matching_timestamps, CapturedColumn,
-    ColumnPredicate, RangeEnd, RangeFilter, UnitRun,
+    accumulate_histogram_with, block_row_count, cmp_numeric, count_header_equality,
+    count_rows_filtered, count_rows_filtered_with, decode_rows_filtered_with, decode_rows_included,
+    image_contains_column, range_impossible, range_matches, read_timestamp_column,
+    read_timestamp_column_included, tighter_lower, tighter_upper, timestamp_column_span,
+    try_accumulate_exact_sum, try_add_dense_float, try_unit_stride_runs, visit_matching_timestamps,
+    visit_matching_timestamps_with, CapturedColumn, ColumnPredicate, PrefixFilter, RangeEnd,
+    RangeFilter, UnitRun,
 };
 use crate::error::{Error, Result};
 use crate::pipeline::{self, Pipeline, PipelineConfig};
@@ -193,6 +194,9 @@ pub enum CmpOp {
 /// [`Scalar::Null`] matches a null column. An empty [`Predicate::In`] matches nothing.
 /// [`Predicate::Cmp`] compares an int, timestamp, decimal, or float column. Nulls
 /// do not match a range. A bool, string, text, or json column is rejected.
+/// [`Predicate::Prefix`] matches a byte prefix of a string or text value. A null
+/// does not match. The literal is raw text, including the word `null`. An empty
+/// prefix, or a prefix on any other column type, is rejected.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
     /// `field == value`, for example `Predicate::Eq("type".into(), "assistant".into())`.
@@ -201,6 +205,8 @@ pub enum Predicate {
     In(String, Vec<Scalar>),
     /// `field` compared with `value` by [`CmpOp`].
     Cmp(String, CmpOp, Scalar),
+    /// `field` starts with `prefix` bytes. String and text only.
+    Prefix(String, String),
 }
 
 /// Append-only event store. Clone the directory handle by wrapping `Store` in `Arc`.
@@ -377,7 +383,7 @@ impl Store {
             if whole && rows_out.len() + nrows > MAX_QUERY_ROWS {
                 return Err(Error::event("query row limit exceeded"));
             }
-            let rows = decode_rows_filtered(
+            let rows = decode_rows_filtered_with(
                 &self.schema,
                 &payload,
                 from_ms,
@@ -385,6 +391,7 @@ impl Store {
                 string_budget,
                 &resolved.predicates,
                 &resolved.ranges,
+                &resolved.prefixes,
             )?;
             let mut page_done = false;
             for row in rows {
@@ -573,6 +580,7 @@ impl Store {
                 string_budget,
                 &resolved.predicates,
                 &resolved.ranges,
+                &resolved.prefixes,
                 loaded.included.as_deref(),
             )?;
             let mut page_done = false;
@@ -705,6 +713,7 @@ impl Store {
                 MAX_QUERY_BYTES,
                 &resolved.predicates,
                 &resolved.ranges,
+                &resolved.prefixes,
                 loaded.included.as_deref(),
             )?;
             for row in rows {
@@ -766,8 +775,9 @@ impl Store {
     /// minimum greater than or equal to it. `lt` and `le` use the maximum the
     /// same way. A null flag, tag `0`, or a bound the zone does not cover still
     /// decodes. An equality on a numeric or json column still reads that column.
-    /// A histogram with no equality uses the same proof, then fills its buckets
-    /// from the timestamp header.
+    /// A histogram with no equality, no `in` list, and no prefix uses the same
+    /// proof, then fills its buckets from the timestamp header. An equality,
+    /// an `in` list, or a prefix still walks.
     ///
     /// One equality on a string or text column, with no other predicate, is
     /// counted from the column header when every payload timestamp sits in the
@@ -835,12 +845,24 @@ impl Store {
                     )?;
                     let nrows = block_row_count(&payload)?;
                     require_header_row_count(block.row_count, nrows)?;
-                    let (predicates, ranges) = if proved {
-                        ([].as_slice(), [].as_slice())
+                    let (predicates, ranges, prefixes) = if proved {
+                        ([].as_slice(), [].as_slice(), [].as_slice())
                     } else {
-                        (resolved.predicates.as_slice(), resolved.ranges.as_slice())
+                        (
+                            resolved.predicates.as_slice(),
+                            resolved.ranges.as_slice(),
+                            resolved.prefixes.as_slice(),
+                        )
                     };
-                    count_rows_filtered(&self.schema, &payload, from_ms, to_ms, predicates, ranges)?
+                    count_rows_filtered_with(
+                        &self.schema,
+                        &payload,
+                        from_ms,
+                        to_ms,
+                        predicates,
+                        ranges,
+                        prefixes,
+                    )?
                 }
             };
             total = total
@@ -992,13 +1014,14 @@ impl Store {
                 } else {
                     capture_columns([column.index])
                 };
-                visit_matching_timestamps(
+                visit_matching_timestamps_with(
                     &self.schema,
                     &payload,
                     from_ms,
                     to_ms,
                     &resolved.predicates,
                     &resolved.ranges,
+                    &resolved.prefixes,
                     &mut captures,
                     |ts, row, captured| {
                         if timestamp_field {
@@ -1129,13 +1152,14 @@ impl Store {
         } else {
             capture_columns([column.index])
         };
-        visit_matching_timestamps(
+        visit_matching_timestamps_with(
             &self.schema,
             &payload,
             from_ms,
             to_ms,
             &resolved.predicates,
             &resolved.ranges,
+            &resolved.prefixes,
             &mut captures,
             |ts, row, captured| {
                 if timestamp_field {
@@ -1217,13 +1241,14 @@ impl Store {
             } else {
                 capture_columns([column.index])
             };
-            visit_matching_timestamps(
+            visit_matching_timestamps_with(
                 &self.schema,
                 &payload,
                 from_ms,
                 to_ms,
                 &resolved.predicates,
                 &resolved.ranges,
+                &resolved.prefixes,
                 &mut captures,
                 |ts, row, captured| {
                     if timestamp_field {
@@ -1263,14 +1288,15 @@ impl Store {
     /// `bucket_ms` is a positive integer. More than [`MAX_HISTOGRAM_BUCKETS`]
     /// buckets is an error, and no block is read for that call. A block the
     /// sparse index places outside the range is not read. A block the zone map
-    /// can reject is not read. A block with no equality reads the timestamp
-    /// column only when it has no numeric range, or when the zone implies every
-    /// numeric range. When that column is a constant or a positive stride that
-    /// does not wrap, it has no nulls, and both encoded endpoints sit inside
-    /// the inclusive range, each run is added to the buckets without expanding
-    /// the column. A range the zone does not prove still walks the rows. An
-    /// equality, a null in the zone, a negative stride, wrapping arithmetic,
-    /// stride pieces, or a bit-packed timestamp still walks. A timestamp
+    /// can reject is not read. A block with no equality, no in list, and no
+    /// prefix reads the timestamp column only when it has no numeric range, or
+    /// when the zone implies every numeric range. When that column is a
+    /// constant or a positive stride that does not wrap, it has no nulls, and
+    /// both encoded endpoints sit inside the inclusive range, each run is
+    /// added to the buckets without expanding the column. A range the zone
+    /// does not prove still walks the rows. An equality, an in list, a prefix,
+    /// a null in the zone, a negative stride, wrapping arithmetic, stride
+    /// pieces, or a bit-packed timestamp still walks. A timestamp
     /// outside the range is not counted. The sparse-index min/max are not that
     /// check.
     pub fn histogram_with_filter(
@@ -1310,18 +1336,23 @@ impl Store {
             )?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
-            let (predicates, ranges) = if proved {
-                ([].as_slice(), [].as_slice())
+            let (predicates, ranges, prefixes) = if proved {
+                ([].as_slice(), [].as_slice(), [].as_slice())
             } else {
-                (resolved.predicates.as_slice(), resolved.ranges.as_slice())
+                (
+                    resolved.predicates.as_slice(),
+                    resolved.ranges.as_slice(),
+                    resolved.prefixes.as_slice(),
+                )
             };
-            accumulate_histogram_filtered(
+            accumulate_histogram_with(
                 &self.schema,
                 &payload,
                 from_ms,
                 to_ms,
                 predicates,
                 ranges,
+                prefixes,
                 bucket_ms,
                 span.first_start,
                 &mut counts,
@@ -1481,13 +1512,14 @@ impl Store {
                     }
                 }
                 let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
-                visit_matching_timestamps(
+                visit_matching_timestamps_with(
                     &self.schema,
                     &payload,
                     from_ms,
                     to_ms,
                     &resolved.predicates,
                     &resolved.ranges,
+                    &resolved.prefixes,
                     &mut captures,
                     |ts, row, captured| {
                         for stat in &mut running {
@@ -1565,13 +1597,14 @@ impl Store {
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
             let mut captures = capture_columns(indexes.iter().copied());
-            visit_matching_timestamps(
+            visit_matching_timestamps_with(
                 &self.schema,
                 &payload,
                 from_ms,
                 to_ms,
                 &resolved.predicates,
                 &resolved.ranges,
+                &resolved.prefixes,
                 &mut captures,
                 |ts, row, captured| {
                     if text_group {
@@ -1724,13 +1757,14 @@ impl Store {
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
             let mut captures = capture_columns(std::iter::once(spec.index));
-            visit_matching_timestamps(
+            visit_matching_timestamps_with(
                 &self.schema,
                 &payload,
                 from_ms,
                 to_ms,
                 &resolved.predicates,
                 &resolved.ranges,
+                &resolved.prefixes,
                 &mut captures,
                 |ts, row, captured| {
                     let value = quantile_value(&self.schema, &spec, ts, row, captured)?;
@@ -2033,7 +2067,12 @@ impl Store {
                     continue;
                 }
                 if segment.zones.get(index).is_some_and(|zone| {
-                    !crate::zone::may_match_ranges(zone, &resolved.predicates, &resolved.ranges)
+                    !crate::zone::may_match_filters(
+                        zone,
+                        &resolved.predicates,
+                        &resolved.ranges,
+                        &resolved.prefixes,
+                    )
                 }) {
                     continue;
                 }
@@ -2045,9 +2084,11 @@ impl Store {
 
     /// Blocks a count or histogram will read, and which columns that read still needs.
     ///
-    /// [`CountPlan::ProvedRanges`] is set only when the block has no equality
-    /// and the zone implies every range. A histogram uses that plan to fill
-    /// buckets from the timestamp header. [`CountPlan::ProvedHeader`] is set
+    /// [`CountPlan::ProvedRanges`] is set only when the block has no equality,
+    /// no `in` list, and no prefix, and the zone implies every range. A
+    /// histogram uses that plan to fill buckets from the timestamp header.
+    /// An equality, an `in` list, or a prefix still walks.
+    /// [`CountPlan::ProvedHeader`] is set
     /// when the only equality is one string, text, or bool value and that same
     /// zone proof holds. A histogram does not take the header plan: an equality
     /// still walks. Row scans keep using [`Store::blocks_in_range`].
@@ -2069,12 +2110,17 @@ impl Store {
                 }
                 let zone = segment.zones.get(index);
                 if zone.is_some_and(|zone| {
-                    !crate::zone::may_match_ranges(zone, &resolved.predicates, &resolved.ranges)
+                    !crate::zone::may_match_filters(
+                        zone,
+                        &resolved.predicates,
+                        &resolved.ranges,
+                        &resolved.prefixes,
+                    )
                 }) {
                     continue;
                 }
-                let proved =
-                    zone.is_some_and(|zone| crate::zone::ranges_implied(zone, &resolved.ranges));
+                let proved = resolved.prefixes.is_empty()
+                    && zone.is_some_and(|zone| crate::zone::ranges_implied(zone, &resolved.ranges));
                 let plan = if proved && resolved.predicates.is_empty() {
                     CountPlan::ProvedRanges
                 } else if proved {
@@ -2499,7 +2545,8 @@ impl Drop for Store {
 enum CountPlan {
     /// Decode the timestamp and every predicate column.
     Rows,
-    /// No equality, and the zone implies every range. Timestamps only.
+    /// No equality, no `in` list, and no prefix, and the zone implies every
+    /// range. Timestamps only.
     ProvedRanges,
     /// One string, text, or bool equality, and the zone implies every range.
     ProvedHeader { column: usize },
@@ -2511,12 +2558,13 @@ enum CountPlan {
 struct ResolvedScan {
     predicates: Vec<ColumnPredicate>,
     ranges: Vec<RangeFilter>,
+    prefixes: Vec<PrefixFilter>,
     impossible: bool,
 }
 
 impl ResolvedScan {
     fn unfiltered(&self) -> bool {
-        self.predicates.is_empty() && self.ranges.is_empty()
+        self.predicates.is_empty() && self.ranges.is_empty() && self.prefixes.is_empty()
     }
 }
 
@@ -4737,6 +4785,8 @@ fn low_bits_nonzero(n: U256, bits: u32) -> bool {
 fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<ResolvedScan> {
     let mut grouped: Vec<ColumnPredicate> = Vec::new();
     let mut ranges: Vec<RangeFilter> = Vec::new();
+    let mut prefixes: Vec<PrefixFilter> = Vec::new();
+    let mut prefix_conflict = false;
     for predicate in predicates {
         match predicate {
             Predicate::Eq(name, value) => {
@@ -4748,6 +4798,11 @@ fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<Resol
             Predicate::Cmp(name, op, value) => {
                 push_range(schema, &mut ranges, name, *op, value)?;
             }
+            Predicate::Prefix(name, prefix) => {
+                if !push_prefix(schema, &mut prefixes, name, prefix)? {
+                    prefix_conflict = true;
+                }
+            }
         }
     }
     for range in &ranges {
@@ -4757,13 +4812,67 @@ fn resolve_predicates(schema: &Schema, predicates: &[Predicate]) -> Result<Resol
                 .retain(|current| range_matches(current, range));
         }
     }
-    let impossible =
-        grouped.iter().any(|pred| pred.allowed.is_empty()) || ranges.iter().any(range_impossible);
+    for prefix in &prefixes {
+        if let Some(existing) = grouped.iter_mut().find(|pred| pred.index == prefix.index) {
+            let needle = prefix.prefix.as_bytes();
+            existing.allowed.retain(|current| match current {
+                Scalar::Str(text) => text.as_bytes().starts_with(needle),
+                _ => false,
+            });
+        }
+    }
+    // An equality set that already satisfies the prefix is the tighter filter.
+    prefixes.retain(|prefix| {
+        !grouped
+            .iter()
+            .any(|pred| pred.index == prefix.index && !pred.allowed.is_empty())
+    });
+    let impossible = prefix_conflict
+        || grouped.iter().any(|pred| pred.allowed.is_empty())
+        || ranges.iter().any(range_impossible);
     Ok(ResolvedScan {
         predicates: grouped,
         ranges,
+        prefixes,
         impossible,
     })
+}
+
+/// `Ok(false)` means the prefixes on this column cannot match one string.
+fn push_prefix(
+    schema: &Schema,
+    prefixes: &mut Vec<PrefixFilter>,
+    name: &str,
+    prefix: &str,
+) -> Result<bool> {
+    if prefix.is_empty() {
+        return Err(Error::schema(format!(
+            "prefix on `{name}` is missing a value"
+        )));
+    }
+    let index = field_index(schema, name)?;
+    let ty = schema.fields[index].ty;
+    if !matches!(ty, FieldType::String | FieldType::Text) {
+        return Err(Error::schema(format!(
+            "prefix does not apply to {} column `{name}`",
+            ty.name()
+        )));
+    }
+    if let Some(existing) = prefixes.iter_mut().find(|filter| filter.index == index) {
+        if prefix.as_bytes().starts_with(existing.prefix.as_bytes()) {
+            existing.prefix = prefix.to_string();
+            return Ok(true);
+        }
+        if existing.prefix.as_bytes().starts_with(prefix.as_bytes()) {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    prefixes.push(PrefixFilter {
+        index,
+        prefix: prefix.to_string(),
+    });
+    Ok(true)
 }
 
 fn push_equality(
@@ -4957,6 +5066,11 @@ fn columns_to_load(schema: &Schema, resolved: &ResolvedScan, keep: &[bool]) -> V
             *slot = true;
         }
     }
+    for prefix in &resolved.prefixes {
+        if let Some(slot) = load.get_mut(prefix.index) {
+            *slot = true;
+        }
+    }
     load
 }
 
@@ -4983,6 +5097,7 @@ fn needed_column(schema: &Schema, resolved: &ResolvedScan, extra: Option<usize>)
         .iter()
         .map(|predicate| predicate.index)
         .chain(resolved.ranges.iter().map(|range| range.index))
+        .chain(resolved.prefixes.iter().map(|prefix| prefix.index))
         .chain(extra)
         .fold(schema.timestamp_index, usize::max)
 }
@@ -12923,6 +13038,134 @@ mod tests {
     }
 
     #[test]
+    fn prefix_matches_string_bytes_and_the_zone_skips_the_rest() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(2)).unwrap();
+        store
+            .append_json(&event(10, Some(1), "click", Some("landing"), "1.00"))
+            .unwrap();
+        store
+            .append_json(&event(11, Some(2), "click", None, "2.00"))
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .append_json(&event(20, Some(3), "view", Some("nullary"), "3.00"))
+            .unwrap();
+        store
+            .append_json(&event(21, None, "view", Some("checkout"), "4.00"))
+            .unwrap();
+        store.flush().unwrap();
+        assert!(store.stats().blocks >= 2);
+
+        let click = [Predicate::Prefix("action".into(), "c".into())];
+        let resolved = resolve_predicates(store.schema(), &click).unwrap();
+        assert_eq!(store.blocks_in_range(0, 100, &resolved).len(), 1);
+        assert_eq!(store.count_with_filter(0, 100, &click).unwrap(), 2);
+        let rows = store.query_with_filter(0, 100, &click).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| row_value(&store, row)["action"] == "click"));
+
+        let missing = [Predicate::Prefix("action".into(), "zzz".into())];
+        let resolved = resolve_predicates(store.schema(), &missing).unwrap();
+        assert!(store.blocks_in_range(0, 100, &resolved).is_empty());
+        assert_eq!(store.count_with_filter(0, 100, &missing).unwrap(), 0);
+        assert!(store
+            .query_with_filter(0, 100, &missing)
+            .unwrap()
+            .is_empty());
+
+        let land = [Predicate::Prefix("note".into(), "land".into())];
+        assert_eq!(store.count_with_filter(0, 100, &land).unwrap(), 1);
+        let word_null = [Predicate::Prefix("note".into(), "null".into())];
+        assert_eq!(store.count_with_filter(0, 100, &word_null).unwrap(), 1);
+        let null_note = store.query_with_filter(0, 100, &word_null).unwrap();
+        assert_eq!(row_value(&store, &null_note[0])["note"], "nullary");
+
+        let both = [
+            Predicate::Prefix("action".into(), "c".into()),
+            Predicate::Prefix("note".into(), "land".into()),
+        ];
+        assert_eq!(store.count_with_filter(0, 100, &both).unwrap(), 1);
+        let with_ok = [
+            Predicate::Prefix("action".into(), "c".into()),
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+        ];
+        assert_eq!(store.count_with_filter(0, 100, &with_ok).unwrap(), 2);
+        let with_in = [
+            Predicate::Prefix("action".into(), "c".into()),
+            Predicate::In("action".into(), vec!["click".into(), "view".into()]),
+        ];
+        assert_eq!(store.count_with_filter(0, 100, &with_in).unwrap(), 2);
+        let with_range = [
+            Predicate::Prefix("action".into(), "v".into()),
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(3)),
+        ];
+        assert_eq!(store.count_with_filter(0, 100, &with_range).unwrap(), 1);
+        let conflict = [
+            Predicate::Prefix("action".into(), "c".into()),
+            Predicate::Prefix("action".into(), "s".into()),
+        ];
+        let resolved = resolve_predicates(store.schema(), &conflict).unwrap();
+        assert!(resolved.impossible);
+        assert_eq!(store.count_with_filter(0, 100, &conflict).unwrap(), 0);
+
+        let buckets = store.histogram_with_filter(0, 100, 10, &click).unwrap();
+        assert_eq!(buckets.iter().map(|bucket| bucket.count).sum::<u64>(), 2);
+        let stats = store
+            .aggregate_with_filter(
+                0,
+                100,
+                &click,
+                &[StatRequest {
+                    field: "user_id".into(),
+                    sum: false,
+                    min: true,
+                    max: false,
+                    var: false,
+                    stddev: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(stats[0].min, Some(Some(Scalar::Int(1))));
+        assert_eq!(store.distinct_count(0, 100, &click, "action").unwrap(), 1);
+        assert_eq!(store.topk(0, 100, &click, "note", 2).unwrap()[0].count, 1);
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 100, &click, "user_id", parse_quantile_p("0").unwrap())
+                .unwrap(),
+            Some(Scalar::Int(1))
+        );
+        let latest = store.latest_json(0, 100, &click, "action", None).unwrap();
+        assert!(std::str::from_utf8(&latest).unwrap().contains("click"));
+
+        for (name, prefix) in [
+            ("user_id", "1"),
+            ("ok", "true"),
+            ("ts", "1"),
+            ("score", "1"),
+            ("amount", "1"),
+        ] {
+            let err = store
+                .count_with_filter(0, 100, &[Predicate::Prefix(name.into(), prefix.into())])
+                .unwrap_err();
+            assert!(matches!(err, Error::Schema(_)), "{name}: {err}");
+        }
+        let err = store
+            .count_with_filter(0, 100, &[Predicate::Prefix("action".into(), String::new())])
+            .unwrap_err();
+        assert!(matches!(err, Error::Schema(_)), "{err}");
+        let err = store
+            .count_with_filter(0, 100, &[Predicate::Prefix("missing".into(), "a".into())])
+            .unwrap_err();
+        assert!(matches!(err, Error::Schema(_)), "{err}");
+        store.close().unwrap();
+    }
+
+    #[test]
     fn stock_events_have_the_distinct_counts_of_the_bench() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -12953,6 +13196,44 @@ mod tests {
         store.flush().unwrap();
         let start = 1_700_000_000_000i64;
         let end = start + (count as i64 - 1) * 10;
+        let click_prefix = [Predicate::Prefix("action".into(), "c".into())];
+        let scroll_prefix = [Predicate::Prefix("action".into(), "s".into())];
+        let missing_prefix = [Predicate::Prefix("action".into(), "zzz".into())];
+        let land_prefix = [Predicate::Prefix("note".into(), "land".into())];
+        let click_ok = [
+            Predicate::Prefix("action".into(), "c".into()),
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+        ];
+        assert_eq!(
+            store.count_with_filter(start, end, &click_prefix).unwrap(),
+            25_000
+        );
+        assert_eq!(
+            store.count_with_filter(start, end, &scroll_prefix).unwrap(),
+            25_000
+        );
+        assert_eq!(
+            store
+                .count_with_filter(start, end, &missing_prefix)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.count_with_filter(start, end, &land_prefix).unwrap(),
+            25_000
+        );
+        // click is i % 4 == 0, which is also ok, so the conjunction is every click.
+        assert_eq!(
+            store.count_with_filter(start, end, &click_ok).unwrap(),
+            25_000
+        );
+        assert!(store
+            .blocks_in_range(
+                start,
+                end,
+                &resolve_predicates(store.schema(), &missing_prefix).unwrap(),
+            )
+            .is_empty());
         assert_eq!(
             store.distinct_count(start, end, &[], "user_id").unwrap(),
             1000
