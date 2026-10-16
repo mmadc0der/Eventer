@@ -45,20 +45,21 @@
 //! finds the minimum and maximum, and computes the population variance and
 //! standard deviation of numeric columns over that same filtered window,
 //! without building the rows. One float sum with no minimum, maximum,
-//! variance, or row predicate adds a fully contained block from the encoded
-//! column. One int, timestamp, or decimal `sum`, with no `min`, no `max`, no
-//! `var`, no `stddev`, no `count`, and no row predicate, adds a null-free constant,
-//! stride, or stride pieces from the column body when every payload timestamp
-//! is inside the range. When that sum, or that one float sum, also has numeric
-//! ranges and no equality, a block whose zone implies every range drops those
-//! ranges and uses the same sum. A null in the zone is not a proof. A bound
-//! the zone does not cover, an equality, a minimum, a maximum, a variance, a
-//! `count`, or a timestamp outside the range still walks. The sparse index is
-//! not that check. `min` and `max` with no `sum`, no variance, no `count`,
-//! and no row predicate take int, decimal, and float extremes from the zone when
-//! every payload timestamp in the block is inside the range. `count` is the
-//! number of non-null values, including a bool, string, or text column, and
-//! it keeps the row visitor.
+//! variance, `count`, or row predicate adds a fully contained block from the
+//! encoded column. One int, timestamp, or decimal `sum`, with no `min`, no
+//! `max`, no `var`, no `stddev`, no `count`, and no row predicate, adds a
+//! null-free constant, stride, or stride pieces from the column body when
+//! every payload timestamp is inside the range. When that sum, or that one
+//! float sum, also has numeric ranges and no equality, a block whose zone
+//! implies every range drops those ranges and uses the same sum. A null in
+//! the zone is not a proof. A bound the zone does not cover, an equality, a
+//! minimum, a maximum, a variance, or a timestamp outside the range still
+//! walks. A request which includes `count` does not take that zone-proved
+//! sum. The sparse index is not that check. `min` and `max` with no `sum`,
+//! no variance, no `count`, and no row predicate take int, decimal, and float
+//! extremes from the zone when every payload timestamp in the block is inside
+//! the range. `count` is the number of non-null values, including a bool,
+//! string, or text column, and it keeps the row visitor.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
 //! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns
