@@ -870,29 +870,35 @@ impl Store {
     /// exceeded` and no count. An empty name, an unknown field, or a json
     /// column is an error and does not read the store.
     ///
-    /// One int, timestamp, or decimal, with no row predicate, reads each
-    /// surviving block's timestamp column. When every payload timestamp is
-    /// inside the inclusive range and the target column has no nulls, a
-    /// constant, a stride, or stride pieces whose stride is -1, 0, or 1 and
-    /// whose values do not wrap become inclusive intervals. The count is the
-    /// number of integers in the union of those intervals. Rows are not
-    /// inserted one by one. A null, a bit-packed or frame-of-reference column,
-    /// a stride other than -1, 0, or 1, wrapping arithmetic, a float, a bool,
-    /// a string, a text, a json column, a block the range cuts, or a predicate
-    /// still inserts the surviving values into the set. A stride of 2 whose
-    /// values are 0 and 2 counts as 2, not as the closed interval from 0 to 2.
-    /// The sparse index is not the inside check.
+    /// One int, timestamp, or decimal, with no equality, reads each surviving
+    /// block's timestamp column. When every payload timestamp is inside the
+    /// inclusive range and the target column has no nulls, a constant, a
+    /// stride, or stride pieces whose stride is -1, 0, or 1 and whose values
+    /// do not wrap become inclusive intervals. The count is the number of
+    /// integers in the union of those intervals. Rows are not inserted one by
+    /// one. A null, a bit-packed or frame-of-reference column, a stride other
+    /// than -1, 0, or 1, wrapping arithmetic, a float, a bool, a string, a
+    /// text, a json column, a block the time range cuts, or an equality still
+    /// inserts the surviving values into the set. A stride of 2 whose values
+    /// are 0 and 2 counts as 2, not as the closed interval from 0 to 2. The
+    /// sparse index is not the inside check.
     ///
-    /// When the request has no row predicate and the column is a bool, string,
-    /// or text, each surviving block is checked from its timestamp column. If
+    /// When the request has no equality and the column is a bool, string, or
+    /// text, each surviving block is checked from its timestamp column. If
     /// every payload timestamp is inside the inclusive range, a bool zone
     /// contributes 0, 1, or 2 and an exact string or text zone contributes its
     /// values. Nulls do not count, so an all-null column contributes nothing.
     /// Those sets are unioned and the column is not decoded. A bloom, an
     /// unknown zone, a float, an int, a timestamp, a decimal, or a json column
-    /// still walks the rows. A block the range cuts, or any predicate, still
-    /// walks. A span that mixes the two unions the proved blocks and walks
-    /// only the rest. The sparse index is not that inside check.
+    /// still walks the rows. A block the time range cuts, or an equality,
+    /// still walks. A span that mixes the two unions the proved blocks and
+    /// walks only the rest. The sparse index is not that inside check.
+    ///
+    /// A numeric range is not one of those walks when the zone already implies
+    /// it. With no equality, a block whose minimum and maximum both sit inside
+    /// every range, and whose zone recorded no nulls, drops those ranges and
+    /// uses the shortcut above. A null in the zone is not a proof. A bound the
+    /// zone does not cover still walks. The sparse index is not that check.
     pub fn distinct_count(
         &self,
         from_ms: i64,
@@ -907,25 +913,29 @@ impl Store {
         let _retention = self.pipeline.lock_for_read();
         let mut seen = DistinctSet::new(column.ty);
         let mut dictionaries = HashMap::new();
-        if resolved.unfiltered() && zone_distinct_column(column.ty) {
-            let blocks = self.prepare_zone_distinct_blocks(from_ms, to_ms, &column);
-            for (block, answer) in blocks {
-                if let ZoneDistinct::Contained(values) = &answer {
-                    let payload = self.read_distinct_prefix(&block, &mut dictionaries)?;
-                    match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
-                        Some(span) if span.inside => {
-                            for value in values {
-                                seen.note(&column.name, column.ty, value)?;
+        if resolved.predicates.is_empty() && zone_distinct_column(column.ty) {
+            let blocks = self.prepare_zone_distinct_blocks(from_ms, to_ms, &resolved, &column);
+            let proved_scan = resolved.without_ranges();
+            for (block, answer, proved) in blocks {
+                let scan = if proved { &proved_scan } else { &resolved };
+                if proved {
+                    if let ZoneDistinct::Contained(values) = &answer {
+                        let payload = self.read_distinct_prefix(&block, &mut dictionaries)?;
+                        match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
+                            Some(span) if span.inside => {
+                                for value in values {
+                                    seen.note(&column.name, column.ty, value)?;
+                                }
+                                continue;
                             }
+                            _ => {}
+                        }
+                        if image_contains_column(&self.schema, &payload, column.index)? {
+                            self.absorb_distinct_payload(
+                                &payload, from_ms, to_ms, scan, &column, &mut seen,
+                            )?;
                             continue;
                         }
-                        _ => {}
-                    }
-                    if image_contains_column(&self.schema, &payload, column.index)? {
-                        self.absorb_distinct_payload(
-                            &payload, from_ms, to_ms, &resolved, &column, &mut seen,
-                        )?;
-                        continue;
                     }
                 }
                 self.absorb_distinct_block(
@@ -933,21 +943,23 @@ impl Store {
                     &mut dictionaries,
                     from_ms,
                     to_ms,
-                    &resolved,
+                    scan,
                     &column,
                     &mut seen,
                 )?;
             }
-        } else if resolved.unfiltered()
+        } else if resolved.predicates.is_empty()
             && matches!(
                 column.ty,
                 FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. }
             )
         {
-            let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+            let blocks = self.blocks_for_distinct_ranges(from_ms, to_ms, &resolved);
+            let proved_scan = resolved.without_ranges();
             let timestamp_field = column.index == self.schema.timestamp_index;
             let mut runs = Some(Vec::new());
-            for block in blocks {
+            for (block, proved) in blocks {
+                let scan = if proved { &proved_scan } else { &resolved };
                 if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                     return Err(Error::event("query response size limit exceeded"));
                 }
@@ -955,25 +967,24 @@ impl Store {
                     &block,
                     &mut dictionaries,
                     segment::BlockLoad {
-                        through_column: Some(needed_column(
-                            &self.schema,
-                            &resolved,
-                            Some(column.index),
-                        )),
+                        through_column: Some(needed_column(&self.schema, scan, Some(column.index))),
                         columns: None,
                     },
                 )?;
                 let nrows = block_row_count(&payload)?;
                 require_header_row_count(block.row_count, nrows)?;
                 if runs.is_some() {
-                    let contained =
+                    let contained = if proved {
                         match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
                             Some(span) if span.inside => {
                                 try_unit_stride_runs(&self.schema, &payload, column.index)?
                             }
                             Some(_) => None,
                             None => Some(Vec::new()),
-                        };
+                        }
+                    } else {
+                        None
+                    };
                     match contained {
                         Some(block_runs) => {
                             runs.as_mut()
@@ -997,8 +1008,8 @@ impl Store {
                     &payload,
                     from_ms,
                     to_ms,
-                    &resolved.predicates,
-                    &resolved.ranges,
+                    &scan.predicates,
+                    &scan.ranges,
                     &mut captures,
                     |ts, row, captured| {
                         if timestamp_field {
@@ -1038,13 +1049,15 @@ impl Store {
     ///
     /// A missing zone, a bloom, or any column this path cannot trust is
     /// [`ZoneDistinct::Walk`]. The sparse index only drops blocks that cannot
-    /// overlap the range.
+    /// overlap the range. A zone that cannot match a numeric range drops the
+    /// block too. `proved` means every range can be ignored.
     fn prepare_zone_distinct_blocks(
         &self,
         from_ms: i64,
         to_ms: i64,
+        resolved: &ResolvedScan,
         column: &DistinctColumn,
-    ) -> Vec<(segment::BlockMeta, ZoneDistinct)> {
+    ) -> Vec<(segment::BlockMeta, ZoneDistinct, bool)> {
         let catalog = self.catalog();
         let mut blocks = Vec::new();
         for segment in &catalog.segments {
@@ -1052,13 +1065,51 @@ impl Store {
                 if block.max_ts < from_ms || block.min_ts > to_ms {
                     continue;
                 }
-                let answer = segment
-                    .zones
-                    .get(index)
+                let zone = segment.zones.get(index);
+                if zone.is_some_and(|zone| {
+                    !crate::zone::may_match_ranges(zone, &resolved.predicates, &resolved.ranges)
+                }) {
+                    continue;
+                }
+                let proved = ranges_already_proved(zone, resolved);
+                let answer = zone
                     .and_then(|zone| zone.columns.get(column.index))
                     .map(|zone| zone_distinct_values(column.ty, zone))
                     .unwrap_or(ZoneDistinct::Walk);
-                blocks.push((block.clone(), answer));
+                blocks.push((block.clone(), answer, proved));
+            }
+        }
+        blocks
+    }
+
+    /// Blocks a range-only distinct may read, and whether every range is proved.
+    ///
+    /// `proved` is true when there is no numeric range, or the zone implies
+    /// every one. A missing zone does not prove a range. Blocks the zone can
+    /// reject are omitted. The caller still checks payload timestamps.
+    fn blocks_for_distinct_ranges(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+    ) -> Vec<(segment::BlockMeta, bool)> {
+        if resolved.impossible {
+            return Vec::new();
+        }
+        let catalog = self.catalog();
+        let mut blocks = Vec::new();
+        for segment in &catalog.segments {
+            for (index, block) in segment.blocks.iter().enumerate() {
+                if block.max_ts < from_ms || block.min_ts > to_ms {
+                    continue;
+                }
+                let zone = segment.zones.get(index);
+                if zone.is_some_and(|zone| {
+                    !crate::zone::may_match_ranges(zone, &resolved.predicates, &resolved.ranges)
+                }) {
+                    continue;
+                }
+                blocks.push((block.clone(), ranges_already_proved(zone, resolved)));
             }
         }
         blocks
@@ -2631,6 +2682,28 @@ impl ResolvedScan {
     fn unfiltered(&self) -> bool {
         self.predicates.is_empty() && self.ranges.is_empty()
     }
+
+    /// A scan with the numeric ranges removed.
+    ///
+    /// Callers use this only when `predicates` is already empty, so the
+    /// unfiltered shortcut does not have to clone a predicate. The time window
+    /// stays with the caller.
+    fn without_ranges(&self) -> Self {
+        Self {
+            predicates: Vec::new(),
+            ranges: Vec::new(),
+            impossible: self.impossible,
+        }
+    }
+}
+
+/// True when every numeric range can be dropped for this block.
+///
+/// An empty range list is already unfiltered. A null, tag `0`, or a bound the
+/// zone does not cover is not a proof. Equality is not decided here.
+fn ranges_already_proved(zone: Option<&crate::zone::BlockZone>, resolved: &ResolvedScan) -> bool {
+    resolved.ranges.is_empty()
+        || zone.is_some_and(|zone| crate::zone::ranges_implied(zone, &resolved.ranges))
 }
 
 #[derive(Clone)]
@@ -13518,6 +13591,205 @@ mod tests {
     }
 
     #[test]
+    fn distinct_count_drops_a_range_the_zone_already_proves() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(4)).unwrap();
+        let row = |ts: i64, user: Option<i64>, score: Option<f64>, action: &str, ok: bool| {
+            let mut value = serde_json::json!({
+                "ts": ts,
+                "ok": ok,
+                "action": action,
+                "amount": "1.00",
+            });
+            if let Some(user) = user {
+                value["user_id"] = serde_json::json!(user);
+            }
+            if let Some(score) = score {
+                value["score"] = serde_json::json!(score);
+            }
+            serde_json::to_vec(&value).unwrap()
+        };
+        // Block 0: scores 1 and 6, so score >= 5 is not proved. "low" only
+        // sits on the row the range rejects.
+        store
+            .append_json(&row(10, Some(0), Some(1.0), "low", true))
+            .unwrap();
+        store
+            .append_json(&row(11, Some(2), Some(6.0), "high", false))
+            .unwrap();
+        store
+            .append_json(&row(12, Some(4), Some(6.5), "high", true))
+            .unwrap();
+        store
+            .append_json(&row(13, Some(6), Some(7.0), "mid", false))
+            .unwrap();
+        // Block 1: every score is covered by score >= 0 and by score >= 5.
+        store
+            .append_json(&row(20, Some(8), Some(8.0), "top", true))
+            .unwrap();
+        store
+            .append_json(&row(21, Some(9), Some(9.0), "top", false))
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 2);
+
+        let ge0 = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let ge5 = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        assert_eq!(store.distinct_count(10, 21, &ge0, "action").unwrap(), 4);
+        assert_eq!(store.distinct_count(10, 21, &ge5, "action").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 21, &ge0, "user_id").unwrap(), 6);
+        assert_eq!(
+            store.distinct_count(10, 21, &ge5, "user_id").unwrap(),
+            5,
+            "user 0 only appears beside a score below 5"
+        );
+        assert_eq!(store.distinct_count(10, 21, &ge0, "ok").unwrap(), 2);
+        assert_eq!(store.distinct_count(20, 21, &ge5, "action").unwrap(), 1);
+        assert_eq!(
+            store.distinct_count(10, 10, &ge0, "action").unwrap(),
+            1,
+            "a timestamp outside the block still walks"
+        );
+        let clicked = [
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        assert_eq!(
+            store.distinct_count(10, 21, &clicked, "action").unwrap(),
+            3,
+            "an equality still walks"
+        );
+        store.close().unwrap();
+
+        let with_null = TempDir::new();
+        let schema = write_schema(with_null.path());
+        let store =
+            Store::open_with(with_null.path().join("data"), &schema, test_options(4)).unwrap();
+        store
+            .append_json(&row(10, Some(1), None, "only-null", true))
+            .unwrap();
+        store
+            .append_json(&row(11, Some(2), Some(1.0), "kept", true))
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(
+            store.distinct_count(10, 11, &ge0, "action").unwrap(),
+            1,
+            "a null in the score zone is not a proof of score >= 0"
+        );
+        store.close().unwrap();
+
+        let stride = TempDir::new();
+        let schema = write_schema(stride.path());
+        let store = Store::open_with(stride.path().join("data"), &schema, test_options(8)).unwrap();
+        store
+            .append_json(&row(1, Some(0), Some(1.0), "click", true))
+            .unwrap();
+        store
+            .append_json(&row(2, Some(2), Some(2.0), "view", true))
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(
+            store.distinct_count(1, 2, &ge0, "user_id").unwrap(),
+            2,
+            "stride 2 is not the closed interval"
+        );
+        store.close().unwrap();
+
+        let wrapped = TempDir::new();
+        let schema = write_schema(wrapped.path());
+        let store =
+            Store::open_with(wrapped.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, user) in [(1i64, i64::MAX), (2, i64::MIN), (3, i64::MIN + 1)] {
+            store
+                .append_json(&row(ts, Some(user), Some(1.0), "click", true))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(1, 3, &ge0, "user_id").unwrap(), 3);
+        store.close().unwrap();
+
+        let times = TempDir::new();
+        let schema = write_schema(times.path());
+        let store = Store::open_with(times.path().join("data"), &schema, test_options(8)).unwrap();
+        for ts in [10i64, 20, 30] {
+            store
+                .append_json(&row(ts, Some(1), Some(1.0), "click", true))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(
+            store.distinct_count(10, 30, &ge0, "ts").unwrap(),
+            3,
+            "a timestamp stride of 10 is not a unit run"
+        );
+        store.close().unwrap();
+
+        let amounts = TempDir::new();
+        let schema = write_schema(amounts.path());
+        let store =
+            Store::open_with(amounts.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, amount) in [(1i64, "0.00"), (2, "0.02")] {
+            let value = serde_json::json!({
+                "ts": ts,
+                "user_id": 1,
+                "score": 1.0,
+                "ok": true,
+                "action": "click",
+                "amount": amount,
+            });
+            store
+                .append_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(1, 2, &ge0, "amount").unwrap(), 2);
+        store.close().unwrap();
+
+        let floats = TempDir::new();
+        let schema = write_schema(floats.path());
+        let store = Store::open_with(floats.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, score) in [(1i64, 0.0), (2, 1.0), (3, 1.0)] {
+            store
+                .append_json(&row(ts, Some(1), Some(score), "click", true))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let user_ge = [Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0))];
+        assert_eq!(
+            store.distinct_count(1, 3, &user_ge, "score").unwrap(),
+            2,
+            "a float distinct still walks"
+        );
+        store.close().unwrap();
+
+        let bloom = TempDir::new();
+        let schema = write_schema(bloom.path());
+        let store = Store::open_with(bloom.path().join("data"), &schema, test_options(40)).unwrap();
+        for id in 0..40i64 {
+            store
+                .append_json(&row(id, Some(id), Some(1.0), &format!("run-{id}"), true))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert!(matches!(
+            store.catalog().segments[0].zones[0].columns[4],
+            crate::zone::ColumnZone::Bloom { .. }
+        ));
+        assert_eq!(store.distinct_count(0, 39, &ge0, "action").unwrap(), 40);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn stock_events_have_the_distinct_counts_of_the_bench() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -13554,6 +13826,46 @@ mod tests {
         );
         assert_eq!(store.distinct_count(start, end, &[], "action").unwrap(), 4);
         assert_eq!(store.distinct_count(start, end, &[], "ok").unwrap(), 2);
+        let score_ge0 = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let score_ge5 = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        assert_eq!(
+            store
+                .distinct_count(start, end, &score_ge0, "action")
+                .unwrap(),
+            4,
+            "every stock score is at least 0, so the zone set is the count"
+        );
+        assert_eq!(
+            store
+                .distinct_count(start, end, &score_ge0, "user_id")
+                .unwrap(),
+            1000
+        );
+        assert_eq!(
+            store.distinct_count(start, end, &score_ge0, "ok").unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .distinct_count(start, end, &score_ge5, "action")
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            store
+                .distinct_count(start, end, &score_ge5, "user_id")
+                .unwrap(),
+            500,
+            "every stock block still contains a score below 5"
+        );
         assert_eq!(store.distinct_count(start, end, &[], "note").unwrap(), 3);
         assert_eq!(store.distinct_count(start, end, &[], "score").unwrap(), 100);
         assert_eq!(
