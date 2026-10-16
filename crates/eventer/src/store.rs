@@ -1397,8 +1397,16 @@ impl Store {
     /// tag `0` and a non-finite float, still decodes that column. The primary
     /// timestamp is taken from the timestamps just read. A payload timestamp
     /// outside the range decodes the stat columns and keeps the in-range rows.
-    /// The sparse index is not that check. A grouped aggregate, or a predicate,
+    /// The sparse index is not that check. A grouped aggregate, or an equality,
     /// still decodes.
+    ///
+    /// A numeric range is not a residual on that path when the zone implies
+    /// every range. Those ranges are dropped and the same zone extremes are
+    /// the answer, including a stat column that also contains nulls. The
+    /// proved range may name the stat column or a different column. A null in
+    /// the zone is not a proof. A bound the zone does not cover, an equality,
+    /// a `sum`, a `var`, a `stddev`, or a timestamp outside the range still
+    /// decodes the in-range rows. The sparse index is not that inside check.
     ///
     /// A request for one int, timestamp, or decimal `sum`, with no `min`, no
     /// `max`, no `var`, no `stddev`, and no row predicate, reads each surviving block's timestamp
@@ -1479,17 +1487,31 @@ impl Store {
             .all(|stat| !stat.spec.sum && !stat.spec.needs_moment());
         let exact_sum_only = exact_sum_request(&running);
         let mut dictionaries = HashMap::new();
-        if minmax_only && resolved.unfiltered() {
-            let blocks = self.prepare_minmax_blocks(from_ms, to_ms, &running);
-            for (block, columns) in blocks {
-                self.absorb_minmax_block(
-                    &block,
-                    &columns,
-                    &mut dictionaries,
-                    from_ms,
-                    to_ms,
-                    &mut running,
-                )?;
+        if minmax_only && resolved.predicates.is_empty() {
+            let blocks = self.prepare_minmax_blocks(from_ms, to_ms, &running, &resolved.ranges);
+            for (block, plan) in blocks {
+                match plan {
+                    MinMaxPlan::Zone(columns) => {
+                        self.absorb_minmax_block(
+                            &block,
+                            &columns,
+                            &mut dictionaries,
+                            from_ms,
+                            to_ms,
+                            &mut running,
+                        )?;
+                    }
+                    MinMaxPlan::Rows => {
+                        self.absorb_filtered_stats(
+                            &block,
+                            &mut dictionaries,
+                            from_ms,
+                            to_ms,
+                            &resolved,
+                            &mut running,
+                        )?;
+                    }
+                }
             }
         } else if exact_sum_only && resolved.unfiltered() {
             let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
@@ -2214,16 +2236,21 @@ impl Store {
         )
     }
 
-    /// Blocks that overlap the range, with one zone answer per running stat.
+    /// Blocks that overlap the range, with a zone answer when every range is proved.
     ///
-    /// Copies the numeric extremes only. A missing zone, tag `0`, or any other
-    /// column this path cannot trust is [`ColumnMinMax::Decode`].
+    /// An empty range list is the unfiltered path. A non-empty list uses the
+    /// zone only when [`crate::zone::ranges_implied`] is true; the caller then
+    /// drops those ranges. Anything else is [`MinMaxPlan::Rows`]. A block the
+    /// zone can reject is left out. Copies the numeric extremes only. A missing
+    /// zone, tag `0`, or any other column this path cannot trust is
+    /// [`ColumnMinMax::Decode`].
     fn prepare_minmax_blocks(
         &self,
         from_ms: i64,
         to_ms: i64,
         running: &[RunningStat],
-    ) -> Vec<(segment::BlockMeta, Vec<ColumnMinMax>)> {
+        ranges: &[RangeFilter],
+    ) -> Vec<(segment::BlockMeta, MinMaxPlan)> {
         let catalog = self.catalog();
         let mut blocks = Vec::new();
         for segment in &catalog.segments {
@@ -2235,6 +2262,15 @@ impl Store {
                     .zones
                     .get(index)
                     .filter(|zone| !zone.columns.is_empty());
+                if zone.is_some_and(|zone| !crate::zone::may_match_ranges(zone, &[], ranges)) {
+                    continue;
+                }
+                let proved = ranges.is_empty()
+                    || zone.is_some_and(|zone| crate::zone::ranges_implied(zone, ranges));
+                if !proved {
+                    blocks.push((block.clone(), MinMaxPlan::Rows));
+                    continue;
+                }
                 let columns = running
                     .iter()
                     .map(|stat| {
@@ -2254,10 +2290,56 @@ impl Store {
                         }
                     })
                     .collect();
-                blocks.push((block.clone(), columns));
+                blocks.push((block.clone(), MinMaxPlan::Zone(columns)));
             }
         }
         blocks
+    }
+
+    /// Decode `min` and `max` columns for a block whose zone did not prove every range.
+    fn absorb_filtered_stats(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+        running: &mut [RunningStat],
+    ) -> Result<()> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let mut through = needed_column(&self.schema, resolved, None);
+        for stat in running.iter() {
+            through = through.max(stat.spec.index);
+        }
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(through),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
+        visit_matching_timestamps(
+            &self.schema,
+            &payload,
+            from_ms,
+            to_ms,
+            &resolved.predicates,
+            &resolved.ranges,
+            &mut captures,
+            |ts, row, captured| {
+                for stat in &mut *running {
+                    let value = stat_value(&self.schema, stat, ts, row, captured)?;
+                    stat.absorb(value)?;
+                }
+                Ok(())
+            },
+        )
     }
 
     /// `min` and `max` for one block that has no row predicate and no `sum`.
@@ -2978,6 +3060,15 @@ fn variance_negative(name: &str) -> Error {
     Error::event(format!(
         "variance of `{name}` is negative; the computed variance is negative"
     ))
+}
+
+/// How one block answers a `min`/`max` request that has no equality.
+enum MinMaxPlan {
+    /// Every numeric range is implied, or there is no range. Extremes come from
+    /// the zone when the timestamp column sits inside the query window.
+    Zone(Vec<ColumnMinMax>),
+    /// A bound the zone does not prove. Decode the in-range rows.
+    Rows,
 }
 
 /// Per-column answer copied out of the zone before the payload is read.
@@ -12137,6 +12228,308 @@ mod tests {
             .unwrap();
         assert_eq!(decoded[0].min, Some(Some(Scalar::Float(1.5))));
         assert_eq!(decoded[0].max, Some(Some(Scalar::Float(3.5))));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn minmax_drops_a_zone_proved_range_and_keeps_a_cut_block_on_the_rows() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let data = dir.path().join("data");
+        let options = test_options(128);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let rows_n = 100i64;
+        let origin = 1_700_000_000_000i64;
+        for i in 0..rows_n {
+            let cents = i % 5_000;
+            let amount = format!("{}.{:02}", cents / 100, cents % 100);
+            let note: String = (0..512)
+                .map(|byte| {
+                    let mixed = (i as u32)
+                        .wrapping_mul(1_103_515_245)
+                        .wrapping_add(12_345)
+                        .wrapping_add(byte);
+                    char::from(b'A' + (mixed % 26) as u8)
+                })
+                .collect();
+            let obj = serde_json::json!({
+                "ts": origin + i * 10,
+                "user_id": i % 1_000,
+                "score": (i % 100) as f64 / 10.0,
+                "ok": i % 2 == 0,
+                "action": if i % 4 == 0 { "click" } else { "view" },
+                "note": note,
+                "amount": amount,
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 1);
+        let end = origin + (rows_n - 1) * 10;
+        let extremes = |store: &Store, from, to, predicates: &[Predicate], field: &str| {
+            let columns = store
+                .aggregate_with_filter(from, to, predicates, &[stat_req(field, false, true, true)])
+                .unwrap();
+            (columns[0].min.clone(), columns[0].max.clone())
+        };
+        let covered = [Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0))];
+        assert_eq!(
+            extremes(&store, origin, end, &covered, "score"),
+            (
+                Some(Some(Scalar::Float(0.0))),
+                Some(Some(Scalar::Float(9.9)))
+            )
+        );
+        assert_eq!(
+            extremes(&store, origin, end, &covered, "user_id"),
+            (Some(Some(Scalar::Int(0))), Some(Some(Scalar::Int(99))))
+        );
+        assert_eq!(
+            extremes(&store, origin, end, &covered, "amount"),
+            (
+                Some(Some(Scalar::Decimal(0))),
+                Some(Some(Scalar::Decimal(99)))
+            )
+        );
+        let on_score = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        assert_eq!(
+            extremes(&store, origin, end, &on_score, "user_id"),
+            (Some(Some(Scalar::Int(0))), Some(Some(Scalar::Int(99))))
+        );
+        let partial = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        assert_eq!(
+            extremes(&store, origin, end, &partial, "score"),
+            (
+                Some(Some(Scalar::Float(5.0))),
+                Some(Some(Scalar::Float(9.9)))
+            ),
+            "a score below 5 keeps the block on the row walk"
+        );
+        assert_eq!(
+            extremes(&store, origin, end, &partial, "user_id"),
+            (Some(Some(Scalar::Int(50))), Some(Some(Scalar::Int(99))))
+        );
+        let above = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(100.0),
+        )];
+        assert_eq!(
+            extremes(&store, origin, end, &above, "score"),
+            (Some(None), Some(None))
+        );
+        assert_eq!(
+            extremes(&store, origin, origin, &covered, "score"),
+            (
+                Some(Some(Scalar::Float(0.0))),
+                Some(Some(Scalar::Float(0.0)))
+            ),
+            "a time window that cuts the block does not publish the zone maximum"
+        );
+        let both = [
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0)),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        assert_eq!(
+            extremes(&store, origin, end, &both, "score"),
+            (
+                Some(Some(Scalar::Float(0.0))),
+                Some(Some(Scalar::Float(9.9)))
+            )
+        );
+        let mixed = [
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0)),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(5.0)),
+        ];
+        assert_eq!(
+            extremes(&store, origin, end, &mixed, "score"),
+            (
+                Some(Some(Scalar::Float(5.0))),
+                Some(Some(Scalar::Float(9.9)))
+            )
+        );
+        let summed = store
+            .aggregate_with_filter(
+                origin,
+                end,
+                &covered,
+                &[stat_req("score", true, true, true)],
+            )
+            .unwrap();
+        assert_eq!(summed[0].min, Some(Some(Scalar::Float(0.0))));
+        assert_eq!(summed[0].max, Some(Some(Scalar::Float(9.9))));
+        assert!(summed[0].sum.is_some());
+        let moment = store
+            .aggregate_with_filter(origin, end, &covered, &[moment_req("score", true, false)])
+            .unwrap();
+        assert!(moment[0].var.is_some());
+        let equality = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0)),
+        ];
+        assert_eq!(
+            extremes(&store, origin, end, &equality, "score"),
+            (
+                Some(Some(Scalar::Float(0.0))),
+                Some(Some(Scalar::Float(9.6)))
+            )
+        );
+
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = origin;
+            block.max_ts = origin;
+        }
+        assert_eq!(
+            extremes(&store, origin, origin, &covered, "score"),
+            (
+                Some(Some(Scalar::Float(0.0))),
+                Some(Some(Scalar::Float(0.0)))
+            ),
+            "the sparse index does not prove that every payload timestamp is inside"
+        );
+        store.close().unwrap();
+
+        let path = segment::data_path(&data, 1);
+        let store = Store::open_with(&data, &schema, options.clone()).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        flip_column_slice(&mut bytes, 2);
+        flip_column_slice(&mut bytes, 6);
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            extremes(&store, origin, end, &covered, "score"),
+            (
+                Some(Some(Scalar::Float(0.0))),
+                Some(Some(Scalar::Float(9.9)))
+            ),
+            "a proved range does not decode the stat column"
+        );
+        assert_eq!(
+            extremes(&store, origin, end, &on_score, "user_id"),
+            (Some(Some(Scalar::Int(0))), Some(Some(Scalar::Int(99))))
+        );
+        assert!(
+            store
+                .aggregate_with_filter(
+                    origin,
+                    end,
+                    &partial,
+                    &[stat_req("score", false, true, true)]
+                )
+                .is_err(),
+            "a bound the zone does not cover still decodes the stat column"
+        );
+        assert!(store
+            .aggregate_with_filter(
+                origin,
+                origin,
+                &covered,
+                &[stat_req("score", false, true, true)]
+            )
+            .is_err());
+        assert!(store
+            .aggregate_with_filter(
+                origin,
+                end,
+                &covered,
+                &[stat_req("score", true, true, true)]
+            )
+            .is_err());
+        assert!(store
+            .aggregate_with_filter(
+                origin,
+                end,
+                &equality,
+                &[stat_req("score", false, true, true)]
+            )
+            .is_err());
+        store.close().unwrap();
+
+        let null_score = TempDir::new();
+        let schema = write_schema(null_score.path());
+        let store =
+            Store::open_with(null_score.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, user, score) in [
+            (10i64, 1i64, Some(0.0f64)),
+            (20, 4, Some(9.9)),
+            (30, 2, None),
+        ] {
+            let mut obj = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "ok": true,
+                "action": "click",
+                "amount": "1.50",
+            });
+            if let Some(score) = score {
+                obj["score"] = serde_json::json!(score);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let ge_user = [Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0))];
+        assert_eq!(
+            extremes(&store, 10, 30, &ge_user, "score"),
+            (
+                Some(Some(Scalar::Float(0.0))),
+                Some(Some(Scalar::Float(9.9)))
+            ),
+            "a null in the stat column does not hide the zone extremes"
+        );
+        assert_eq!(
+            extremes(&store, 10, 30, &ge_user, "amount"),
+            (
+                Some(Some(Scalar::Decimal(150))),
+                Some(Some(Scalar::Decimal(150)))
+            )
+        );
+        store.close().unwrap();
+
+        let null_range = TempDir::new();
+        let schema = write_schema(null_range.path());
+        let store =
+            Store::open_with(null_range.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, user, score) in [
+            (10i64, Some(5i64), 1.0f64),
+            (20, Some(8), 4.0),
+            (30, None, 0.0),
+        ] {
+            let mut obj = serde_json::json!({
+                "ts": ts,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "2.00",
+            });
+            if let Some(user) = user {
+                obj["user_id"] = serde_json::json!(user);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(
+            extremes(&store, 10, 30, &ge_user, "score"),
+            (
+                Some(Some(Scalar::Float(1.0))),
+                Some(Some(Scalar::Float(4.0)))
+            ),
+            "a null in the zone is not a proof, so the null row's score stays out"
+        );
         store.close().unwrap();
     }
 
