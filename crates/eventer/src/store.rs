@@ -1667,17 +1667,22 @@ impl Store {
     /// text, or json column, an empty name, or an unknown field is an error
     /// and does not read the store. A non-finite float is corrupt.
     ///
-    /// One int, timestamp, or decimal, with no row predicate, reads the
-    /// timestamp column. When every payload timestamp sits in the inclusive
-    /// range and the target column has no nulls, a constant, a stride, or
-    /// stride pieces whose stride is -1, 0, or 1 and whose values do not wrap
-    /// are merged as inclusive intervals. Each integer in an interval has that
-    /// run's multiplicity, and the same index is selected from the merge.
-    /// Those rows are not stored as samples. A null, a bit-packed or
-    /// frame-of-reference body, any other stride, wrapping arithmetic, a
-    /// float, a timestamp outside the range, or a predicate still sorts one
-    /// sample per surviving value. The sparse index is not the containment
-    /// check.
+    /// One int, timestamp, or decimal, with no equality, reads the timestamp
+    /// column. When every payload timestamp sits in the inclusive range and
+    /// the target column has no nulls, a constant, a stride, or stride pieces
+    /// whose stride is -1, 0, or 1 and whose values do not wrap are merged as
+    /// inclusive intervals. Each integer in an interval has that run's
+    /// multiplicity, and the same index is selected from the merge. Those rows
+    /// are not stored as samples. A numeric range is not a residual on a block
+    /// whose zone implies every range: those ranges are dropped and the same
+    /// selection runs. The read stops at the timestamp or the target column,
+    /// the same way an unfiltered quantile does, so a proved range past that
+    /// column stays compressed. A null in the
+    /// zone is not a proof. A bound the zone does not cover, an equality, a
+    /// null in the target column, a bit-packed or frame-of-reference body, any
+    /// other stride, wrapping arithmetic, a float, or a timestamp outside the
+    /// range still sorts one sample per surviving value. The sparse index is
+    /// not the containment check.
     ///
     /// Retained samples are one `i64` or `f64` (8 bytes) or one `i128` (16
     /// bytes) per non-null match. A sample count already at [`MAX_QUERY_ROWS`]
@@ -1700,12 +1705,23 @@ impl Store {
             return Ok(None);
         };
         let _retention = self.pipeline.lock_for_read();
-        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         if unit_quantile(&spec, &resolved) {
-            if let Some(value) = self.quantile_from_unit_runs(from_ms, to_ms, &blocks, &spec, p)? {
+            let blocks = self
+                .blocks_for_count(from_ms, to_ms, &resolved)
+                .into_iter()
+                .map(|(block, plan)| {
+                    let proved =
+                        resolved.ranges.is_empty() || matches!(plan, CountPlan::ProvedRanges);
+                    (block, proved)
+                })
+                .collect::<Vec<_>>();
+            if let Some(value) =
+                self.quantile_from_unit_runs(from_ms, to_ms, &blocks, &spec, p, &resolved)?
+            {
                 return Ok(value);
             }
         }
+        let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
         let mut samples = QuantileSamples::new(spec.ty);
         let mut dictionaries = HashMap::new();
         for block in blocks {
@@ -2351,17 +2367,22 @@ impl Store {
     /// `Ok(Some(None))` is an empty match. A qualifying prefix that crosses the
     /// sample ceilings returns the same error the sample path would.
     ///
-    /// A block whose timestamps are not all inside the range, or whose body is
-    /// not a unit stride, keeps the runs already accepted. Those runs are
-    /// expanded through [`push_sample`], this payload is visited, and only the
-    /// blocks after it are read. The rank is the sample rank.
+    /// `proved` is set when the block has no numeric range left: the request
+    /// had none, or the zone implies every range. A proved block whose
+    /// timestamps are all inside the range and whose body is a unit stride
+    /// contributes runs. Anything else keeps the runs already accepted. Those
+    /// runs are expanded into samples, this payload is visited, and only the
+    /// blocks after it are read. A proved block visits with the ranges
+    /// dropped. A block the zone did not prove still applies them. The rank is
+    /// the sample rank.
     fn quantile_from_unit_runs(
         &self,
         from_ms: i64,
         to_ms: i64,
-        blocks: &[segment::BlockMeta],
+        blocks: &[(segment::BlockMeta, bool)],
         spec: &ResolvedQuantile,
         p: QuantileP,
+        resolved: &ResolvedScan,
     ) -> Result<Option<Option<Scalar>>> {
         let width = match spec.ty {
             FieldType::Int | FieldType::Timestamp => std::mem::size_of::<i64>(),
@@ -2371,11 +2392,15 @@ impl Store {
         let mut runs = Vec::new();
         let mut n = 0usize;
         let mut dictionaries = HashMap::new();
-        let through = self.schema.timestamp_index.max(spec.index);
-        for (index, block) in blocks.iter().enumerate() {
+        for (index, (block, proved)) in blocks.iter().enumerate() {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                 return Err(Error::event("query response size limit exceeded"));
             }
+            let through = if *proved {
+                self.schema.timestamp_index.max(spec.index)
+            } else {
+                needed_column(&self.schema, resolved, Some(spec.index))
+            };
             let payload = self.read_block_bytes(
                 block,
                 &mut dictionaries,
@@ -2389,7 +2414,7 @@ impl Store {
             let Some(span) = timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? else {
                 continue;
             };
-            if span.inside {
+            if *proved && span.inside {
                 if let Some(block_runs) = try_unit_stride_runs(&self.schema, &payload, spec.index)?
                 {
                     for run in block_runs {
@@ -2414,10 +2439,11 @@ impl Store {
                 spec,
                 p,
                 &runs,
+                *proved,
                 &payload,
                 &blocks[index + 1..],
                 &mut dictionaries,
-                through,
+                resolved,
             );
         }
         let Some(rank) = quantile_rank(p, n) else {
@@ -2428,6 +2454,9 @@ impl Store {
     }
 
     /// Expand qualified unit runs, visit the declining payload, then read the rest.
+    ///
+    /// `proved` drops numeric ranges for that block. A block the zone did not
+    /// prove still filters by them, and the read includes those columns.
     fn quantile_samples_after_runs(
         &self,
         from_ms: i64,
@@ -2435,18 +2464,37 @@ impl Store {
         spec: &ResolvedQuantile,
         p: QuantileP,
         runs: &[UnitRun],
+        proved: bool,
         payload: &[u8],
-        rest: &[segment::BlockMeta],
+        rest: &[(segment::BlockMeta, bool)],
         dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
-        through: usize,
+        resolved: &ResolvedScan,
     ) -> Result<Option<Option<Scalar>>> {
         let mut samples = QuantileSamples::new(spec.ty);
         expand_unit_runs(&mut samples, &spec.ty, runs)?;
-        push_quantile_payload(&self.schema, &mut samples, spec, payload, from_ms, to_ms)?;
-        for block in rest {
+        let ranges = if proved {
+            &[][..]
+        } else {
+            resolved.ranges.as_slice()
+        };
+        push_quantile_payload(
+            &self.schema,
+            &mut samples,
+            spec,
+            payload,
+            from_ms,
+            to_ms,
+            ranges,
+        )?;
+        for (block, proved) in rest {
             if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                 return Err(Error::event("query response size limit exceeded"));
             }
+            let through = if *proved {
+                self.schema.timestamp_index.max(spec.index)
+            } else {
+                needed_column(&self.schema, resolved, Some(spec.index))
+            };
             let payload = self.read_block_bytes(
                 block,
                 dictionaries,
@@ -2457,7 +2505,20 @@ impl Store {
             )?;
             let nrows = block_row_count(&payload)?;
             require_header_row_count(block.row_count, nrows)?;
-            push_quantile_payload(&self.schema, &mut samples, spec, &payload, from_ms, to_ms)?;
+            let ranges = if *proved {
+                &[][..]
+            } else {
+                resolved.ranges.as_slice()
+            };
+            push_quantile_payload(
+                &self.schema,
+                &mut samples,
+                spec,
+                &payload,
+                from_ms,
+                to_ms,
+                ranges,
+            )?;
         }
         Ok(Some(samples.finish(p)?))
     }
@@ -3088,9 +3149,11 @@ fn integer_digit(whole: &str) -> Option<u8> {
     }
 }
 
-/// Int, timestamp, or decimal, and no row predicate.
+/// Int, timestamp, or decimal, and no equality. Numeric ranges may still be
+/// present; a block takes the unit-stride rank only when its zone implies
+/// every one of them.
 fn unit_quantile(spec: &ResolvedQuantile, resolved: &ResolvedScan) -> bool {
-    resolved.unfiltered()
+    resolved.predicates.is_empty()
         && matches!(
             spec.ty,
             FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. }
@@ -3226,6 +3289,7 @@ fn push_quantile_payload(
     payload: &[u8],
     from_ms: i64,
     to_ms: i64,
+    ranges: &[RangeFilter],
 ) -> Result<()> {
     let mut captures = capture_columns(std::iter::once(spec.index));
     visit_matching_timestamps(
@@ -3234,7 +3298,7 @@ fn push_quantile_payload(
         from_ms,
         to_ms,
         &[],
-        &[],
+        ranges,
         &mut captures,
         |ts, row, captured| {
             let value = quantile_value(schema, spec, ts, row, captured)?;
@@ -12122,6 +12186,324 @@ mod tests {
                 .quantile_with_filter(0, 39, &[], "ts", level("1"))
                 .unwrap(),
             Some(Scalar::Timestamp(39))
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn quantile_drops_ranges_the_zone_already_proves() {
+        let level = |text: &str| parse_quantile_p(text).unwrap();
+        let dir = TempDir::new();
+        let schema_text = r#"{
+            "timestamp_field": "ts",
+            "fields": [
+                {"name": "ts", "type": "timestamp"},
+                {"name": "user_id", "type": "int"},
+                {"name": "score", "type": "float"},
+                {"name": "ok", "type": "bool"},
+                {"name": "action", "type": "string"},
+                {"name": "note", "type": "text"},
+                {"name": "amount", "type": "decimal", "scale": 2},
+                {"name": "blob", "type": "json"}
+            ]
+        }"#;
+        let schema = dir.path().join("schema.json");
+        fs::write(&schema, schema_text).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(128)).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        let rows_n = 128i64;
+        for i in 0..rows_n {
+            let blob: String = (0..512)
+                .map(|byte| {
+                    let mixed = (i as u32)
+                        .wrapping_mul(1_103_515_245)
+                        .wrapping_add(12_345)
+                        .wrapping_add(byte);
+                    char::from(b'A' + (mixed % 26) as u8)
+                })
+                .collect();
+            let obj = serde_json::json!({
+                "ts": i * 10,
+                "user_id": i,
+                "score": (i % 10) as f64,
+                "ok": true,
+                "action": actions[i as usize % actions.len()],
+                "amount": "1.00",
+                "blob": {"n": i, "blob": blob},
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 1);
+        let end = (rows_n - 1) * 10;
+        let covered = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let partial = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        let above = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(100.0),
+        )];
+        let users_open = [Predicate::Cmp("user_id".into(), CmpOp::Gt, Scalar::Int(0))];
+        let users_closed = [Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0))];
+        let view = [
+            Predicate::Eq("action".into(), "view".into()),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let amount_ty = crate::schema::FieldType::Decimal { scale: 2 };
+        let amount_zero = crate::value::scalar_from_literal(amount_ty, "0.00").unwrap();
+        let amount = [Predicate::Cmp("amount".into(), CmpOp::Ge, amount_zero)];
+        let rank = |predicates: &[Predicate], field: &str, p: &str| {
+            store
+                .quantile_with_filter(0, end, predicates, field, level(p))
+                .unwrap()
+        };
+        assert_eq!(rank(&covered, "user_id", "0"), Some(Scalar::Int(0)));
+        assert_eq!(rank(&covered, "user_id", "0.5"), Some(Scalar::Int(64)));
+        assert_eq!(rank(&covered, "user_id", "1"), Some(Scalar::Int(127)));
+        assert_eq!(
+            rank(&covered, "user_id", "0.95"),
+            rank(&[], "user_id", "0.95")
+        );
+        assert_eq!(rank(&covered, "ts", "0"), Some(Scalar::Timestamp(0)));
+        assert_eq!(rank(&covered, "ts", "1"), Some(Scalar::Timestamp(end)));
+        assert_eq!(rank(&amount, "user_id", "0.5"), Some(Scalar::Int(64)));
+        assert_eq!(rank(&users_closed, "ts", "0"), Some(Scalar::Timestamp(0)));
+        assert_eq!(rank(&users_open, "user_id", "0"), Some(Scalar::Int(1)));
+        assert_eq!(rank(&partial, "user_id", "0"), Some(Scalar::Int(5)));
+        assert_eq!(rank(&partial, "user_id", "1"), Some(Scalar::Int(127)));
+        assert_ne!(
+            rank(&partial, "user_id", "0"),
+            rank(&[], "user_id", "0"),
+            "a full-span shortcut would return the unfiltered minimum"
+        );
+        assert_eq!(rank(&above, "user_id", "0.95"), None);
+        assert_eq!(rank(&view, "user_id", "0"), Some(Scalar::Int(1)));
+        assert_eq!(rank(&covered, "score", "0"), Some(Scalar::Float(0.0)));
+        assert_eq!(rank(&covered, "score", "1"), Some(Scalar::Float(9.0)));
+
+        let bounds = {
+            let catalog = store.catalog();
+            let block = &catalog.segments[0].blocks[0];
+            (block.min_ts, block.max_ts)
+        };
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = 0;
+            block.max_ts = 10;
+        }
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 10, &covered, "user_id", level("0"))
+                .unwrap(),
+            Some(Scalar::Int(0)),
+            "the sparse index does not prove that every payload timestamp is inside"
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 10, &covered, "user_id", level("1"))
+                .unwrap(),
+            Some(Scalar::Int(1))
+        );
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = bounds.0;
+            block.max_ts = bounds.1;
+        }
+
+        let path = segment::data_path(&data, 1);
+        let mut bytes = fs::read(&path).unwrap();
+        assert!(
+            bytes.windows(4).any(|magic| magic == b"EVCS"),
+            "each column is its own slice"
+        );
+        flip_column_slice(&mut bytes, 2);
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            store
+                .quantile_with_filter(0, end, &covered, "user_id", level("0.95"))
+                .unwrap(),
+            Some(Scalar::Int(121)),
+            "a proved score column is not decoded"
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(0, end, &covered, "ts", level("1"))
+                .unwrap(),
+            Some(Scalar::Timestamp(end))
+        );
+        assert!(store
+            .quantile_with_filter(0, end, &partial, "user_id", level("0"))
+            .is_err());
+        assert!(store
+            .quantile_with_filter(0, end, &view, "user_id", level("0"))
+            .is_err());
+        store.close().unwrap();
+
+        let holes = TempDir::new();
+        let schema = write_schema(holes.path());
+        let store = Store::open_with(holes.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, user, score) in [(0i64, 1i64, Some(1.0)), (1, 2, None), (2, 3, Some(2.0))] {
+            let mut obj = serde_json::json!({
+                "ts": ts,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+                "user_id": user,
+            });
+            if let Some(score) = score {
+                obj["score"] = serde_json::json!(score);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 2, &covered, "user_id", level("0"))
+                .unwrap(),
+            Some(Scalar::Int(1)),
+            "a null in the zone is not a proof"
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 2, &covered, "user_id", level("0.5"))
+                .unwrap(),
+            Some(Scalar::Int(3))
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 2, &covered, "user_id", level("1"))
+                .unwrap(),
+            Some(Scalar::Int(3))
+        );
+        store.close().unwrap();
+
+        let stride = TempDir::new();
+        let schema = write_schema(stride.path());
+        let store = Store::open_with(stride.path().join("data"), &schema, test_options(8)).unwrap();
+        for i in 0..5i64 {
+            store
+                .append_json(&event(i, Some(i * 2), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 4, &covered, "user_id", level("0.2"))
+                .unwrap(),
+            Some(Scalar::Int(2)),
+            "a stride of 2 is not the closed interval"
+        );
+        store.close().unwrap();
+
+        let mixed = TempDir::new();
+        let schema = write_schema(mixed.path());
+        let store = Store::open_with(mixed.path().join("data"), &schema, test_options(4)).unwrap();
+        for i in 0..4i64 {
+            let obj = serde_json::json!({
+                "ts": i,
+                "user_id": i,
+                "score": 8.0,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        for (ts, user, score) in [(4i64, 4i64, 0.0), (5, 5, 9.0), (6, 6, 0.0), (7, 7, 9.0)] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.stats().blocks, 2);
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 7, &partial, "user_id", level("0"))
+                .unwrap(),
+            Some(Scalar::Int(0))
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 7, &partial, "user_id", level("0.5"))
+                .unwrap(),
+            Some(Scalar::Int(3)),
+            "a proved prefix stays in the rank when a later block still filters"
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 7, &partial, "user_id", level("1"))
+                .unwrap(),
+            Some(Scalar::Int(7))
+        );
+        store.close().unwrap();
+
+        let tail = TempDir::new();
+        let schema = write_schema(tail.path());
+        let store = Store::open_with(tail.path().join("data"), &schema, test_options(4)).unwrap();
+        for (ts, user, score) in [(0i64, 0i64, 0.0), (1, 1, 9.0), (2, 2, 0.0), (3, 3, 9.0)] {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        for i in 4..8i64 {
+            let obj = serde_json::json!({
+                "ts": i,
+                "user_id": i + 6,
+                "score": 8.0,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.stats().blocks, 2);
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 7, &partial, "user_id", level("0"))
+                .unwrap(),
+            Some(Scalar::Int(1))
+        );
+        assert_eq!(
+            store
+                .quantile_with_filter(0, 7, &partial, "user_id", level("1"))
+                .unwrap(),
+            Some(Scalar::Int(13))
         );
         store.close().unwrap();
     }
