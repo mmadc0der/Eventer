@@ -47,11 +47,13 @@
 //! without building the rows. One float sum with no minimum, maximum,
 //! variance, or row predicate adds a fully contained block from the encoded
 //! column. One int, timestamp, or decimal `sum`, with no `min`, no `max`, no
-//! `var`, no `stddev`, and no row predicate, adds a null-free constant,
+//! `var`, no `stddev`, no `count`, and no row predicate, adds a null-free constant,
 //! stride, or stride pieces from the column body when every payload timestamp
-//! is inside the range. `min` and `max` with no `sum`, no variance, and no
-//! row predicate take int, decimal, and float extremes from the zone when
-//! every payload timestamp in the block is inside the range.
+//! is inside the range. `min` and `max` with no `sum`, no variance, no `count`,
+//! and no row predicate take int, decimal, and float extremes from the zone when
+//! every payload timestamp in the block is inside the range. `count` is the
+//! number of non-null values, including a bool, string, or text column, and
+//! it keeps the row visitor.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
 //! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns

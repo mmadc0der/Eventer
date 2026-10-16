@@ -19,10 +19,11 @@
 //! same filters. `limit` and `offset` are rejected on both.
 //! `GET /events/histogram?from=&to=&bucket_ms=N` returns one count per epoch-aligned
 //! bucket that intersects that inclusive range.
-//! `GET /events/stats` returns `sum`, `min`, `max`, population `var`, and
-//! `stddev` for numeric columns over that same range and the same filters,
-//! without the matching rows. `by=field` splits that result into one group per
-//! value of a single column.
+//! `GET /events/stats` returns `sum`, `min`, `max`, population `var`,
+//! `stddev`, and non-null `count` over that same range and the same filters,
+//! without the matching rows. `count` also accepts a bool, string, or text
+//! column. `by=field` splits that result into one group per value of a single
+//! column.
 //! `GET /events/quantile?field=&p=` returns one exact rank of a numeric column
 //! over that same range and the same filters. The body is that value, or JSON
 //! `null` when no non-null value matches.
@@ -138,7 +139,7 @@ async fn post_drop(
     if let Err(response) = reject_named_params(
         raw_query,
         "/events/drop",
-        &["by", "latest", "distinct", "topk", "in"],
+        &["by", "latest", "distinct", "topk", "in", "count"],
     ) {
         return *response;
     }
@@ -246,9 +247,11 @@ async fn get_events(
     if let Err(response) = reject_quantile_param(raw_query, "/events") {
         return *response;
     }
-    if let Err(response) =
-        reject_named_params(raw_query, "/events", &["by", "latest", "distinct", "topk"])
-    {
+    if let Err(response) = reject_named_params(
+        raw_query,
+        "/events",
+        &["by", "latest", "distinct", "topk", "count"],
+    ) {
         return *response;
     }
     let (offset, limit) = match page_params(raw_query) {
@@ -291,9 +294,11 @@ async fn count_events(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.as_deref().unwrap_or("");
-    if let Err(response) =
-        reject_named_params(raw, "/events/count", &["by", "latest", "distinct", "topk"])
-    {
+    if let Err(response) = reject_named_params(
+        raw,
+        "/events/count",
+        &["by", "latest", "distinct", "topk", "count"],
+    ) {
         return *response;
     }
     if let Err(response) = reject_page_params(raw, "/events/count") {
@@ -421,7 +426,7 @@ async fn histogram_events(
     if let Err(response) = reject_named_params(
         raw,
         "/events/histogram",
-        &["by", "latest", "distinct", "topk"],
+        &["by", "latest", "distinct", "topk", "count"],
     ) {
         return *response;
     }
@@ -806,6 +811,7 @@ fn reject_stats_params(query: &str) -> std::result::Result<(), Box<Response>> {
                 | "max"
                 | "var"
                 | "stddev"
+                | "count"
         ) {
             return Err(bad_request(&format!(
                 "`{key}` is not a parameter of /events/stats"
@@ -827,14 +833,20 @@ fn stat_requests(query: &str) -> std::result::Result<Vec<eventer::StatRequest>, 
                 Some((key, value)) => (key, value),
                 None => {
                     let key = percent_decode(pair, "query")?;
-                    if matches!(key.as_str(), "sum" | "min" | "max" | "var" | "stddev") {
+                    if matches!(
+                        key.as_str(),
+                        "sum" | "min" | "max" | "var" | "stddev" | "count"
+                    ) {
                         return Err(bad_request(&format!("`{key}` is missing a field name")));
                     }
                     continue;
                 }
             };
             let key = percent_decode(key, "query")?;
-            if !matches!(key.as_str(), "sum" | "min" | "max" | "var" | "stddev") {
+            if !matches!(
+                key.as_str(),
+                "sum" | "min" | "max" | "var" | "stddev" | "count"
+            ) {
                 continue;
             }
             saw = true;
@@ -849,6 +861,7 @@ fn stat_requests(query: &str) -> std::result::Result<Vec<eventer::StatRequest>, 
                     "max" => existing.max = true,
                     "var" => existing.var = true,
                     "stddev" => existing.stddev = true,
+                    "count" => existing.count = true,
                     _ => {}
                 }
             } else {
@@ -859,13 +872,14 @@ fn stat_requests(query: &str) -> std::result::Result<Vec<eventer::StatRequest>, 
                     max: key == "max",
                     var: key == "var",
                     stddev: key == "stddev",
+                    count: key == "count",
                 });
             }
         }
     }
     if !saw {
         return Err(bad_request(
-            "missing `sum`, `min`, `max`, `var`, or `stddev` query parameter",
+            "missing `sum`, `min`, `max`, `var`, `stddev`, or `count` query parameter",
         ));
     }
     Ok(requests)
@@ -933,32 +947,47 @@ fn reject_stat_fields(
         let Some(field) = schema.fields.iter().find(|field| field.name == stat.field) else {
             return Err(bad_request(&format!("unknown stat field `{}`", stat.field)));
         };
-        if matches!(
+        let numeric = matches!(
             field.ty,
-            eventer::FieldType::Bool
-                | eventer::FieldType::String
-                | eventer::FieldType::Text
-                | eventer::FieldType::Json
-        ) {
-            let op = if stat.sum {
-                "sum"
-            } else if stat.min {
-                "min"
-            } else if stat.max {
-                "max"
-            } else if stat.var {
-                "var"
-            } else {
-                "stddev"
-            };
+            eventer::FieldType::Int
+                | eventer::FieldType::Timestamp
+                | eventer::FieldType::Float
+                | eventer::FieldType::Decimal { .. }
+        );
+        if numeric {
+            continue;
+        }
+        if let Some(op) = numeric_stat_name(stat) {
             return Err(bad_request(&format!(
                 "`{op}` does not apply to {} column `{}`",
                 field.ty.name(),
                 field.name
             )));
         }
+        if matches!(field.ty, eventer::FieldType::Json) {
+            return Err(bad_request(&format!(
+                "`count` does not apply to json column `{}`",
+                field.name
+            )));
+        }
     }
     Ok(())
+}
+
+fn numeric_stat_name(stat: &eventer::StatRequest) -> Option<&'static str> {
+    if stat.sum {
+        Some("sum")
+    } else if stat.min {
+        Some("min")
+    } else if stat.max {
+        Some("max")
+    } else if stat.var {
+        Some("var")
+    } else if stat.stddev {
+        Some("stddev")
+    } else {
+        None
+    }
 }
 
 fn stats_body(schema: &eventer::Schema, columns: &[eventer::ColumnStats]) -> Value {
@@ -1015,6 +1044,9 @@ fn columns_object(
         }
         if let Some(stddev) = &column.stddev {
             body.insert("stddev".to_string(), stddev_json(stddev));
+        }
+        if let Some(count) = column.count {
+            body.insert("count".to_string(), json!(count));
         }
         out.insert(column.field.clone(), Value::Object(body));
     }
@@ -1728,9 +1760,7 @@ fn parse_in_value(
 /// the word `null` is that text. Int, timestamp, float, bool, decimal, and json
 /// accept `null` as a null column.
 fn equality_scalar(ty: eventer::FieldType, literal: &str) -> eventer::Result<eventer::Scalar> {
-    if literal == "null"
-        && !matches!(ty, eventer::FieldType::String | eventer::FieldType::Text)
-    {
+    if literal == "null" && !matches!(ty, eventer::FieldType::String | eventer::FieldType::Text) {
         return Ok(eventer::Scalar::Null);
     }
     eventer::scalar_from_literal(ty, literal)
@@ -3352,6 +3382,182 @@ mod tests {
             get_json(&app, "/events/stats?from=0&to=4096&by=user_id&sum=amount").await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.get("groups").is_none(), "{body}");
+        store.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stats_count_non_null_values() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eventer-http-stats-count-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let schema = root.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{
+                "timestamp_field": "ts",
+                "fields": [
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "user_id", "type": "int"},
+                    {"name": "score", "type": "float"},
+                    {"name": "ok", "type": "bool"},
+                    {"name": "action", "type": "string"},
+                    {"name": "note", "type": "text"},
+                    {"name": "amount", "type": "decimal", "scale": 2},
+                    {"name": "props", "type": "json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let options = store_options(64, eventer::StoreOptions::default().segment_bytes);
+        let store =
+            Arc::new(eventer::Store::open_with(root.join("data"), &schema, options).unwrap());
+        let app = router(Arc::clone(&store));
+        let actions = ["click", "view", "buy", "scroll"];
+        let notes = ["landing", "checkout", "search", ""];
+        for i in 0..100i64 {
+            let note = notes[(i % 4) as usize];
+            let mut value = serde_json::json!({
+                "ts": 1000 + i,
+                "user_id": i,
+                "score": 1.0,
+                "ok": i % 2 == 0,
+                "action": actions[(i % 4) as usize],
+                "amount": "1.00",
+                "props": {"n": i},
+            });
+            if !note.is_empty() {
+                value["note"] = serde_json::json!(note);
+            }
+            store
+                .append_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        let (status, users) = get_json(&app, "/events/stats?from=1000&to=1099&count=user_id").await;
+        assert_eq!(status, StatusCode::OK, "{users}");
+        assert_eq!(users["columns"]["user_id"]["count"], json!(100));
+        assert!(users["columns"]["user_id"].get("sum").is_none(), "{users}");
+        assert!(users.get("groups").is_none(), "{users}");
+
+        let (status, notes) = get_json(&app, "/events/stats?from=1000&to=1099&count=note").await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes["columns"]["note"]["count"], json!(75));
+
+        let (status, actions_body) =
+            get_json(&app, "/events/stats?from=1000&to=1099&count=action").await;
+        assert_eq!(status, StatusCode::OK, "{actions_body}");
+        assert_eq!(actions_body["columns"]["action"]["count"], json!(100));
+
+        let (status, flags) = get_json(&app, "/events/stats?from=1000&to=1099&count=ok").await;
+        assert_eq!(status, StatusCode::OK, "{flags}");
+        assert_eq!(flags["columns"]["ok"]["count"], json!(100));
+
+        let (status, grouped) = get_json(
+            &app,
+            "/events/stats?from=1000&to=1099&by=action&count=action",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{grouped}");
+        let groups = grouped["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 4);
+        for (index, key) in ["buy", "click", "scroll", "view"].iter().enumerate() {
+            assert_eq!(groups[index]["key"], json!(key));
+            assert_eq!(groups[index]["columns"]["action"]["count"], json!(25));
+        }
+
+        let (status, by_ok) =
+            get_json(&app, "/events/stats?from=1000&to=1099&by=ok&count=note").await;
+        assert_eq!(status, StatusCode::OK, "{by_ok}");
+        let groups = by_ok["groups"].as_array().unwrap();
+        assert_eq!(groups[0]["key"], json!(false));
+        assert_eq!(groups[0]["columns"]["note"]["count"], json!(25));
+        assert_eq!(groups[1]["key"], json!(true));
+        assert_eq!(groups[1]["columns"]["note"]["count"], json!(50));
+
+        let (status, mixed) = get_json(
+            &app,
+            "/events/stats?from=1000&to=1099&count=user_id&sum=user_id&count=note",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{mixed}");
+        assert_eq!(mixed["columns"]["user_id"]["count"], json!(100));
+        assert_eq!(mixed["columns"]["user_id"]["sum"], json!("4950"));
+        assert_eq!(mixed["columns"]["note"]["count"], json!(75));
+        assert!(mixed["columns"]["note"].get("sum").is_none(), "{mixed}");
+
+        let (status, scroll) = get_json(
+            &app,
+            "/events/stats?from=1000&to=1099&eq=action=scroll&count=note",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{scroll}");
+        assert_eq!(scroll["columns"]["note"]["count"], json!(0));
+
+        let (status, empty) = get_json(&app, "/events/stats?from=9000&to=9000&count=user_id").await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert_eq!(empty["columns"]["user_id"]["count"], json!(0));
+
+        for uri in [
+            "/events/stats?from=1000&to=1099&count=props",
+            "/events/stats?from=1000&to=1099&count=",
+            "/events/stats?from=1000&to=1099&count",
+            "/events/stats?from=1000&to=1099&count=missing",
+            "/events/stats?from=1000&to=1099&sum=action",
+            "/events/stats?from=1000&to=1099&count=note&sum=note",
+            "/events/stats?from=1000&to=1099&count=user_id&limit=1",
+            "/events/stats?from=1000&to=1099&count=user_id&offset=0",
+            "/events/stats?from=1000&to=1099&count=user_id&select=action",
+            "/events/stats?from=1000&to=1099&count=user_id&bucket_ms=1",
+            "/events?from=1000&to=1099&count=action",
+            "/events/count?from=1000&to=1099&count=action",
+            "/events/histogram?from=1000&to=1099&bucket_ms=1000&count=action",
+            "/events/latest?from=1000&to=1099&by=action&count=action",
+            "/events/distinct?from=1000&to=1099&field=action&count=action",
+            "/events/quantile?from=1000&to=1099&field=user_id&p=0&count=user_id",
+            "/events/topk?from=1000&to=1099&field=action&k=1&count=action",
+        ] {
+            let (status, body) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+            assert!(body.get("columns").is_none(), "{uri} -> {body}");
+            assert!(body.get("groups").is_none(), "{uri} -> {body}");
+        }
+        let (status, dropped) =
+            post_json(&app, "/events/drop?count=action", r#"{"before_ms":1}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{dropped}");
+
+        let data = root.join("data");
+        let dat = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("dat"))
+            .unwrap();
+        let mut bytes = fs::read(&dat).unwrap();
+        bytes[16] ^= 0xff;
+        fs::write(&dat, &bytes).unwrap();
+        let (status, unread) = get_json(&app, "/events/stats?from=1000&to=1099&count=props").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unread}");
+        let message = unread["error"].as_str().unwrap_or("");
+        assert!(
+            !message.contains("corrupt"),
+            "json count read the store: {unread}"
+        );
+        let (status, events) = get_json(&app, "/events?from=1000&to=1099&count=action").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{events}");
+        let message = events["error"].as_str().unwrap_or("");
+        assert!(
+            !message.contains("corrupt"),
+            "count on /events read the store: {events}"
+        );
+
         store.close().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
