@@ -876,29 +876,35 @@ impl Store {
     /// exceeded` and no count. An empty name, an unknown field, or a json
     /// column is an error and does not read the store.
     ///
-    /// One int, timestamp, or decimal, with no row predicate, reads each
-    /// surviving block's timestamp column. When every payload timestamp is
-    /// inside the inclusive range and the target column has no nulls, a
-    /// constant, a stride, or stride pieces whose stride is -1, 0, or 1 and
-    /// whose values do not wrap become inclusive intervals. The count is the
-    /// number of integers in the union of those intervals. Rows are not
-    /// inserted one by one. A null, a bit-packed or frame-of-reference column,
-    /// a stride other than -1, 0, or 1, wrapping arithmetic, a float, a bool,
-    /// a string, a text, a json column, a block the range cuts, or a predicate
-    /// still inserts the surviving values into the set. A stride of 2 whose
-    /// values are 0 and 2 counts as 2, not as the closed interval from 0 to 2.
-    /// The sparse index is not the inside check.
+    /// One int, timestamp, or decimal, with no equality, reads each surviving
+    /// block's timestamp column. When every payload timestamp is inside the
+    /// inclusive range and the target column has no nulls, a constant, a
+    /// stride, or stride pieces whose stride is -1, 0, or 1 and whose values
+    /// do not wrap become inclusive intervals. The count is the number of
+    /// integers in the union of those intervals. Rows are not inserted one by
+    /// one. A null, a bit-packed or frame-of-reference column, a stride other
+    /// than -1, 0, or 1, wrapping arithmetic, a float, a bool, a string, a
+    /// text, a json column, a block the time range cuts, or an equality still
+    /// inserts the surviving values into the set. A stride of 2 whose values
+    /// are 0 and 2 counts as 2, not as the closed interval from 0 to 2. The
+    /// sparse index is not the inside check.
     ///
-    /// When the request has no row predicate and the column is a bool, string,
-    /// or text, each surviving block is checked from its timestamp column. If
+    /// When the request has no equality and the column is a bool, string, or
+    /// text, each surviving block is checked from its timestamp column. If
     /// every payload timestamp is inside the inclusive range, a bool zone
     /// contributes 0, 1, or 2 and an exact string or text zone contributes its
     /// values. Nulls do not count, so an all-null column contributes nothing.
     /// Those sets are unioned and the column is not decoded. A bloom, an
     /// unknown zone, a float, an int, a timestamp, a decimal, or a json column
-    /// still walks the rows. A block the range cuts, or any predicate, still
-    /// walks. A span that mixes the two unions the proved blocks and walks
-    /// only the rest. The sparse index is not that inside check.
+    /// still walks the rows. A block the time range cuts, or an equality,
+    /// still walks. A span that mixes the two unions the proved blocks and
+    /// walks only the rest. The sparse index is not that inside check.
+    ///
+    /// A numeric range is not one of those walks when the zone already implies
+    /// it. With no equality, a block whose minimum and maximum both sit inside
+    /// every range, and whose zone recorded no nulls, drops those ranges and
+    /// uses the shortcut above. A null in the zone is not a proof. A bound the
+    /// zone does not cover still walks. The sparse index is not that check.
     pub fn distinct_count(
         &self,
         from_ms: i64,
@@ -913,25 +919,29 @@ impl Store {
         let _retention = self.pipeline.lock_for_read();
         let mut seen = DistinctSet::new(column.ty);
         let mut dictionaries = HashMap::new();
-        if resolved.unfiltered() && zone_distinct_column(column.ty) {
-            let blocks = self.prepare_zone_distinct_blocks(from_ms, to_ms, &column);
-            for (block, answer) in blocks {
-                if let ZoneDistinct::Contained(values) = &answer {
-                    let payload = self.read_distinct_prefix(&block, &mut dictionaries)?;
-                    match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
-                        Some(span) if span.inside => {
-                            for value in values {
-                                seen.note(&column.name, column.ty, value)?;
+        if resolved.predicates.is_empty() && zone_distinct_column(column.ty) {
+            let blocks = self.prepare_zone_distinct_blocks(from_ms, to_ms, &resolved, &column);
+            let proved_scan = resolved.without_ranges();
+            for (block, answer, proved) in blocks {
+                let scan = if proved { &proved_scan } else { &resolved };
+                if proved {
+                    if let ZoneDistinct::Contained(values) = &answer {
+                        let payload = self.read_distinct_prefix(&block, &mut dictionaries)?;
+                        match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
+                            Some(span) if span.inside => {
+                                for value in values {
+                                    seen.note(&column.name, column.ty, value)?;
+                                }
+                                continue;
                             }
+                            _ => {}
+                        }
+                        if image_contains_column(&self.schema, &payload, column.index)? {
+                            self.absorb_distinct_payload(
+                                &payload, from_ms, to_ms, scan, &column, &mut seen,
+                            )?;
                             continue;
                         }
-                        _ => {}
-                    }
-                    if image_contains_column(&self.schema, &payload, column.index)? {
-                        self.absorb_distinct_payload(
-                            &payload, from_ms, to_ms, &resolved, &column, &mut seen,
-                        )?;
-                        continue;
                     }
                 }
                 self.absorb_distinct_block(
@@ -939,21 +949,23 @@ impl Store {
                     &mut dictionaries,
                     from_ms,
                     to_ms,
-                    &resolved,
+                    scan,
                     &column,
                     &mut seen,
                 )?;
             }
-        } else if resolved.unfiltered()
+        } else if resolved.predicates.is_empty()
             && matches!(
                 column.ty,
                 FieldType::Int | FieldType::Timestamp | FieldType::Decimal { .. }
             )
         {
-            let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
+            let blocks = self.blocks_for_distinct_ranges(from_ms, to_ms, &resolved);
+            let proved_scan = resolved.without_ranges();
             let timestamp_field = column.index == self.schema.timestamp_index;
             let mut runs = Some(Vec::new());
-            for block in blocks {
+            for (block, proved) in blocks {
+                let scan = if proved { &proved_scan } else { &resolved };
                 if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
                     return Err(Error::event("query response size limit exceeded"));
                 }
@@ -961,25 +973,24 @@ impl Store {
                     &block,
                     &mut dictionaries,
                     segment::BlockLoad {
-                        through_column: Some(needed_column(
-                            &self.schema,
-                            &resolved,
-                            Some(column.index),
-                        )),
+                        through_column: Some(needed_column(&self.schema, scan, Some(column.index))),
                         columns: None,
                     },
                 )?;
                 let nrows = block_row_count(&payload)?;
                 require_header_row_count(block.row_count, nrows)?;
                 if runs.is_some() {
-                    let contained =
+                    let contained = if proved {
                         match timestamp_column_span(&self.schema, &payload, from_ms, to_ms)? {
                             Some(span) if span.inside => {
                                 try_unit_stride_runs(&self.schema, &payload, column.index)?
                             }
                             Some(_) => None,
                             None => Some(Vec::new()),
-                        };
+                        }
+                    } else {
+                        None
+                    };
                     match contained {
                         Some(block_runs) => {
                             runs.as_mut()
@@ -1003,8 +1014,8 @@ impl Store {
                     &payload,
                     from_ms,
                     to_ms,
-                    &resolved.predicates,
-                    &resolved.ranges,
+                    &scan.predicates,
+                    &scan.ranges,
                     &mut captures,
                     |ts, row, captured| {
                         if timestamp_field {
@@ -1044,13 +1055,15 @@ impl Store {
     ///
     /// A missing zone, a bloom, or any column this path cannot trust is
     /// [`ZoneDistinct::Walk`]. The sparse index only drops blocks that cannot
-    /// overlap the range.
+    /// overlap the range. A zone that cannot match a numeric range drops the
+    /// block too. `proved` means every range can be ignored.
     fn prepare_zone_distinct_blocks(
         &self,
         from_ms: i64,
         to_ms: i64,
+        resolved: &ResolvedScan,
         column: &DistinctColumn,
-    ) -> Vec<(segment::BlockMeta, ZoneDistinct)> {
+    ) -> Vec<(segment::BlockMeta, ZoneDistinct, bool)> {
         let catalog = self.catalog();
         let mut blocks = Vec::new();
         for segment in &catalog.segments {
@@ -1058,13 +1071,51 @@ impl Store {
                 if block.max_ts < from_ms || block.min_ts > to_ms {
                     continue;
                 }
-                let answer = segment
-                    .zones
-                    .get(index)
+                let zone = segment.zones.get(index);
+                if zone.is_some_and(|zone| {
+                    !crate::zone::may_match_ranges(zone, &resolved.predicates, &resolved.ranges)
+                }) {
+                    continue;
+                }
+                let proved = ranges_already_proved(zone, resolved);
+                let answer = zone
                     .and_then(|zone| zone.columns.get(column.index))
                     .map(|zone| zone_distinct_values(column.ty, zone))
                     .unwrap_or(ZoneDistinct::Walk);
-                blocks.push((block.clone(), answer));
+                blocks.push((block.clone(), answer, proved));
+            }
+        }
+        blocks
+    }
+
+    /// Blocks a range-only distinct may read, and whether every range is proved.
+    ///
+    /// `proved` is true when there is no numeric range, or the zone implies
+    /// every one. A missing zone does not prove a range. Blocks the zone can
+    /// reject are omitted. The caller still checks payload timestamps.
+    fn blocks_for_distinct_ranges(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+    ) -> Vec<(segment::BlockMeta, bool)> {
+        if resolved.impossible {
+            return Vec::new();
+        }
+        let catalog = self.catalog();
+        let mut blocks = Vec::new();
+        for segment in &catalog.segments {
+            for (index, block) in segment.blocks.iter().enumerate() {
+                if block.max_ts < from_ms || block.min_ts > to_ms {
+                    continue;
+                }
+                let zone = segment.zones.get(index);
+                if zone.is_some_and(|zone| {
+                    !crate::zone::may_match_ranges(zone, &resolved.predicates, &resolved.ranges)
+                }) {
+                    continue;
+                }
+                blocks.push((block.clone(), ranges_already_proved(zone, resolved)));
             }
         }
         blocks
@@ -1382,6 +1433,15 @@ impl Store {
     /// column stats. A non-finite float already stored is
     /// [`Error::Corrupt`](Error::Corrupt).
     ///
+    /// When that one int, timestamp, or decimal `sum` has numeric ranges and
+    /// no equality, a block whose zone implies every range drops those ranges
+    /// and uses the same stride sum. When that one float `sum` has numeric
+    /// ranges and no equality, a block whose zone implies every range drops
+    /// those ranges and uses the same dense-float sum. A null in the zone is
+    /// not a proof. A bound the zone does not cover, an equality, a `min`, a
+    /// `max`, a variance, or a timestamp outside the range still walks that
+    /// block. The sparse index is not the inside check.
+    ///
     /// `var` is the population variance and `stddev` is its square root. Nulls
     /// do not contribute to either. No non-null match leaves both empty, which
     /// is not zero. One non-null value is zero. A float variance is the
@@ -1454,60 +1514,48 @@ impl Store {
                     &mut running,
                 )?;
             }
+        } else if zone_proved_sum(&running, &resolved) {
+            let blocks = self.blocks_for_count(from_ms, to_ms, &resolved);
+            for (block, plan) in blocks {
+                if !matches!(plan, CountPlan::ProvedRanges) {
+                    self.absorb_stat_block(
+                        &block,
+                        &mut dictionaries,
+                        from_ms,
+                        to_ms,
+                        &resolved,
+                        &mut running,
+                        None,
+                    )?;
+                } else if exact_sum_only {
+                    self.absorb_exact_sum_block(
+                        &block,
+                        &mut dictionaries,
+                        from_ms,
+                        to_ms,
+                        &mut running,
+                    )?;
+                } else {
+                    self.absorb_proved_float_sum_block(
+                        &block,
+                        &mut dictionaries,
+                        from_ms,
+                        to_ms,
+                        &mut running,
+                    )?;
+                }
+            }
         } else {
             let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
             for block in blocks {
-                if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
-                    return Err(Error::event("query response size limit exceeded"));
-                }
-                let mut through = needed_column(&self.schema, &resolved, None);
-                for stat in &running {
-                    through = through.max(stat.spec.index);
-                }
-                let payload = self.read_block_bytes(
+                self.absorb_stat_block(
                     &block,
                     &mut dictionaries,
-                    segment::BlockLoad {
-                        through_column: Some(through),
-                        columns: None,
-                    },
-                )?;
-                let nrows = block_row_count(&payload)?;
-                require_header_row_count(block.row_count, nrows)?;
-                if let Some(index) = dense_float {
-                    match try_add_dense_float(
-                        &self.schema,
-                        &payload,
-                        index,
-                        from_ms,
-                        to_ms,
-                        &mut running[0].float_sum,
-                    )? {
-                        Some(rows) => {
-                            if rows > 0 {
-                                running[0].contributed = true;
-                            }
-                            continue;
-                        }
-                        None => {}
-                    }
-                }
-                let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
-                visit_matching_timestamps(
-                    &self.schema,
-                    &payload,
                     from_ms,
                     to_ms,
-                    &resolved.predicates,
-                    &resolved.ranges,
-                    &mut captures,
-                    |ts, row, captured| {
-                        for stat in &mut running {
-                            let value = stat_value(&self.schema, stat, ts, row, captured)?;
-                            stat.absorb(value)?;
-                        }
-                        Ok(())
-                    },
+                    &resolved,
+                    &mut running,
+                    dense_float,
                 )?;
             }
         }
@@ -2056,14 +2104,17 @@ impl Store {
         blocks
     }
 
-    /// Blocks a count or histogram will read, and which columns that read still needs.
+    /// Blocks a count, histogram, or single numeric sum will read, and which
+    /// columns that read still needs.
     ///
     /// [`CountPlan::ProvedRanges`] is set only when the block has no equality
     /// and the zone implies every range. A histogram uses that plan to fill
-    /// buckets from the timestamp header. [`CountPlan::ProvedHeader`] is set
-    /// when the only equality is one string, text, or bool value and that same
-    /// zone proof holds. A histogram does not take the header plan: an equality
-    /// still walks. Row scans keep using [`Store::blocks_in_range`].
+    /// buckets from the timestamp header. A single int, timestamp, decimal, or
+    /// float `sum` uses it to drop the ranges and add the unfiltered sum.
+    /// [`CountPlan::ProvedHeader`] is set when the only equality is one string,
+    /// text, or bool value and that same zone proof holds. A histogram does not
+    /// take the header plan: an equality still walks. Other row scans keep
+    /// using [`Store::blocks_in_range`].
     fn blocks_for_count(
         &self,
         from_ms: i64,
@@ -2360,6 +2411,119 @@ impl Store {
         }
     }
 
+    /// One float `sum` after the zone has proved every numeric range.
+    ///
+    /// The ranges are dropped. The timestamp column and the float column are
+    /// the slices this reads. A constant, raw frame, or repeated decimal stride
+    /// with no nulls is added in row order when every payload timestamp is
+    /// inside the range. Anything else uses the row visitor on this same block.
+    /// The sparse index is not the inside check.
+    fn absorb_proved_float_sum_block(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        from_ms: i64,
+        to_ms: i64,
+        running: &mut [RunningStat],
+    ) -> Result<()> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let index = running[0].spec.index;
+        let through = self.schema.timestamp_index.max(index);
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(through),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        match try_add_dense_float(
+            &self.schema,
+            &payload,
+            index,
+            from_ms,
+            to_ms,
+            &mut running[0].float_sum,
+        )? {
+            Some(rows) => {
+                if rows > 0 {
+                    running[0].contributed = true;
+                }
+                Ok(())
+            }
+            None => fold_stat_payload(&self.schema, &payload, from_ms, to_ms, running, None),
+        }
+    }
+
+    /// One filtered block of column stats, including a range the zone did not prove.
+    fn absorb_stat_block(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+        running: &mut [RunningStat],
+        dense_float: Option<usize>,
+    ) -> Result<()> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let mut through = needed_column(&self.schema, resolved, None);
+        for stat in running.iter() {
+            through = through.max(stat.spec.index);
+        }
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(through),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        if let Some(index) = dense_float {
+            match try_add_dense_float(
+                &self.schema,
+                &payload,
+                index,
+                from_ms,
+                to_ms,
+                &mut running[0].float_sum,
+            )? {
+                Some(rows) => {
+                    if rows > 0 {
+                        running[0].contributed = true;
+                    }
+                    return Ok(());
+                }
+                None => {}
+            }
+        }
+        let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
+        visit_matching_timestamps(
+            &self.schema,
+            &payload,
+            from_ms,
+            to_ms,
+            &resolved.predicates,
+            &resolved.ranges,
+            &mut captures,
+            |ts, row, captured| {
+                for stat in running.iter_mut() {
+                    let value = stat_value(&self.schema, stat, ts, row, captured)?;
+                    stat.absorb(value)?;
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// `Ok(None)` means this column is not an int, timestamp, or decimal.
     /// `Ok(Some(None))` is an empty match. A qualifying prefix that crosses the
     /// sample ceilings returns the same error the sample path would.
@@ -2531,6 +2695,28 @@ impl ResolvedScan {
     fn unfiltered(&self) -> bool {
         self.predicates.is_empty() && self.ranges.is_empty()
     }
+
+    /// A scan with the numeric ranges removed.
+    ///
+    /// Callers use this only when `predicates` is already empty, so the
+    /// unfiltered shortcut does not have to clone a predicate. The time window
+    /// stays with the caller.
+    fn without_ranges(&self) -> Self {
+        Self {
+            predicates: Vec::new(),
+            ranges: Vec::new(),
+            impossible: self.impossible,
+        }
+    }
+}
+
+/// True when every numeric range can be dropped for this block.
+///
+/// An empty range list is already unfiltered. A null, tag `0`, or a bound the
+/// zone does not cover is not a proof. Equality is not decided here.
+fn ranges_already_proved(zone: Option<&crate::zone::BlockZone>, resolved: &ResolvedScan) -> bool {
+    resolved.ranges.is_empty()
+        || zone.is_some_and(|zone| crate::zone::ranges_implied(zone, &resolved.ranges))
 }
 
 #[derive(Clone)]
@@ -2908,6 +3094,13 @@ fn fold_stat_payload(
             Ok(())
         },
     )
+}
+
+/// One numeric `sum`, no equality, and at least one range the zone may prove.
+fn zone_proved_sum(running: &[RunningStat], resolved: &ResolvedScan) -> bool {
+    resolved.predicates.is_empty()
+        && !resolved.ranges.is_empty()
+        && (exact_sum_request(running) || single_float_sum(running).is_some())
 }
 
 /// One int, timestamp, or decimal `sum`, with no `min`, `max`, or variance.
@@ -4296,10 +4489,17 @@ fn group_key_from_row(
 /// One float `sum`, nothing else, and no row predicate. The column index is
 /// the encoded values to add when the block is fully inside the range.
 fn dense_float_sum(stats: &[RunningStat], resolved: &ResolvedScan) -> Option<usize> {
-    if !resolved.unfiltered() || stats.len() != 1 {
+    if !resolved.unfiltered() {
         return None;
     }
-    let stat = &stats[0];
+    single_float_sum(stats)
+}
+
+/// One float `sum`, with no `min`, `max`, or variance. Ranges are allowed.
+fn single_float_sum(stats: &[RunningStat]) -> Option<usize> {
+    let [stat] = stats else {
+        return None;
+    };
     if stat.spec.ty == FieldType::Float
         && stat.spec.sum
         && !stat.spec.min
@@ -11542,6 +11742,474 @@ mod tests {
     }
 
     #[test]
+    fn zone_proved_range_uses_the_stride_or_dense_sum() {
+        let dir = TempDir::new();
+        let schema_text = r#"{
+            "timestamp_field": "ts",
+            "fields": [
+                {"name": "ts", "type": "timestamp"},
+                {"name": "user_id", "type": "int"},
+                {"name": "score", "type": "float"},
+                {"name": "ok", "type": "bool"},
+                {"name": "action", "type": "string"},
+                {"name": "note", "type": "text"},
+                {"name": "amount", "type": "decimal", "scale": 2},
+                {"name": "blob", "type": "json"}
+            ]
+        }"#;
+        let schema = dir.path().join("schema.json");
+        fs::write(&schema, schema_text).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(128)).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        let rows_n = 128i64;
+        let mut users = 0i128;
+        let mut users_high = 0i128;
+        let mut users_click = 0i128;
+        let mut users_listed = 0i128;
+        let mut users_above_zero = 0i128;
+        let mut users_from_50 = 0i128;
+        let mut score_all = 0.0f64;
+        let mut score_high = 0.0f64;
+        let mut score_above_zero = 0.0f64;
+        let mut cents = 0i128;
+        let mut cents_high = 0i128;
+        let mut timestamps = 0i128;
+        for i in 0..rows_n {
+            let score = (i % 10) as f64;
+            let action = actions[i as usize % actions.len()];
+            let blob: String = (0..512)
+                .map(|byte| {
+                    let mixed = (i as u32)
+                        .wrapping_mul(1_103_515_245)
+                        .wrapping_add(12_345)
+                        .wrapping_add(byte);
+                    char::from(b'A' + (mixed % 26) as u8)
+                })
+                .collect();
+            users += i128::from(i);
+            timestamps += i128::from(i * 10);
+            cents += 100;
+            score_all += score;
+            if score >= 5.0 {
+                users_high += i128::from(i);
+                cents_high += 100;
+                score_high += score;
+            }
+            if score > 0.0 {
+                users_above_zero += i128::from(i);
+                score_above_zero += score;
+            }
+            if i >= 50 {
+                users_from_50 += i128::from(i);
+            }
+            if action == "click" {
+                users_click += i128::from(i);
+            }
+            if action == "click" || action == "view" {
+                users_listed += i128::from(i);
+            }
+            let event = serde_json::json!({
+                "ts": i * 10,
+                "user_id": i,
+                "score": score,
+                "ok": i % 2 == 0,
+                "action": action,
+                "note": "landing",
+                "amount": "1.00",
+                "blob": {"n": i, "blob": blob},
+            });
+            store
+                .append_json(&serde_json::to_vec(&event).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 1);
+        let path = segment::data_path(&data, 1);
+        let original = fs::read(&path).unwrap();
+        assert!(
+            original.windows(4).any(|magic| magic == b"EVCS"),
+            "each column is its own slice"
+        );
+        let end = (rows_n - 1) * 10;
+        let covered = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let partial = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        let above_zero = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(0.0),
+        )];
+        let open_low = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(-1.0),
+        )];
+        let too_high = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(100.0),
+        )];
+        let users_ge = [Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(50))];
+        let both = [
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0)),
+        ];
+        let click = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let listed = [
+            Predicate::In("action".into(), vec!["click".into(), "view".into()]),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let user_sum = stat_req("user_id", true, false, false);
+        let score_sum = stat_req("score", true, false, false);
+        let amount_sum = stat_req("amount", true, false, false);
+        let ts_sum = stat_req("ts", true, false, false);
+        let summed = |predicates: &[Predicate], stat: &StatRequest| {
+            store
+                .aggregate_with_filter(0, end, predicates, &[stat.clone()])
+                .unwrap()
+        };
+        assert_eq!(
+            exact_sum(&summed(&covered, &user_sum), "user_id"),
+            (users, true)
+        );
+        assert_eq!(exact_sum(&summed(&[], &user_sum), "user_id"), (users, true));
+        assert_eq!(
+            exact_sum(&summed(&partial, &user_sum), "user_id"),
+            (users_high, true)
+        );
+        assert!(users_high < users);
+        assert_eq!(
+            exact_sum(&summed(&above_zero, &user_sum), "user_id"),
+            (users_above_zero, true)
+        );
+        assert!(users_above_zero < users);
+        assert_eq!(
+            exact_sum(&summed(&open_low, &user_sum), "user_id"),
+            (users, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&too_high, &user_sum), "user_id"),
+            (0, false)
+        );
+        assert_eq!(
+            exact_sum(&summed(&users_ge, &user_sum), "user_id"),
+            (users_from_50, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&both, &user_sum), "user_id"),
+            (users, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&click, &user_sum), "user_id"),
+            (users_click, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&listed, &user_sum), "user_id"),
+            (users_listed, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&covered, &amount_sum), "amount"),
+            (cents, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&partial, &amount_sum), "amount"),
+            (cents_high, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&covered, &ts_sum), "ts"),
+            (timestamps, true)
+        );
+        let covered_score = summed(&covered, &score_sum);
+        let plain_score = summed(&[], &score_sum);
+        match (
+            covered_score[0].sum.as_ref().unwrap(),
+            plain_score[0].sum.as_ref().unwrap(),
+        ) {
+            (
+                StatSum::Float {
+                    total: covered_total,
+                    contributed: true,
+                },
+                StatSum::Float {
+                    total: plain_total,
+                    contributed: true,
+                },
+            ) => {
+                assert_eq!(covered_total.to_bits(), plain_total.to_bits());
+                assert_eq!(covered_total.to_bits(), score_all.to_bits());
+            }
+            other => panic!("expected float sums, got {other:?}"),
+        }
+        let high_score = summed(&partial, &score_sum);
+        match high_score[0].sum.as_ref().unwrap() {
+            StatSum::Float {
+                total,
+                contributed: true,
+            } => {
+                assert_eq!(total.to_bits(), score_high.to_bits());
+                assert_ne!(total.to_bits(), score_all.to_bits());
+            }
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        let above_score = summed(&above_zero, &score_sum);
+        match above_score[0].sum.as_ref().unwrap() {
+            StatSum::Float {
+                total,
+                contributed: true,
+            } => assert_eq!(total.to_bits(), score_above_zero.to_bits()),
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+
+        let mut moment = stat_req("user_id", true, false, false);
+        moment.var = true;
+        moment.stddev = true;
+        let plain_moment = store
+            .aggregate_with_filter(0, end, &[], &[moment.clone()])
+            .unwrap();
+        let proved_moment = store
+            .aggregate_with_filter(0, end, &covered, &[moment.clone()])
+            .unwrap();
+        assert_eq!(
+            exact_sum(&proved_moment, "user_id"),
+            exact_sum(&plain_moment, "user_id")
+        );
+        assert_eq!(
+            exact_var(&proved_moment, "user_id"),
+            exact_var(&plain_moment, "user_id")
+        );
+        let high_moment = store
+            .aggregate_with_filter(0, end, &partial, &[moment])
+            .unwrap();
+        assert_eq!(exact_sum(&high_moment, "user_id"), (users_high, true));
+        assert_ne!(
+            exact_var(&high_moment, "user_id").0,
+            exact_var(&plain_moment, "user_id").0
+        );
+        let with_min = store
+            .aggregate_with_filter(0, end, &partial, &[stat_req("user_id", true, true, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&with_min, "user_id"), (users_high, true));
+        assert_eq!(with_min[0].min, Some(Some(Scalar::Int(5))));
+        let proved_min = store
+            .aggregate_with_filter(0, end, &covered, &[stat_req("user_id", true, true, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&proved_min, "user_id"), (users, true));
+        assert_eq!(proved_min[0].min, Some(Some(Scalar::Int(0))));
+        let groups = store
+            .aggregate_grouped(0, end, &partial, &[user_sum.clone()], "action")
+            .unwrap();
+        let grouped = groups
+            .iter()
+            .map(|group| exact_sum(&group.columns, "user_id").0)
+            .sum::<i128>();
+        assert_eq!(grouped, users_high);
+
+        let mut later = fs::read(&path).unwrap();
+        for column in 3..=7 {
+            flip_column_slice(&mut later, column);
+        }
+        fs::write(&path, &later).unwrap();
+        assert_eq!(
+            exact_sum(&summed(&covered, &user_sum), "user_id"),
+            (users, true),
+            "a proved sum does not decode columns after the total"
+        );
+        match summed(&covered, &score_sum)[0].sum.as_ref().unwrap() {
+            StatSum::Float { total, .. } => assert_eq!(total.to_bits(), score_all.to_bits()),
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        assert_eq!(
+            exact_sum(&summed(&partial, &user_sum), "user_id"),
+            (users_high, true)
+        );
+
+        flip_column_slice(&mut later, 2);
+        fs::write(&path, &later).unwrap();
+        assert_eq!(
+            exact_sum(&summed(&covered, &user_sum), "user_id"),
+            (users, true),
+            "a proved score range stays compressed"
+        );
+        assert_eq!(
+            exact_sum(&summed(&covered, &ts_sum), "ts"),
+            (timestamps, true)
+        );
+        assert!(summed_err(&store, end, &covered, &score_sum).is_err());
+        assert!(summed_err(&store, end, &partial, &user_sum).is_err());
+        assert!(summed_err(
+            &store,
+            end,
+            &covered,
+            &stat_req("user_id", true, true, false)
+        )
+        .is_err());
+        assert!(summed_err(&store, end, &click, &user_sum).is_err());
+        assert!(summed_err(&store, end, &listed, &user_sum).is_err());
+        store.close().unwrap();
+
+        let cut_dir = TempDir::new();
+        let schema = write_schema(cut_dir.path());
+        let store =
+            Store::open_with(cut_dir.path().join("data"), &schema, test_options(4)).unwrap();
+        for i in 0..4i64 {
+            store
+                .append_json(&event(i * 10, Some(i + 1), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let covered = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let cut = store
+            .aggregate_with_filter(10, 20, &covered, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&cut, "user_id"), (2 + 3, true));
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = 10;
+            block.max_ts = 20;
+        }
+        let indexed = store
+            .aggregate_with_filter(10, 20, &covered, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            exact_sum(&indexed, "user_id"),
+            (2 + 3, true),
+            "the sparse index does not prove that every payload timestamp is inside"
+        );
+        store.close().unwrap();
+
+        let nulls = TempDir::new();
+        let schema = write_schema(nulls.path());
+        let store = Store::open_with(nulls.path().join("data"), &schema, test_options(4)).unwrap();
+        for (ts, user, score) in [
+            (1i64, 10i64, Some(1.0f64)),
+            (2, 100, None),
+            (3, 20, Some(2.0)),
+            (4, 30, Some(6.0)),
+        ] {
+            let mut obj = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            if let Some(score) = score {
+                obj["score"] = serde_json::json!(score);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let covered = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let partial = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        let nullable = store
+            .aggregate_with_filter(0, 10, &covered, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            exact_sum(&nullable, "user_id"),
+            (60, true),
+            "a null in the zone is not a proof"
+        );
+        let high = store
+            .aggregate_with_filter(0, 10, &partial, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&high, "user_id"), (30, true));
+        let scores = store
+            .aggregate_with_filter(0, 10, &partial, &[stat_req("score", true, false, false)])
+            .unwrap();
+        match scores[0].sum.as_ref().unwrap() {
+            StatSum::Float {
+                total,
+                contributed: true,
+            } => assert_eq!(total.to_bits(), 6.0f64.to_bits()),
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        store.close().unwrap();
+
+        let mixed = TempDir::new();
+        let schema = write_schema(mixed.path());
+        let store = Store::open_with(mixed.path().join("data"), &schema, test_options(4)).unwrap();
+        for (ts, user, score) in [
+            (1i64, 10i64, 5.0f64),
+            (2, 10, 6.0),
+            (3, 10, 7.0),
+            (4, 10, 8.0),
+            (5, 1, 0.0),
+            (6, 2, 5.0),
+            (7, 3, 1.0),
+            (8, 4, 9.0),
+        ] {
+            let event = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&event).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 2);
+        let partial = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        let users = store
+            .aggregate_with_filter(0, 10, &partial, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&users, "user_id"), (46, true));
+        let scores = store
+            .aggregate_with_filter(0, 10, &partial, &[stat_req("score", true, false, false)])
+            .unwrap();
+        match scores[0].sum.as_ref().unwrap() {
+            StatSum::Float {
+                total,
+                contributed: true,
+            } => assert_eq!(total.to_bits(), 40.0f64.to_bits()),
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        store.close().unwrap();
+    }
+
+    fn summed_err(
+        store: &Store,
+        end: i64,
+        predicates: &[Predicate],
+        stat: &StatRequest,
+    ) -> Result<Vec<ColumnStats>> {
+        store.aggregate_with_filter(0, end, predicates, &[stat.clone()])
+    }
+
+    #[test]
     fn minmax_uses_zone_extremes_only_when_every_timestamp_is_inside() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -13168,6 +13836,205 @@ mod tests {
     }
 
     #[test]
+    fn distinct_count_drops_a_range_the_zone_already_proves() {
+        let dir = TempDir::new();
+        let schema = write_schema(dir.path());
+        let store = Store::open_with(dir.path().join("data"), &schema, test_options(4)).unwrap();
+        let row = |ts: i64, user: Option<i64>, score: Option<f64>, action: &str, ok: bool| {
+            let mut value = serde_json::json!({
+                "ts": ts,
+                "ok": ok,
+                "action": action,
+                "amount": "1.00",
+            });
+            if let Some(user) = user {
+                value["user_id"] = serde_json::json!(user);
+            }
+            if let Some(score) = score {
+                value["score"] = serde_json::json!(score);
+            }
+            serde_json::to_vec(&value).unwrap()
+        };
+        // Block 0: scores 1 and 6, so score >= 5 is not proved. "low" only
+        // sits on the row the range rejects.
+        store
+            .append_json(&row(10, Some(0), Some(1.0), "low", true))
+            .unwrap();
+        store
+            .append_json(&row(11, Some(2), Some(6.0), "high", false))
+            .unwrap();
+        store
+            .append_json(&row(12, Some(4), Some(6.5), "high", true))
+            .unwrap();
+        store
+            .append_json(&row(13, Some(6), Some(7.0), "mid", false))
+            .unwrap();
+        // Block 1: every score is covered by score >= 0 and by score >= 5.
+        store
+            .append_json(&row(20, Some(8), Some(8.0), "top", true))
+            .unwrap();
+        store
+            .append_json(&row(21, Some(9), Some(9.0), "top", false))
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 2);
+
+        let ge0 = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let ge5 = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        assert_eq!(store.distinct_count(10, 21, &ge0, "action").unwrap(), 4);
+        assert_eq!(store.distinct_count(10, 21, &ge5, "action").unwrap(), 3);
+        assert_eq!(store.distinct_count(10, 21, &ge0, "user_id").unwrap(), 6);
+        assert_eq!(
+            store.distinct_count(10, 21, &ge5, "user_id").unwrap(),
+            5,
+            "user 0 only appears beside a score below 5"
+        );
+        assert_eq!(store.distinct_count(10, 21, &ge0, "ok").unwrap(), 2);
+        assert_eq!(store.distinct_count(20, 21, &ge5, "action").unwrap(), 1);
+        assert_eq!(
+            store.distinct_count(10, 10, &ge0, "action").unwrap(),
+            1,
+            "a timestamp outside the block still walks"
+        );
+        let clicked = [
+            Predicate::Eq("ok".into(), Scalar::Bool(true)),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        assert_eq!(
+            store.distinct_count(10, 21, &clicked, "action").unwrap(),
+            3,
+            "an equality still walks"
+        );
+        store.close().unwrap();
+
+        let with_null = TempDir::new();
+        let schema = write_schema(with_null.path());
+        let store =
+            Store::open_with(with_null.path().join("data"), &schema, test_options(4)).unwrap();
+        store
+            .append_json(&row(10, Some(1), None, "only-null", true))
+            .unwrap();
+        store
+            .append_json(&row(11, Some(2), Some(1.0), "kept", true))
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(
+            store.distinct_count(10, 11, &ge0, "action").unwrap(),
+            1,
+            "a null in the score zone is not a proof of score >= 0"
+        );
+        store.close().unwrap();
+
+        let stride = TempDir::new();
+        let schema = write_schema(stride.path());
+        let store = Store::open_with(stride.path().join("data"), &schema, test_options(8)).unwrap();
+        store
+            .append_json(&row(1, Some(0), Some(1.0), "click", true))
+            .unwrap();
+        store
+            .append_json(&row(2, Some(2), Some(2.0), "view", true))
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(
+            store.distinct_count(1, 2, &ge0, "user_id").unwrap(),
+            2,
+            "stride 2 is not the closed interval"
+        );
+        store.close().unwrap();
+
+        let wrapped = TempDir::new();
+        let schema = write_schema(wrapped.path());
+        let store =
+            Store::open_with(wrapped.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, user) in [(1i64, i64::MAX), (2, i64::MIN), (3, i64::MIN + 1)] {
+            store
+                .append_json(&row(ts, Some(user), Some(1.0), "click", true))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(1, 3, &ge0, "user_id").unwrap(), 3);
+        store.close().unwrap();
+
+        let times = TempDir::new();
+        let schema = write_schema(times.path());
+        let store = Store::open_with(times.path().join("data"), &schema, test_options(8)).unwrap();
+        for ts in [10i64, 20, 30] {
+            store
+                .append_json(&row(ts, Some(1), Some(1.0), "click", true))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(
+            store.distinct_count(10, 30, &ge0, "ts").unwrap(),
+            3,
+            "a timestamp stride of 10 is not a unit run"
+        );
+        store.close().unwrap();
+
+        let amounts = TempDir::new();
+        let schema = write_schema(amounts.path());
+        let store =
+            Store::open_with(amounts.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, amount) in [(1i64, "0.00"), (2, "0.02")] {
+            let value = serde_json::json!({
+                "ts": ts,
+                "user_id": 1,
+                "score": 1.0,
+                "ok": true,
+                "action": "click",
+                "amount": amount,
+            });
+            store
+                .append_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.distinct_count(1, 2, &ge0, "amount").unwrap(), 2);
+        store.close().unwrap();
+
+        let floats = TempDir::new();
+        let schema = write_schema(floats.path());
+        let store = Store::open_with(floats.path().join("data"), &schema, test_options(8)).unwrap();
+        for (ts, score) in [(1i64, 0.0), (2, 1.0), (3, 1.0)] {
+            store
+                .append_json(&row(ts, Some(1), Some(score), "click", true))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let user_ge = [Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0))];
+        assert_eq!(
+            store.distinct_count(1, 3, &user_ge, "score").unwrap(),
+            2,
+            "a float distinct still walks"
+        );
+        store.close().unwrap();
+
+        let bloom = TempDir::new();
+        let schema = write_schema(bloom.path());
+        let store = Store::open_with(bloom.path().join("data"), &schema, test_options(40)).unwrap();
+        for id in 0..40i64 {
+            store
+                .append_json(&row(id, Some(id), Some(1.0), &format!("run-{id}"), true))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert!(matches!(
+            store.catalog().segments[0].zones[0].columns[4],
+            crate::zone::ColumnZone::Bloom { .. }
+        ));
+        assert_eq!(store.distinct_count(0, 39, &ge0, "action").unwrap(), 40);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn stock_events_have_the_distinct_counts_of_the_bench() {
         let dir = TempDir::new();
         let schema = write_schema(dir.path());
@@ -13204,6 +14071,46 @@ mod tests {
         );
         assert_eq!(store.distinct_count(start, end, &[], "action").unwrap(), 4);
         assert_eq!(store.distinct_count(start, end, &[], "ok").unwrap(), 2);
+        let score_ge0 = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let score_ge5 = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        assert_eq!(
+            store
+                .distinct_count(start, end, &score_ge0, "action")
+                .unwrap(),
+            4,
+            "every stock score is at least 0, so the zone set is the count"
+        );
+        assert_eq!(
+            store
+                .distinct_count(start, end, &score_ge0, "user_id")
+                .unwrap(),
+            1000
+        );
+        assert_eq!(
+            store.distinct_count(start, end, &score_ge0, "ok").unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .distinct_count(start, end, &score_ge5, "action")
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            store
+                .distinct_count(start, end, &score_ge5, "user_id")
+                .unwrap(),
+            500,
+            "every stock block still contains a score below 5"
+        );
         assert_eq!(store.distinct_count(start, end, &[], "note").unwrap(), 3);
         assert_eq!(store.distinct_count(start, end, &[], "score").unwrap(), 100);
         assert_eq!(
