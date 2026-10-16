@@ -61,11 +61,14 @@
 //! result by one column.
 //! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns
 //! one exact rank of a numeric column over that same window. Nulls are left
-//! out of the sample. One int, timestamp, or decimal with no row predicate
+//! out of the sample. One int, timestamp, or decimal with no equality
 //! selects that rank from a null-free constant, stride, or stride pieces whose
 //! stride is -1, 0, or 1 and whose values do not wrap, when every payload
-//! timestamp is inside the range. A null, any other encoding, a float, a cut
-//! block, or a predicate still sorts the sample. The encoder and the on-disk
+//! timestamp is inside the range. A numeric range the zone implies is dropped
+//! and that same selection runs. A null in the zone is not a proof. A bound
+//! the zone does not cover, an equality, a null in the target column, any
+//! other encoding, a float, a cut block, or a timestamp outside the range
+//! still sorts the sample. The encoder and the on-disk
 //! files are unchanged.
 //! [`Store::latest_json`](store::Store::latest_json) returns the newest matching
 //! row for each value of one column, in that same key order.
