@@ -51,7 +51,13 @@
 //! stride, or stride pieces from the column body when every payload timestamp
 //! is inside the range. `min` and `max` with no `sum`, no variance, and no
 //! row predicate take int, decimal, and float extremes from the zone when
-//! every payload timestamp in the block is inside the range.
+//! every payload timestamp in the block is inside the range. A numeric range
+//! on that request is dropped when the zone implies every range, and those
+//! extremes still come from the zone, including a column that also contains
+//! nulls. The proved range may name the stat column or a different column.
+//! A null in the zone is not a proof. A bound the zone does not cover, an
+//! equality, a sum, a variance, or a timestamp outside the range still
+//! decodes the in-range rows.
 //! [`Store::aggregate_grouped`](store::Store::aggregate_grouped) splits that
 //! result by one column.
 //! [`Store::quantile_with_filter`](store::Store::quantile_with_filter) returns
