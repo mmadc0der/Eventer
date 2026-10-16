@@ -1376,6 +1376,15 @@ impl Store {
     /// column stats. A non-finite float already stored is
     /// [`Error::Corrupt`](Error::Corrupt).
     ///
+    /// When that one int, timestamp, or decimal `sum` has numeric ranges and
+    /// no equality, a block whose zone implies every range drops those ranges
+    /// and uses the same stride sum. When that one float `sum` has numeric
+    /// ranges and no equality, a block whose zone implies every range drops
+    /// those ranges and uses the same dense-float sum. A null in the zone is
+    /// not a proof. A bound the zone does not cover, an equality, a `min`, a
+    /// `max`, a variance, or a timestamp outside the range still walks that
+    /// block. The sparse index is not the inside check.
+    ///
     /// `var` is the population variance and `stddev` is its square root. Nulls
     /// do not contribute to either. No non-null match leaves both empty, which
     /// is not zero. One non-null value is zero. A float variance is the
@@ -1442,60 +1451,48 @@ impl Store {
                     &mut running,
                 )?;
             }
+        } else if zone_proved_sum(&running, &resolved) {
+            let blocks = self.blocks_for_count(from_ms, to_ms, &resolved);
+            for (block, plan) in blocks {
+                if !matches!(plan, CountPlan::ProvedRanges) {
+                    self.absorb_stat_block(
+                        &block,
+                        &mut dictionaries,
+                        from_ms,
+                        to_ms,
+                        &resolved,
+                        &mut running,
+                        None,
+                    )?;
+                } else if exact_sum_only {
+                    self.absorb_exact_sum_block(
+                        &block,
+                        &mut dictionaries,
+                        from_ms,
+                        to_ms,
+                        &mut running,
+                    )?;
+                } else {
+                    self.absorb_proved_float_sum_block(
+                        &block,
+                        &mut dictionaries,
+                        from_ms,
+                        to_ms,
+                        &mut running,
+                    )?;
+                }
+            }
         } else {
             let blocks = self.blocks_in_range(from_ms, to_ms, &resolved);
             for block in blocks {
-                if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
-                    return Err(Error::event("query response size limit exceeded"));
-                }
-                let mut through = needed_column(&self.schema, &resolved, None);
-                for stat in &running {
-                    through = through.max(stat.spec.index);
-                }
-                let payload = self.read_block_bytes(
+                self.absorb_stat_block(
                     &block,
                     &mut dictionaries,
-                    segment::BlockLoad {
-                        through_column: Some(through),
-                        columns: None,
-                    },
-                )?;
-                let nrows = block_row_count(&payload)?;
-                require_header_row_count(block.row_count, nrows)?;
-                if let Some(index) = dense_float {
-                    match try_add_dense_float(
-                        &self.schema,
-                        &payload,
-                        index,
-                        from_ms,
-                        to_ms,
-                        &mut running[0].float_sum,
-                    )? {
-                        Some(rows) => {
-                            if rows > 0 {
-                                running[0].contributed = true;
-                            }
-                            continue;
-                        }
-                        None => {}
-                    }
-                }
-                let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
-                visit_matching_timestamps(
-                    &self.schema,
-                    &payload,
                     from_ms,
                     to_ms,
-                    &resolved.predicates,
-                    &resolved.ranges,
-                    &mut captures,
-                    |ts, row, captured| {
-                        for stat in &mut running {
-                            let value = stat_value(&self.schema, stat, ts, row, captured)?;
-                            stat.absorb(value)?;
-                        }
-                        Ok(())
-                    },
+                    &resolved,
+                    &mut running,
+                    dense_float,
                 )?;
             }
         }
@@ -2043,14 +2040,17 @@ impl Store {
         blocks
     }
 
-    /// Blocks a count or histogram will read, and which columns that read still needs.
+    /// Blocks a count, histogram, or single numeric sum will read, and which
+    /// columns that read still needs.
     ///
     /// [`CountPlan::ProvedRanges`] is set only when the block has no equality
     /// and the zone implies every range. A histogram uses that plan to fill
-    /// buckets from the timestamp header. [`CountPlan::ProvedHeader`] is set
-    /// when the only equality is one string, text, or bool value and that same
-    /// zone proof holds. A histogram does not take the header plan: an equality
-    /// still walks. Row scans keep using [`Store::blocks_in_range`].
+    /// buckets from the timestamp header. A single int, timestamp, decimal, or
+    /// float `sum` uses it to drop the ranges and add the unfiltered sum.
+    /// [`CountPlan::ProvedHeader`] is set when the only equality is one string,
+    /// text, or bool value and that same zone proof holds. A histogram does not
+    /// take the header plan: an equality still walks. Other row scans keep
+    /// using [`Store::blocks_in_range`].
     fn blocks_for_count(
         &self,
         from_ms: i64,
@@ -2345,6 +2345,119 @@ impl Store {
             }
             None => fold_stat_payload(&self.schema, &payload, from_ms, to_ms, running, None),
         }
+    }
+
+    /// One float `sum` after the zone has proved every numeric range.
+    ///
+    /// The ranges are dropped. The timestamp column and the float column are
+    /// the slices this reads. A constant, raw frame, or repeated decimal stride
+    /// with no nulls is added in row order when every payload timestamp is
+    /// inside the range. Anything else uses the row visitor on this same block.
+    /// The sparse index is not the inside check.
+    fn absorb_proved_float_sum_block(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        from_ms: i64,
+        to_ms: i64,
+        running: &mut [RunningStat],
+    ) -> Result<()> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let index = running[0].spec.index;
+        let through = self.schema.timestamp_index.max(index);
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(through),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        match try_add_dense_float(
+            &self.schema,
+            &payload,
+            index,
+            from_ms,
+            to_ms,
+            &mut running[0].float_sum,
+        )? {
+            Some(rows) => {
+                if rows > 0 {
+                    running[0].contributed = true;
+                }
+                Ok(())
+            }
+            None => fold_stat_payload(&self.schema, &payload, from_ms, to_ms, running, None),
+        }
+    }
+
+    /// One filtered block of column stats, including a range the zone did not prove.
+    fn absorb_stat_block(
+        &self,
+        block: &segment::BlockMeta,
+        dictionaries: &mut HashMap<u32, Option<Vec<u8>>>,
+        from_ms: i64,
+        to_ms: i64,
+        resolved: &ResolvedScan,
+        running: &mut [RunningStat],
+        dense_float: Option<usize>,
+    ) -> Result<()> {
+        if block_exceeds_read_budget(block.uncompressed_len, false, 0, true) {
+            return Err(Error::event("query response size limit exceeded"));
+        }
+        let mut through = needed_column(&self.schema, resolved, None);
+        for stat in running.iter() {
+            through = through.max(stat.spec.index);
+        }
+        let payload = self.read_block_bytes(
+            block,
+            dictionaries,
+            segment::BlockLoad {
+                through_column: Some(through),
+                columns: None,
+            },
+        )?;
+        let nrows = block_row_count(&payload)?;
+        require_header_row_count(block.row_count, nrows)?;
+        if let Some(index) = dense_float {
+            match try_add_dense_float(
+                &self.schema,
+                &payload,
+                index,
+                from_ms,
+                to_ms,
+                &mut running[0].float_sum,
+            )? {
+                Some(rows) => {
+                    if rows > 0 {
+                        running[0].contributed = true;
+                    }
+                    return Ok(());
+                }
+                None => {}
+            }
+        }
+        let mut captures = capture_columns(running.iter().map(|stat| stat.spec.index));
+        visit_matching_timestamps(
+            &self.schema,
+            &payload,
+            from_ms,
+            to_ms,
+            &resolved.predicates,
+            &resolved.ranges,
+            &mut captures,
+            |ts, row, captured| {
+                for stat in running.iter_mut() {
+                    let value = stat_value(&self.schema, stat, ts, row, captured)?;
+                    stat.absorb(value)?;
+                }
+                Ok(())
+            },
+        )
     }
 
     /// `Ok(None)` means this column is not an int, timestamp, or decimal.
@@ -2854,6 +2967,13 @@ fn fold_stat_payload(
             Ok(())
         },
     )
+}
+
+/// One numeric `sum`, no equality, and at least one range the zone may prove.
+fn zone_proved_sum(running: &[RunningStat], resolved: &ResolvedScan) -> bool {
+    resolved.predicates.is_empty()
+        && !resolved.ranges.is_empty()
+        && (exact_sum_request(running) || single_float_sum(running).is_some())
 }
 
 /// One int, timestamp, or decimal `sum`, with no `min`, `max`, or variance.
@@ -4222,10 +4342,17 @@ fn group_key_from_row(
 /// One float `sum`, nothing else, and no row predicate. The column index is
 /// the encoded values to add when the block is fully inside the range.
 fn dense_float_sum(stats: &[RunningStat], resolved: &ResolvedScan) -> Option<usize> {
-    if !resolved.unfiltered() || stats.len() != 1 {
+    if !resolved.unfiltered() {
         return None;
     }
-    let stat = &stats[0];
+    single_float_sum(stats)
+}
+
+/// One float `sum`, with no `min`, `max`, or variance. Ranges are allowed.
+fn single_float_sum(stats: &[RunningStat]) -> Option<usize> {
+    let [stat] = stats else {
+        return None;
+    };
     if stat.spec.ty == FieldType::Float
         && stat.spec.sum
         && !stat.spec.min
@@ -11294,6 +11421,474 @@ mod tests {
             .unwrap();
         assert_eq!(exact_sum(&alone, "amount"), (i128::MAX, true));
         store.close().unwrap();
+    }
+
+    #[test]
+    fn zone_proved_range_uses_the_stride_or_dense_sum() {
+        let dir = TempDir::new();
+        let schema_text = r#"{
+            "timestamp_field": "ts",
+            "fields": [
+                {"name": "ts", "type": "timestamp"},
+                {"name": "user_id", "type": "int"},
+                {"name": "score", "type": "float"},
+                {"name": "ok", "type": "bool"},
+                {"name": "action", "type": "string"},
+                {"name": "note", "type": "text"},
+                {"name": "amount", "type": "decimal", "scale": 2},
+                {"name": "blob", "type": "json"}
+            ]
+        }"#;
+        let schema = dir.path().join("schema.json");
+        fs::write(&schema, schema_text).unwrap();
+        let data = dir.path().join("data");
+        let store = Store::open_with(&data, &schema, test_options(128)).unwrap();
+        let actions = ["click", "view", "buy", "scroll"];
+        let rows_n = 128i64;
+        let mut users = 0i128;
+        let mut users_high = 0i128;
+        let mut users_click = 0i128;
+        let mut users_listed = 0i128;
+        let mut users_above_zero = 0i128;
+        let mut users_from_50 = 0i128;
+        let mut score_all = 0.0f64;
+        let mut score_high = 0.0f64;
+        let mut score_above_zero = 0.0f64;
+        let mut cents = 0i128;
+        let mut cents_high = 0i128;
+        let mut timestamps = 0i128;
+        for i in 0..rows_n {
+            let score = (i % 10) as f64;
+            let action = actions[i as usize % actions.len()];
+            let blob: String = (0..512)
+                .map(|byte| {
+                    let mixed = (i as u32)
+                        .wrapping_mul(1_103_515_245)
+                        .wrapping_add(12_345)
+                        .wrapping_add(byte);
+                    char::from(b'A' + (mixed % 26) as u8)
+                })
+                .collect();
+            users += i128::from(i);
+            timestamps += i128::from(i * 10);
+            cents += 100;
+            score_all += score;
+            if score >= 5.0 {
+                users_high += i128::from(i);
+                cents_high += 100;
+                score_high += score;
+            }
+            if score > 0.0 {
+                users_above_zero += i128::from(i);
+                score_above_zero += score;
+            }
+            if i >= 50 {
+                users_from_50 += i128::from(i);
+            }
+            if action == "click" {
+                users_click += i128::from(i);
+            }
+            if action == "click" || action == "view" {
+                users_listed += i128::from(i);
+            }
+            let event = serde_json::json!({
+                "ts": i * 10,
+                "user_id": i,
+                "score": score,
+                "ok": i % 2 == 0,
+                "action": action,
+                "note": "landing",
+                "amount": "1.00",
+                "blob": {"n": i, "blob": blob},
+            });
+            store
+                .append_json(&serde_json::to_vec(&event).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 1);
+        let path = segment::data_path(&data, 1);
+        let original = fs::read(&path).unwrap();
+        assert!(
+            original.windows(4).any(|magic| magic == b"EVCS"),
+            "each column is its own slice"
+        );
+        let end = (rows_n - 1) * 10;
+        let covered = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let partial = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        let above_zero = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(0.0),
+        )];
+        let open_low = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(-1.0),
+        )];
+        let too_high = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Gt,
+            Scalar::Float(100.0),
+        )];
+        let users_ge = [Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(50))];
+        let both = [
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+            Predicate::Cmp("user_id".into(), CmpOp::Ge, Scalar::Int(0)),
+        ];
+        let click = [
+            Predicate::Eq("action".into(), "click".into()),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let listed = [
+            Predicate::In("action".into(), vec!["click".into(), "view".into()]),
+            Predicate::Cmp("score".into(), CmpOp::Ge, Scalar::Float(0.0)),
+        ];
+        let user_sum = stat_req("user_id", true, false, false);
+        let score_sum = stat_req("score", true, false, false);
+        let amount_sum = stat_req("amount", true, false, false);
+        let ts_sum = stat_req("ts", true, false, false);
+        let summed = |predicates: &[Predicate], stat: &StatRequest| {
+            store
+                .aggregate_with_filter(0, end, predicates, &[stat.clone()])
+                .unwrap()
+        };
+        assert_eq!(
+            exact_sum(&summed(&covered, &user_sum), "user_id"),
+            (users, true)
+        );
+        assert_eq!(exact_sum(&summed(&[], &user_sum), "user_id"), (users, true));
+        assert_eq!(
+            exact_sum(&summed(&partial, &user_sum), "user_id"),
+            (users_high, true)
+        );
+        assert!(users_high < users);
+        assert_eq!(
+            exact_sum(&summed(&above_zero, &user_sum), "user_id"),
+            (users_above_zero, true)
+        );
+        assert!(users_above_zero < users);
+        assert_eq!(
+            exact_sum(&summed(&open_low, &user_sum), "user_id"),
+            (users, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&too_high, &user_sum), "user_id"),
+            (0, false)
+        );
+        assert_eq!(
+            exact_sum(&summed(&users_ge, &user_sum), "user_id"),
+            (users_from_50, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&both, &user_sum), "user_id"),
+            (users, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&click, &user_sum), "user_id"),
+            (users_click, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&listed, &user_sum), "user_id"),
+            (users_listed, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&covered, &amount_sum), "amount"),
+            (cents, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&partial, &amount_sum), "amount"),
+            (cents_high, true)
+        );
+        assert_eq!(
+            exact_sum(&summed(&covered, &ts_sum), "ts"),
+            (timestamps, true)
+        );
+        let covered_score = summed(&covered, &score_sum);
+        let plain_score = summed(&[], &score_sum);
+        match (
+            covered_score[0].sum.as_ref().unwrap(),
+            plain_score[0].sum.as_ref().unwrap(),
+        ) {
+            (
+                StatSum::Float {
+                    total: covered_total,
+                    contributed: true,
+                },
+                StatSum::Float {
+                    total: plain_total,
+                    contributed: true,
+                },
+            ) => {
+                assert_eq!(covered_total.to_bits(), plain_total.to_bits());
+                assert_eq!(covered_total.to_bits(), score_all.to_bits());
+            }
+            other => panic!("expected float sums, got {other:?}"),
+        }
+        let high_score = summed(&partial, &score_sum);
+        match high_score[0].sum.as_ref().unwrap() {
+            StatSum::Float {
+                total,
+                contributed: true,
+            } => {
+                assert_eq!(total.to_bits(), score_high.to_bits());
+                assert_ne!(total.to_bits(), score_all.to_bits());
+            }
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        let above_score = summed(&above_zero, &score_sum);
+        match above_score[0].sum.as_ref().unwrap() {
+            StatSum::Float {
+                total,
+                contributed: true,
+            } => assert_eq!(total.to_bits(), score_above_zero.to_bits()),
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+
+        let mut moment = stat_req("user_id", true, false, false);
+        moment.var = true;
+        moment.stddev = true;
+        let plain_moment = store
+            .aggregate_with_filter(0, end, &[], &[moment.clone()])
+            .unwrap();
+        let proved_moment = store
+            .aggregate_with_filter(0, end, &covered, &[moment.clone()])
+            .unwrap();
+        assert_eq!(
+            exact_sum(&proved_moment, "user_id"),
+            exact_sum(&plain_moment, "user_id")
+        );
+        assert_eq!(
+            exact_var(&proved_moment, "user_id"),
+            exact_var(&plain_moment, "user_id")
+        );
+        let high_moment = store
+            .aggregate_with_filter(0, end, &partial, &[moment])
+            .unwrap();
+        assert_eq!(exact_sum(&high_moment, "user_id"), (users_high, true));
+        assert_ne!(
+            exact_var(&high_moment, "user_id").0,
+            exact_var(&plain_moment, "user_id").0
+        );
+        let with_min = store
+            .aggregate_with_filter(0, end, &partial, &[stat_req("user_id", true, true, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&with_min, "user_id"), (users_high, true));
+        assert_eq!(with_min[0].min, Some(Some(Scalar::Int(5))));
+        let proved_min = store
+            .aggregate_with_filter(0, end, &covered, &[stat_req("user_id", true, true, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&proved_min, "user_id"), (users, true));
+        assert_eq!(proved_min[0].min, Some(Some(Scalar::Int(0))));
+        let groups = store
+            .aggregate_grouped(0, end, &partial, &[user_sum.clone()], "action")
+            .unwrap();
+        let grouped = groups
+            .iter()
+            .map(|group| exact_sum(&group.columns, "user_id").0)
+            .sum::<i128>();
+        assert_eq!(grouped, users_high);
+
+        let mut later = fs::read(&path).unwrap();
+        for column in 3..=7 {
+            flip_column_slice(&mut later, column);
+        }
+        fs::write(&path, &later).unwrap();
+        assert_eq!(
+            exact_sum(&summed(&covered, &user_sum), "user_id"),
+            (users, true),
+            "a proved sum does not decode columns after the total"
+        );
+        match summed(&covered, &score_sum)[0].sum.as_ref().unwrap() {
+            StatSum::Float { total, .. } => assert_eq!(total.to_bits(), score_all.to_bits()),
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        assert_eq!(
+            exact_sum(&summed(&partial, &user_sum), "user_id"),
+            (users_high, true)
+        );
+
+        flip_column_slice(&mut later, 2);
+        fs::write(&path, &later).unwrap();
+        assert_eq!(
+            exact_sum(&summed(&covered, &user_sum), "user_id"),
+            (users, true),
+            "a proved score range stays compressed"
+        );
+        assert_eq!(
+            exact_sum(&summed(&covered, &ts_sum), "ts"),
+            (timestamps, true)
+        );
+        assert!(summed_err(&store, end, &covered, &score_sum).is_err());
+        assert!(summed_err(&store, end, &partial, &user_sum).is_err());
+        assert!(summed_err(
+            &store,
+            end,
+            &covered,
+            &stat_req("user_id", true, true, false)
+        )
+        .is_err());
+        assert!(summed_err(&store, end, &click, &user_sum).is_err());
+        assert!(summed_err(&store, end, &listed, &user_sum).is_err());
+        store.close().unwrap();
+
+        let cut_dir = TempDir::new();
+        let schema = write_schema(cut_dir.path());
+        let store =
+            Store::open_with(cut_dir.path().join("data"), &schema, test_options(4)).unwrap();
+        for i in 0..4i64 {
+            store
+                .append_json(&event(i * 10, Some(i + 1), "click", None, "1.00"))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let covered = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let cut = store
+            .aggregate_with_filter(10, 20, &covered, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&cut, "user_id"), (2 + 3, true));
+        {
+            let mut catalog = store.catalog();
+            let block = &mut catalog.segments[0].blocks[0];
+            block.min_ts = 10;
+            block.max_ts = 20;
+        }
+        let indexed = store
+            .aggregate_with_filter(10, 20, &covered, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            exact_sum(&indexed, "user_id"),
+            (2 + 3, true),
+            "the sparse index does not prove that every payload timestamp is inside"
+        );
+        store.close().unwrap();
+
+        let nulls = TempDir::new();
+        let schema = write_schema(nulls.path());
+        let store = Store::open_with(nulls.path().join("data"), &schema, test_options(4)).unwrap();
+        for (ts, user, score) in [
+            (1i64, 10i64, Some(1.0f64)),
+            (2, 100, None),
+            (3, 20, Some(2.0)),
+            (4, 30, Some(6.0)),
+        ] {
+            let mut obj = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            if let Some(score) = score {
+                obj["score"] = serde_json::json!(score);
+            }
+            store
+                .append_json(&serde_json::to_vec(&obj).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let covered = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(0.0),
+        )];
+        let partial = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        let nullable = store
+            .aggregate_with_filter(0, 10, &covered, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(
+            exact_sum(&nullable, "user_id"),
+            (60, true),
+            "a null in the zone is not a proof"
+        );
+        let high = store
+            .aggregate_with_filter(0, 10, &partial, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&high, "user_id"), (30, true));
+        let scores = store
+            .aggregate_with_filter(0, 10, &partial, &[stat_req("score", true, false, false)])
+            .unwrap();
+        match scores[0].sum.as_ref().unwrap() {
+            StatSum::Float {
+                total,
+                contributed: true,
+            } => assert_eq!(total.to_bits(), 6.0f64.to_bits()),
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        store.close().unwrap();
+
+        let mixed = TempDir::new();
+        let schema = write_schema(mixed.path());
+        let store = Store::open_with(mixed.path().join("data"), &schema, test_options(4)).unwrap();
+        for (ts, user, score) in [
+            (1i64, 10i64, 5.0f64),
+            (2, 10, 6.0),
+            (3, 10, 7.0),
+            (4, 10, 8.0),
+            (5, 1, 0.0),
+            (6, 2, 5.0),
+            (7, 3, 1.0),
+            (8, 4, 9.0),
+        ] {
+            let event = serde_json::json!({
+                "ts": ts,
+                "user_id": user,
+                "score": score,
+                "ok": true,
+                "action": "click",
+                "amount": "1.00",
+            });
+            store
+                .append_json(&serde_json::to_vec(&event).unwrap())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(store.catalog().segments[0].blocks.len(), 2);
+        let partial = [Predicate::Cmp(
+            "score".into(),
+            CmpOp::Ge,
+            Scalar::Float(5.0),
+        )];
+        let users = store
+            .aggregate_with_filter(0, 10, &partial, &[stat_req("user_id", true, false, false)])
+            .unwrap();
+        assert_eq!(exact_sum(&users, "user_id"), (46, true));
+        let scores = store
+            .aggregate_with_filter(0, 10, &partial, &[stat_req("score", true, false, false)])
+            .unwrap();
+        match scores[0].sum.as_ref().unwrap() {
+            StatSum::Float {
+                total,
+                contributed: true,
+            } => assert_eq!(total.to_bits(), 40.0f64.to_bits()),
+            other => panic!("expected a float sum, got {other:?}"),
+        }
+        store.close().unwrap();
+    }
+
+    fn summed_err(
+        store: &Store,
+        end: i64,
+        predicates: &[Predicate],
+        stat: &StatRequest,
+    ) -> Result<Vec<ColumnStats>> {
+        store.aggregate_with_filter(0, end, predicates, &[stat.clone()])
     }
 
     #[test]
